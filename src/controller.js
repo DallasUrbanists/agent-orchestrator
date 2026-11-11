@@ -72,8 +72,10 @@ function dispatchHold(rows, control) {
   return null;
 }
 
-function runnable(issues, rows) {
-  return eligibleIssues(issues, new Map(rows.map(row => [row.number, row.state])));
+function runnable(issues, rows, sourceRepo) {
+  return eligibleIssues(issues, new Map(rows.map(row => [row.number, row.state])), {
+    acceptSourceCompletion: Boolean(sourceRepo)
+  });
 }
 
 export async function preview(queue, statePath, { readIssues = readGithubIssues, signal } = {}) {
@@ -89,7 +91,7 @@ export async function preview(queue, statePath, { readIssues = readGithubIssues,
     const rows = state?.list() ?? [];
     const hold = dispatchHold(rows, state?.get('control'));
     const issues = hold ? [] : await load(signal);
-    const eligible = runnable(issues, rows).map(issue => ({
+    const eligible = runnable(issues, rows, sourceRepo).map(issue => ({
       number: issue.number, model: MODELS[issue.model], title: issue.title
     }));
     return { mode: 'dry-run', ...(sourceRepo && { sourceRepo }),
@@ -132,7 +134,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       if (signal?.aborted) return { reason: 'stopped', results };
       const afterPoll = dispatchHold(previous, state.get('control'));
       if (afterPoll) return { reason: afterPoll, results };
-      const [issue] = runnable(issues, previous);
+      const [issue] = runnable(issues, previous, sourceRepo);
       if (!issue) {
         if (!sourceRepo || ++idlePolls >= polls) return { reason: 'no-eligible-work', results };
         await wait(intervalMs, undefined, { signal });

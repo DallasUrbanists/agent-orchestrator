@@ -209,6 +209,32 @@ test('refreshes GitHub readiness and remembers a claim while the issue stays rea
   assert.deepEqual(withState(stateDir, store => store.list().map(row => row.number)), [1, 2]);
 });
 
+test('GitHub completion releases dependencies with unsuccessful local claims', async t => {
+  const { queue, stateDir, repo } = fixture(t, [task(1), task(2), task(3), task(4)]);
+  queue.sourceRepo = 'fixture/issue-queue';
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/issue-queue.git']);
+  const outcomes = ['failed', 'blocked', 'stopped'];
+  withState(stateDir, store => {
+    store.bind(repo, queue.sourceRepo);
+    for (const [index, state] of outcomes.entries()) {
+      const number = index + 1;
+      store.reserve({ number, repo, worker: 'local-1', model: 'gpt-6.1-terra',
+        location: worktreeLocation(stateDir, number, queue.sourceRepo), log: 'log' });
+      store.finish(number, { state });
+    }
+  });
+  const dependent = remoteReady(4, [1, 2, 3]);
+  let snapshot = [remoteReady(1), remoteReady(2), remoteReady(3), dependent];
+  const readIssues = async () => snapshot;
+  assert.deepEqual((await preview(queue, stateDir, { readIssues })).eligible, []);
+
+  snapshot = [...snapshot.slice(0, 3).map(issue => ({ ...issue, state: 'done' })), dependent];
+  assert.deepEqual((await preview(queue, stateDir, { readIssues })).eligible.map(issue => issue.number), [4]);
+  const result = await execute(queue, stateDir, { ...options, readIssues }, done);
+  assert.deepEqual(result.results.map(issue => [issue.number, issue.state]), [[4, 'done']]);
+  assert.deepEqual(withState(stateDir, store => store.list().map(row => row.state)), [...outcomes, 'done']);
+});
+
 test('does not reserve work if pause arrives during a GitHub request', async t => {
   const { queue, stateDir, repo } = fixture(t);
   queue.sourceRepo = 'fixture/issue-queue';
