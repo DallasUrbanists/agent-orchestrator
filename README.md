@@ -25,7 +25,7 @@ $env:ORCHESTRATOR_LIVE_TEST = '1'
 try { npm run test:integration } finally { Remove-Item Env:ORCHESTRATOR_LIVE_TEST }
 ```
 
-This test makes real Codex requests and can consume usage. It creates a fresh local Git repository, supplies fixture GitHub issue snapshots, and gives Terra and Sol separate worktrees. It checks that both file edits stay in their assigned worktrees, that both workers return structured results, and that the controller dispatches Sol automatically after Terra. It also checks that reopening the state does not dispatch either claimed issue again and that an issue without a reviewed prompt stays unclaimed. The Windows tests exercise cancellation and timeouts against a real subprocess with a child process. The test prints the disposable folders and retains them for inspection.
+This test makes real Codex requests and can consume usage. It creates a fresh local Git repository, supplies fixture GitHub issue snapshots, and gives Terra and Sol separate worktrees. It checks that both file edits stay in their assigned worktrees, that both workers return structured results, and that the controller dispatches Sol automatically after Terra. It checks that Terra can pause for a decision while Sol completes independent work, then resume in its original worktree after an authorized fixture reply. Reopening the state leaves both completed claims and the unapproved issue alone. The Windows tests exercise cancellation and timeouts against a real subprocess with a child process. The test prints the disposable folders and retains them for inspection.
 
 The live worker also runs a synthetic filesystem probe that should return access denied when it tries to overwrite a file beside the worktree under Windows Temp. If the sentinel changes or the probe cannot establish the denial, the integration gate fails. This checks one write boundary on the host. The Windows worker currently uses the legacy unelevated workspace-write sandbox. Read access and network isolation have different limits, so keep the integration on disposable data. [Codex Windows sandbox](https://learn.chatgpt.com/docs/windows/windows-sandbox)
 
@@ -71,7 +71,7 @@ For a local queue, dry-run lists tasks eligible now in dispatch order. Use the s
 
 The controller snapshots the target's current committed HEAD at the start of each invocation. Every task in that invocation starts from that commit. A dependency's completion opens the scheduling gate. To use its edits as a later task's base, inspect and integrate them yourself before starting the later task. Use `--limit 1`, the default, when you need to review between tasks.
 
-The allowlist matches the canonical checkout path. The controller keeps one state directory per checkout and requires it to sit outside the target checkout. It does not accept live GitHub issue bodies as executable tasks. It passes the operator-reviewed prompt as text on stdin, starts the CLI without a shell, and requests workspace-write with no approval escalation. The controller creates local branches. Authenticated decision replies and PR automation are future work.
+The allowlist matches the canonical checkout path. The controller keeps one state directory per checkout and requires it to sit outside the target checkout. It does not accept live GitHub issue bodies as executable tasks. It passes the operator-reviewed prompt as text on stdin, starts the CLI without a shell, and requests workspace-write with no approval escalation. The controller creates local branches. PR automation is future work.
 
 ## Poll GitHub issues and claim reviewed work
 
@@ -108,7 +108,47 @@ npm run status -- --state .\state\github-demo
 
 The GitHub-backed controller refreshes issue metadata before each dispatch. It uses the local prompt verbatim as task content and uses GitHub metadata for readiness, model, priority, and dependencies. For a run, `--polls` limits consecutive polls with no eligible work and defaults to one. `--interval-seconds` is the delay between those idle polls. A failed GitHub read stops the run and preserves existing claims.
 
-The controller binds the state directory to the checkout and `sourceRepo`. It records each issue claim in SQLite before creating the worktree or launching Codex. Keep using the same state directory on this machine. A task stays claimed across polls and restarts even if GitHub still shows it as ready. Local claims coordinate controllers that share this state directory. All GitHub operations in this workflow are issue-list GET requests.
+The controller binds the state directory to the checkout and `sourceRepo`. It records each issue claim in SQLite before creating the worktree or launching Codex. Keep using the same state directory on this machine. A task stays claimed across polls and restarts even if GitHub still shows it as ready. Local claims coordinate controllers that share this state directory. With the default options, GitHub operations are issue-list GET requests.
+
+## Ask for a decision on GitHub
+
+Enable issue comments explicitly with `--github-decisions` on a real run. Use a GitHub-backed queue, a signed-in `gh` account with permission to comment on the target issues, and a local list of authorized GitHub account IDs. To find an account ID, run `gh api users/LOGIN --jq .id` and verify the account before adding it.
+
+Add `authorizedResponders` to the queue and add reviewed decisions to the relevant issue entries. The worker can select each reviewed key once. GitHub receives the question, choice labels, and exact reply commands. Choice instructions stay local until the controller sends the chosen instruction to Codex.
+
+```json
+{
+  "target": "C:/sandbox/disposable-demo",
+  "allowedRepos": ["C:/sandbox/disposable-demo"],
+  "sourceRepo": "example-org/disposable-demo",
+  "authorizedResponders": [12345678],
+  "issues": [
+    {
+      "number": 12,
+      "prompt": "Build the draft index and ask for a layout decision before finishing.",
+      "decisions": [
+        {
+          "key": "layout",
+          "question": "Which layout should the draft index use?",
+          "choices": [
+            { "id": "list", "label": "List", "instruction": "Finish the draft using the reviewed list layout." },
+            { "id": "grid", "label": "Grid", "instruction": "Finish the draft using the reviewed grid layout." }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+```powershell
+npm run start -- --queue queue.local.json --state .\state\github-demo --execute --github-decisions --limit 4 --polls 20 --interval-seconds 15
+npm run status -- --state .\state\github-demo
+```
+
+The controller saves the blocked claim and request together, then posts the reviewed question on the issue. Independent tasks can run while the controller waits. From GitHub on mobile or desktop, add a new comment containing exactly one command from the request. The controller records the first matching, unedited reply from an authorized account. It uses the approved choice instruction stored with the request and starts a fresh Codex session in the original worktree. The issue must remain ready, approved locally, and eligible under its dependencies. A successful resumption counts toward `--limit`. When the run reaches its poll limit, use the same command and state directory to check for replies again.
+
+If a comment request times out, the controller checks later polls for the original message from the publishing account. Status shows `delivery-unconfirmed` when that check cannot confirm delivery. If you have inspected the issue and verified that the request was never posted, rearm that request with `node src/cli.js retry-decision REQUEST-ID --state .\state\github-demo`, then run the controller again. It checks for the original comment before posting. Keep the same signed-in publishing account during recovery.
 
 ## Pause, stop, and inspect
 
@@ -123,7 +163,7 @@ Get-Content .\state\demo\logs\task-1.jsonl -Tail 20
 
 Pause lets the current worker finish and prevents the next dispatch. Stop asks the controller to terminate the active process tree and prevents later dispatch. Ctrl+C asks the current controller to stop. On Windows, the controller uses `taskkill /T` for tree termination. On POSIX it signals the worker's process group and records an interruption because detached descendants may survive. Pause and stop set a durable control flag. Run `npm run unpause -- --state .\state\demo` and start the controller again when ready.
 
-The controller stores task claims, timestamps, model, branch, worktree, PID, Codex session ID, terminal state, and diagnostic categories in SQLite. Logs record structured event types and exit codes. Raw prompts, command output, and the free-form model response are omitted from controller logs and the database. Codex keeps its own session record under the signed-in user.
+The controller stores task claims, timestamps, model, branch, worktree, PID, Codex session ID, terminal state, and diagnostic categories in SQLite. Logs record structured event types and exit codes. Controller logs and the database omit raw worker prompts, command output, and free-form model responses. Decision records retain the locally reviewed template, chosen option, and GitHub comment and responder IDs. Codex keeps its own session record under the signed-in user.
 
 A failed or blocked task leaves its worktree available if one was created. A controller logging or control-state failure ends the run. Dependencies wait, and independent tasks can continue within the run limit. The controller does not retry failed tasks automatically. After an abrupt restart, it marks the previous claim interrupted and holds dispatch because a worker might still be alive. Inspect the recorded worktree and PID, verify that the old worker and its children have exited, and then clear the hold with the following command. Acknowledging the interruption never reruns that task.
 

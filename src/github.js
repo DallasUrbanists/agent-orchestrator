@@ -77,25 +77,54 @@ export function normalizeIssues(pages) {
   return issues.sort((a, b) => a.number - b.number);
 }
 
-export async function readGithubIssues(sourceRepo, { signal } = {}, run = request) {
-  const repo = githubRepo(sourceRepo);
+async function githubRequest(method, args, failure, { signal } = {}, run = request) {
   let stdout;
   try {
-    ({ stdout } = await run('gh', ['api', '--hostname', 'github.com', '--method', 'GET',
-      '--paginate', '--slurp', 'repos/' + repo + '/issues?state=all&sort=created&direction=asc&per_page=100'], {
+    ({ stdout } = await run('gh', ['api', '--hostname', 'github.com', '--method', method, ...args], {
       encoding: 'utf8', windowsHide: true, timeout: 30000, maxBuffer: 16 * 1024 * 1024,
       signal, env: { ...process.env, GH_PROMPT_DISABLED: '1' }
     }));
   } catch (error) {
     if (signal?.aborted) throw error;
     if (error.code === 'ENOENT') throw new Error('GitHub CLI (gh) is required for GitHub issue polling');
-    throw new Error('GitHub issue poll failed for ' + repo + '. Check gh authentication, access, and rate limits');
+    throw new Error(failure + '. Check gh authentication, access, and rate limits');
   }
-  let pages;
-  try { pages = JSON.parse(stdout); }
-  catch { throw new Error('GitHub returned unreadable issue pages'); }
+  try { return JSON.parse(stdout); }
+  catch { throw new Error('GitHub returned unreadable ' + (failure.startsWith('GitHub issue poll') ? 'issue pages' : 'decision data')); }
+}
+
+export async function readGithubIssues(sourceRepo, options, run) {
+  const repo = githubRepo(sourceRepo);
+  const pages = await githubRequest('GET', ['--paginate', '--slurp',
+    'repos/' + repo + '/issues?state=all&sort=created&direction=asc&per_page=100'],
+  'GitHub issue poll failed for ' + repo, options, run);
   return normalizeIssues(pages);
 }
+
+function commentsEndpoint(sourceRepo, number) {
+  if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid GitHub issue number');
+  return 'repos/' + githubRepo(sourceRepo) + '/issues/' + number + '/comments';
+}
+
+export const githubDecisions = {
+  async viewer(options, run) {
+    const user = await githubRequest('GET', ['user'], 'GitHub account lookup failed', options, run);
+    if (!Number.isSafeInteger(user?.id) || user.id < 1) throw new Error('GitHub did not identify the publishing account');
+    return user.id;
+  },
+  async comments(repo, number, options, run) {
+    const pages = await githubRequest('GET', ['--paginate', '--slurp', commentsEndpoint(repo, number) + '?per_page=100'],
+      'GitHub issue comment lookup failed', options, run);
+    if (!Array.isArray(pages) || !pages.length || !pages.every(Array.isArray)) {
+      throw new Error('GitHub returned invalid issue comment pages');
+    }
+    return pages.flat();
+  },
+  post(repo, number, body, options, run) {
+    return githubRequest('POST', [commentsEndpoint(repo, number), '--raw-field', 'body=' + body],
+      'GitHub decision comment delivery could not be confirmed', options, run);
+  }
+};
 
 export function validatePolling(polls, intervalMs) {
   if (!Number.isSafeInteger(polls) || polls < 1 || polls > 1000 ||
