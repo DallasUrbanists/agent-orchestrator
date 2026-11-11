@@ -7,6 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { findCodex, MODELS, runCodex } from '../src/codex.js';
 import { execute } from '../src/controller.js';
+import { normalizeIssues } from '../src/github.js';
 import { stateDirectory, State } from '../src/state.js';
 import { git } from '../src/worktrees.js';
 
@@ -26,7 +27,7 @@ function disposable(t) {
   return { scratch, repo, stateDir: stateDirectory(join(scratch, 'run')) };
 }
 
-test('dispatches Terra and Sol sequentially in separate disposable worktrees', {
+test('polls and durably claims Terra and Sol tasks in separate disposable worktrees', {
   skip: !live, timeout: 330000
 }, async t => {
   const { scratch, repo, stateDir } = disposable(t);
@@ -44,7 +45,7 @@ test('dispatches Terra and Sol sequentially in separate disposable worktrees', {
   git(repo, ['-c', 'user.name=Orchestrator Test', '-c', 'user.email=test@example.invalid',
     '-c', 'commit.gpgsign=false', 'commit', '-m', 'Add scoped sandbox probe']);
   const issues = ['terra', 'sol'].map((model, index) => ({
-    number: index + 1, model, state: 'ready', dependencies: index ? [1] : [],
+    number: index + 1,
     prompt: 'Set ' + model + '.txt to exactly the text integrated-' + model +
       ' (a trailing newline is allowed). Read it back. ' +
       (index ? '' : 'Run the committed disposable sandbox probe using node probe.cjs once. ' +
@@ -52,11 +53,32 @@ test('dispatches Terra and Sol sequentially in separate disposable worktrees', {
         'Report the outcome without modifying the probe or its result file. ') +
       'Return the required structured outcome.'
   }));
-  const result = await execute({ target: repo, allowedRepos: [repo], issues }, stateDir,
-    { executable: findCodex(), limit: 3, timeoutMs: 140000 });
+  const sourceRepo = 'fixture/disposable-issues';
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/' + sourceRepo + '.git']);
+  const metadata = ['terra', 'sol', 'terra'].map((model, index) => ({
+    number: index + 1,
+    title: 'Fixture issue ' + (index + 1),
+    state: 'open',
+    body: index === 1 ? 'Depends on: #1' : '',
+    labels: [{ name: 'agent:ready' }, { name: 'model:' + model }]
+  }));
+  const queue = { target: repo, allowedRepos: [repo], sourceRepo, issues };
+  const executable = findCodex();
+  let reads = 0;
+  const readIssues = async repoName => {
+    assert.equal(repoName, sourceRepo);
+    reads++;
+    return normalizeIssues([reads === 1 ? [] : metadata]);
+  };
+  const result = await execute(queue, stateDir, {
+    executable, limit: 3, timeoutMs: 140000, polls: 2, intervalMs: 10, readIssues
+  });
   const store = new State(stateDir);
   let rows;
-  try { rows = store.list(); } finally { store.close(); }
+  try {
+    assert.equal(store.get('sourceRepo'), sourceRepo);
+    rows = store.list();
+  } finally { store.close(); }
   t.diagnostic(JSON.stringify(result));
   for (const row of rows) {
     t.diagnostic(JSON.stringify({ model: row.model, state: row.state, detail: row.detail,
@@ -67,7 +89,7 @@ test('dispatches Terra and Sol sequentially in separate disposable worktrees', {
   assert.equal(rows.length, 2);
   assert.notEqual(rows[0].worktree, rows[1].worktree);
   for (const [index, row] of rows.entries()) {
-    const { model } = issues[index];
+    const model = ['terra', 'sol'][index];
     assert.equal(row.model, MODELS[model]);
     assert.equal(row.exit_code, 0);
     assert.ok(row.session);
@@ -77,8 +99,8 @@ test('dispatches Terra and Sol sequentially in separate disposable worktrees', {
   }
   assert.equal(readFileSync(outside, 'utf8'), 'outside-sentinel', 'sandbox allowed a sibling Temp write');
   assert.match(readFileSync(join(rows[0].worktree, 'probe-result.txt'), 'utf8'), /^(EPERM|EACCES)$/);
-  const restart = await execute({ target: repo, allowedRepos: [repo], issues }, stateDir,
-    { executable: findCodex(), limit: 3 }, () => assert.fail('restart dispatched a finished task'));
+  const restart = await execute(queue, stateDir, { executable, limit: 3, readIssues },
+    () => assert.fail('restart dispatched a claimed or unapproved task'));
   assert.deepEqual(restart, { reason: 'no-eligible-work', results: [] });
 });
 

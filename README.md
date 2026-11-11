@@ -4,7 +4,7 @@ The orchestrator reads a local queue of reviewed tasks, starts one Codex CLI wor
 
 ## Set up on Windows
 
-Install Node.js 24 or later, Git for Windows, and Codex CLI 0.163.0 or later. GitHub CLI is optional for operating the controller. From PowerShell in this checkout, run the following commands.
+Install Node.js 24 or later, Git for Windows, and Codex CLI 0.163.0 or later. Install GitHub CLI if you want to poll GitHub issues. From PowerShell in this checkout, run the following commands.
 
 ```powershell
 npm ci
@@ -25,7 +25,7 @@ $env:ORCHESTRATOR_LIVE_TEST = '1'
 try { npm run test:integration } finally { Remove-Item Env:ORCHESTRATOR_LIVE_TEST }
 ```
 
-This test makes real Codex requests and can consume usage. It creates a fresh local Git repository and gives Terra and Sol separate worktrees. It checks that both file edits stay in their assigned worktrees, that both workers return structured results, and that the controller dispatches Sol automatically after Terra. It also checks that reopening the state does not dispatch either task again. The Windows tests exercise cancellation and timeouts against a real subprocess with a child process. The test prints the disposable folders and retains them for inspection.
+This test makes real Codex requests and can consume usage. It creates a fresh local Git repository, supplies fixture GitHub issue snapshots, and gives Terra and Sol separate worktrees. It checks that both file edits stay in their assigned worktrees, that both workers return structured results, and that the controller dispatches Sol automatically after Terra. It also checks that reopening the state does not dispatch either claimed issue again and that an issue without a reviewed prompt stays unclaimed. The Windows tests exercise cancellation and timeouts against a real subprocess with a child process. The test prints the disposable folders and retains them for inspection.
 
 The live worker also runs a synthetic filesystem probe that should return access denied when it tries to overwrite a file beside the worktree under Windows Temp. If the sentinel changes or the probe cannot establish the denial, the integration gate fails. This checks one write boundary on the host. The Windows worker currently uses the legacy unelevated workspace-write sandbox. Read access and network isolation have different limits, so keep the integration on disposable data. [Codex Windows sandbox](https://learn.chatgpt.com/docs/windows/windows-sandbox)
 
@@ -71,7 +71,44 @@ For a local queue, dry-run lists tasks eligible now in dispatch order. Use the s
 
 The controller snapshots the target's current committed HEAD at the start of each invocation. Every task in that invocation starts from that commit. A dependency's completion opens the scheduling gate. To use its edits as a later task's base, inspect and integrate them yourself before starting the later task. Use `--limit 1`, the default, when you need to review between tasks.
 
-The allowlist matches the canonical checkout path. The controller keeps one state directory per checkout and requires it to sit outside the target checkout. It does not accept live GitHub issue bodies as executable tasks. It passes the operator-reviewed prompt as text on stdin, starts the CLI without a shell, and requests workspace-write with no approval escalation. The controller creates local branches only. GitHub issue polling, authenticated replies, PR automation, and unattended operation are future work.
+The allowlist matches the canonical checkout path. The controller keeps one state directory per checkout and requires it to sit outside the target checkout. It does not accept live GitHub issue bodies as executable tasks. It passes the operator-reviewed prompt as text on stdin, starts the CLI without a shell, and requests workspace-write with no approval escalation. The controller creates local branches. Authenticated decision replies and PR automation are future work.
+
+## Poll GitHub issues and claim reviewed work
+
+Sign in to GitHub CLI with `gh auth login` if needed. The poll command lists issue metadata using paginated GET requests. It omits pull requests and raw issue bodies and works without a target checkout.
+
+```powershell
+npm run poll -- --repo DallasUrbanists/agent-orchestrator
+npm run poll -- --repo DallasUrbanists/agent-orchestrator --polls 3 --interval-seconds 15
+```
+
+A runnable issue needs the `agent:ready` label and exactly one of `model:terra` or `model:sol`. Optional priority labels are `priority:p0`, `priority:p1`, and `priority:p2`. An issue body can declare same-repository dependencies on one line such as `Depends on: #12, #13`. An issue closed as completed, an open issue labeled `agent:done`, or a completed local claim can satisfy a dependency. Missing or unresolved dependencies hold the dependent task. Conflicting labels and invalid dependency declarations hold the affected issue.
+
+For real work, save a reviewed queue with `sourceRepo` and a local prompt for each approved issue number. Use a disposable Git checkout whose `origin` points to the same repository on github.com.
+
+```json
+{
+  "target": "C:/sandbox/disposable-demo",
+  "allowedRepos": ["C:/sandbox/disposable-demo"],
+  "sourceRepo": "example-org/disposable-demo",
+  "issues": [
+    {
+      "number": 12,
+      "prompt": "Create demo.txt containing the text hello. Read it back to verify the edit."
+    }
+  ]
+}
+```
+
+```powershell
+npm run dry-run -- --queue queue.local.json --state .\state\github-demo
+npm run start -- --queue queue.local.json --state .\state\github-demo --execute --limit 2 --polls 3 --interval-seconds 15
+npm run status -- --state .\state\github-demo
+```
+
+The GitHub-backed controller refreshes issue metadata before each dispatch. It uses the local prompt verbatim as task content and uses GitHub metadata for readiness, model, priority, and dependencies. For a run, `--polls` limits consecutive polls with no eligible work and defaults to one. `--interval-seconds` is the delay between those idle polls. A failed GitHub read stops the run and preserves existing claims.
+
+The controller binds the state directory to the checkout and `sourceRepo`. It records each issue claim in SQLite before creating the worktree or launching Codex. Keep using the same state directory on this machine. A task stays claimed across polls and restarts even if GitHub still shows it as ready. Local claims coordinate controllers that share this state directory. All GitHub operations in this workflow are issue-list GET requests.
 
 ## Pause, stop, and inspect
 
@@ -100,7 +137,8 @@ Worktrees remain available for inspection by default. Use `node src/cli.js clean
 
 ```mermaid
 flowchart LR
-    Queue["Reviewed local task queue"] --> Controller["Controller"]
+    GitHub["GitHub issue metadata via GET"] --> Controller["Controller"]
+    Queue["Reviewed local task queue"] --> Controller
     Operator["PowerShell controls"] --> State["SQLite task state"]
     Controller <--> State
     Controller --> Worktree["Dedicated Git worktree and branch"]

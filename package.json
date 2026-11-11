@@ -8,6 +8,7 @@
     "test": "node --test test/*.test.js",
     "doctor": "node src/cli.js doctor",
     "dry-run": "node src/cli.js",
+    "poll": "node src/cli.js poll",
     "start": "node src/cli.js",
     "status": "node src/cli.js status",
     "pause": "node src/cli.js pause",

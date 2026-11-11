@@ -12,6 +12,7 @@ const task = (number, dependencies = [], model = 'terra') => ({
   number, state: 'ready', model, dependencies, prompt: 'Task ' + number
 });
 const done = async () => ({ state: 'done' });
+const remoteReady = (number, dependencies = []) => ({ number, state: 'ready', model: 'terra', dependencies });
 
 function fixture(t, issues = [task(1)]) {
   const root = mkdtempSync(join(tmpdir(), 'orchestrator-test-'));
@@ -73,7 +74,7 @@ test('holds independent tasks when a worker cannot confirm tree termination', as
   assert.equal(result.reason, 'interrupted-worker-needs-review');
   assert.equal(launched, 1);
   assert.equal(withState(stateDir, store => store.task(1).state), 'interrupted');
-  assert.deepEqual(preview(queue, stateDir).eligible, []);
+  assert.deepEqual((await preview(queue, stateDir)).eligible, []);
 });
 
 test('a second controller cannot claim tasks while a run owns the state', async t => {
@@ -143,13 +144,13 @@ test('stop cancels the current worker and persists across restarts', async t => 
 test('previews local tasks in real dispatch order using saved outcomes and controls', async t => {
   const { queue, stateDir } = fixture(t, [task(1), { ...task(2), priority: 0 }, task(3, [2])]);
   const missing = join(stateDir, 'unused');
-  assert.deepEqual(preview(queue, missing).eligible.map(row => row.number), [2, 1]);
+  assert.deepEqual((await preview(queue, missing)).eligible.map(row => row.number), [2, 1]);
   assert.equal(existsSync(missing), false);
   const first = await execute(queue, stateDir, { ...options, limit: 1 }, done);
   assert.equal(first.results[0].number, 2);
-  assert.deepEqual(preview(queue, stateDir).eligible.map(row => row.number), [1, 3]);
+  assert.deepEqual((await preview(queue, stateDir)).eligible.map(row => row.number), [1, 3]);
   withState(stateDir, store => store.set('control', 'pause'));
-  assert.deepEqual(preview(queue, stateDir), { mode: 'dry-run', reason: 'pause', eligible: [] });
+  assert.deepEqual(await preview(queue, stateDir), { mode: 'dry-run', reason: 'pause', eligible: [] });
 });
 
 test('rejects state paths under a checkout or its shared Git directory before creating them', async t => {
@@ -175,4 +176,75 @@ test('a log collision preserves the existing log and stops before launching any 
   ] });
   assert.equal(withState(stateDir, store => store.task(1).state), 'failed');
   assert.equal(readFileSync(log, 'utf8'), 'previous output');
+});
+
+test('refreshes GitHub readiness and remembers a claim while the issue stays ready', async t => {
+  const { queue, stateDir, repo } = fixture(t, [task(1), task(2), task(3)]);
+  queue.sourceRepo = 'Fixture/Issue-Queue';
+  git(repo, ['remote', 'add', 'origin', 'git@github.com:fixture/issue-queue.git']);
+  const first = remoteReady(1);
+  const second = remoteReady(2, [1]);
+  const unavailable = remoteReady(3, [99]);
+  const unapproved = remoteReady(4);
+  let reads = 0;
+  const result = await execute(queue, stateDir, { ...options, readIssues: async source => {
+    assert.equal(source, 'fixture/issue-queue');
+    reads++;
+    const latest = reads === 1 ? second : { ...second, state: 'blocked' };
+    return [first, latest, unavailable, unapproved];
+  } }, async ({ prompt, cwd }) => {
+    const row = withState(stateDir, store => store.task(1));
+    assert.equal(row.state, 'running');
+    assert.equal(row.worktree, cwd);
+    assert.equal(row.branch, 'orchestrator/github-issue-1');
+    assert.match(prompt, /Operator-reviewed task:\nTask 1$/);
+    return done();
+  });
+  assert.equal(reads, 2);
+  assert.deepEqual(result.results.map(row => row.number), [1]);
+  const readIssues = async () => [first, second, unavailable, unapproved];
+  assert.deepEqual((await preview(queue, stateDir, { readIssues })).eligible.map(row => row.number), [2]);
+  const restart = await execute(queue, stateDir, { ...options, readIssues }, done);
+  assert.deepEqual(restart.results.map(row => row.number), [2]);
+  assert.deepEqual(withState(stateDir, store => store.list().map(row => row.number)), [1, 2]);
+});
+
+test('does not reserve work if pause arrives during a GitHub request', async t => {
+  const { queue, stateDir, repo } = fixture(t);
+  queue.sourceRepo = 'fixture/issue-queue';
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/issue-queue.git']);
+  const result = await execute(queue, stateDir, { ...options, readIssues: async () => {
+    withState(stateDir, store => store.set('control', 'pause'));
+    return [remoteReady(1)];
+  } }, () => assert.fail('paused'));
+  assert.deepEqual(result, { reason: 'pause', results: [] });
+  assert.deepEqual(withState(stateDir, store => store.list()), []);
+});
+
+test('rejects a mismatched origin or a different claim source before polling', async t => {
+  const { queue, stateDir, repo } = fixture(t);
+  queue.sourceRepo = 'fixture/issue-queue';
+  const guarded = { ...options, readIssues: () => assert.fail('wrong source polled') };
+  await assert.rejects(execute(queue, stateDir, guarded), /checkout origin must match/);
+  assert.equal(existsSync(join(stateDir, 'tasks.sqlite')), false);
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/issue-queue.git']);
+  await execute(queue, stateDir, { ...options, readIssues: async () => [] });
+  const other = { ...queue, sourceRepo: 'fixture/other-queue' };
+  git(repo, ['remote', 'set-url', 'origin', 'https://github.com/fixture/other-queue.git']);
+  await assert.rejects(execute(other, stateDir, guarded), /different task source/);
+  await assert.rejects(preview(other, stateDir, guarded), /different task source/);
+  await assert.rejects(execute({ ...queue, sourceRepo: undefined }, stateDir, guarded), /different task source/);
+});
+
+test('preserves earlier claims when a later GitHub poll fails', async t => {
+  const { queue, stateDir, repo } = fixture(t, [task(1), task(2)]);
+  queue.sourceRepo = 'fixture/issue-queue';
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/issue-queue.git']);
+  let reads = 0;
+  const readIssues = async () => {
+    if (++reads > 1) throw new Error('poll failed');
+    return [remoteReady(1), remoteReady(2)];
+  };
+  await assert.rejects(execute(queue, stateDir, { ...options, readIssues }, done), /poll failed/);
+  assert.deepEqual(withState(stateDir, store => store.list().map(row => [row.number, row.state])), [[1, 'done']]);
 });

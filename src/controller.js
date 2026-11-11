@@ -1,6 +1,8 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { setTimeout as wait } from 'node:timers/promises';
 import { MODELS, runCodex } from './codex.js';
+import { githubOrigin, githubRepo, readGithubIssues, validatePolling } from './github.js';
 import { eligibleIssues, validateIssues } from './scheduler.js';
 import { lease, resolveStatePath, State, stateDirectory } from './state.js';
 import { createWorktree, git, verifyTarget, worktreeLocation } from './worktrees.js';
@@ -18,12 +20,47 @@ function workerPrompt(issue) {
   ].join('\n');
 }
 
-function validateQueue(queue) {
-  validateIssues(queue?.issues);
-  for (const issue of queue.issues) {
-    if (issue.state === 'ready' && (typeof issue.prompt !== 'string' || !issue.prompt.trim() ||
-        issue.prompt.length > 32000)) throw new Error('A reviewed prompt is required for ready task #' + issue.number);
+function validatePrompt(issue) {
+  if (typeof issue.prompt !== 'string' || !issue.prompt.trim() || issue.prompt.length > 32000) {
+    throw new Error('A reviewed prompt is required for task #' + issue.number);
   }
+}
+
+function prepareQueue(queue, repo, readIssues) {
+  if (queue.sourceRepo === undefined) {
+    validateIssues(queue.issues);
+    for (const issue of queue.issues) {
+      if (issue.state === 'ready') validatePrompt(issue);
+    }
+    return { sourceRepo: null, load: () => queue.issues };
+  }
+  const sourceRepo = githubRepo(queue.sourceRepo);
+  let origin;
+  try { origin = git(repo, ['config', '--local', '--get-all', 'remote.origin.url']); }
+  catch { /* A source checkout must have an origin. */ }
+  if (!origin || githubOrigin(origin) !== sourceRepo) {
+    throw new Error('The checkout origin must match sourceRepo on github.com');
+  }
+  if (!Array.isArray(queue.issues)) throw new Error('GitHub queues need an issues array of reviewed prompts');
+  const prompts = new Map();
+  for (const issue of queue.issues) {
+    if (!Number.isSafeInteger(issue?.number) || issue.number < 1 || prompts.has(issue.number)) {
+      throw new Error('Reviewed GitHub issue numbers must be unique positive integers');
+    }
+    validatePrompt(issue);
+    prompts.set(issue.number, issue.prompt);
+  }
+  return {
+    sourceRepo,
+    async load(signal) {
+      const issues = await readIssues(sourceRepo, { signal });
+      return issues.map(issue => {
+        if (issue.state !== 'ready') return issue;
+        const prompt = prompts.get(issue.number);
+        return prompt ? { ...issue, prompt } : { ...issue, state: 'blocked' };
+      });
+    }
+  };
 }
 
 function dispatchHold(rows, control) {
@@ -35,62 +72,75 @@ function dispatchHold(rows, control) {
   return null;
 }
 
-function runnable(queue, rows) {
-  return eligibleIssues(queue.issues, new Map(rows.map(row => [row.number, row.state])));
+function runnable(issues, rows) {
+  return eligibleIssues(issues, new Map(rows.map(row => [row.number, row.state])));
 }
 
-export function preview(queue, statePath) {
-  validateQueue(queue);
+export async function preview(queue, statePath, { readIssues = readGithubIssues, signal } = {}) {
   const stateDir = resolveStatePath(statePath);
-  const repo = verifyTarget(queue.target, queue.allowedRepos, stateDir);
+  const repo = verifyTarget(queue?.target, queue?.allowedRepos, stateDir);
+  const { sourceRepo, load } = prepareQueue(queue, repo, readIssues);
   let state;
   try {
     if (existsSync(join(stateDir, 'tasks.sqlite'))) {
       state = new State(stateDir, { readOnly: true });
-      const bound = state.get('repo');
-      if (bound && bound !== repo) throw new Error('This state directory belongs to a different checkout');
+      state.assertBinding(repo, sourceRepo);
     }
     const rows = state?.list() ?? [];
     const hold = dispatchHold(rows, state?.get('control'));
-    const eligible = hold ? [] : runnable(queue, rows).map(issue => ({
+    const issues = hold ? [] : await load(signal);
+    const eligible = runnable(issues, rows).map(issue => ({
       number: issue.number, model: MODELS[issue.model], title: issue.title
     }));
-    return { mode: 'dry-run', reason: hold ?? (eligible.length ? 'eligible-work' : 'no-eligible-work'), eligible };
+    return { mode: 'dry-run', ...(sourceRepo && { sourceRepo }),
+      reason: hold ?? (eligible.length ? 'eligible-work' : 'no-eligible-work'), eligible };
   } finally {
     state?.close();
   }
 }
 
 export async function execute(queue, statePath, options, worker = runCodex) {
-  const { executable, limit = 1, timeoutMs = 15 * 60 * 1000, signal } = options;
+  const { executable, limit = 1, timeoutMs = 15 * 60 * 1000, signal,
+    polls = 1, intervalMs = 15000, readIssues = readGithubIssues } = options;
   if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) {
     throw new Error('Specify a positive execution limit and a worker timeout up to one hour');
   }
-  validateQueue(queue);
+  validatePolling(polls, intervalMs);
   const stateDir = resolveStatePath(statePath);
-  const repo = verifyTarget(queue.target, queue.allowedRepos, stateDir);
+  const repo = verifyTarget(queue?.target, queue?.allowedRepos, stateDir);
+  const { sourceRepo, load } = prepareQueue(queue, repo, readIssues);
   const base = git(repo, ['rev-parse', '--verify', 'HEAD^{commit}']);
   if (relative(stateDirectory(stateDir), stateDir) !== '') throw new Error('State directory redirected during setup');
   const release = lease(stateDir);
+  const results = [];
   let state;
   try {
     state = new State(stateDir);
-    state.bind(repo);
+    state.bind(repo, sourceRepo);
     state.recover();
     const logDir = join(stateDir, 'logs');
     mkdirSync(logDir, { recursive: true });
     if (relative(realpathSync(logDir), logDir) !== '') throw new Error('Log directory redirects elsewhere');
-    const results = [];
+    let idlePolls = 0;
     while (results.length < limit) {
       if (signal?.aborted) return { reason: 'stopped', results };
       const previous = state.list();
       const hold = dispatchHold(previous, state.get('control'));
       if (hold) return { reason: hold, results };
-      const [issue] = runnable(queue, previous);
-      if (!issue) return { reason: 'no-eligible-work', results };
+      const issues = await load(signal);
+      if (signal?.aborted) return { reason: 'stopped', results };
+      const afterPoll = dispatchHold(previous, state.get('control'));
+      if (afterPoll) return { reason: afterPoll, results };
+      const [issue] = runnable(issues, previous);
+      if (!issue) {
+        if (!sourceRepo || ++idlePolls >= polls) return { reason: 'no-eligible-work', results };
+        await wait(intervalMs, undefined, { signal });
+        continue;
+      }
+      idlePolls = 0;
 
-      const location = worktreeLocation(stateDir, issue.number);
+      const location = worktreeLocation(stateDir, issue.number, sourceRepo);
       const log = join(logDir, 'task-' + issue.number + '.jsonl');
       // Persist the claim before creating the worktree or spawning a process.
       state.reserve({ number: issue.number, repo, worker: 'local-1', model: MODELS[issue.model], location, log });
@@ -150,6 +200,9 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       if (result.state === 'stopped') return { reason: 'stopped', results };
     }
     return { reason: 'execution-limit', results };
+  } catch (error) {
+    if (signal?.aborted && error.name === 'AbortError') return { reason: 'stopped', results };
+    throw error;
   } finally {
     try { state?.close(); } finally { release(); }
   }

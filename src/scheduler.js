@@ -84,6 +84,6 @@ export function plan(issues, workers = DEFAULT_WORKERS, active = []) {
 export function eligibleIssues(issues, persisted) {
   const byId = new Map(issues.map(issue => [issue.number, issue]));
   return issues.filter(issue => issue.state === 'ready' && !persisted.has(issue.number) &&
-    issue.dependencies.every(number => (persisted.get(number) ?? byId.get(number).state) === 'done'))
+    issue.dependencies.every(number => (persisted.get(number) ?? byId.get(number)?.state) === 'done'))
     .sort(byPriority);
 }
