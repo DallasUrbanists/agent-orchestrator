@@ -53,9 +53,27 @@ export class State {
   set(name, value) {
     this.db.prepare('INSERT OR REPLACE INTO settings VALUES (?, ?)').run(name, value);
   }
-  bind(repo) {
-    this.db.prepare("INSERT OR IGNORE INTO settings VALUES ('repo', ?)").run(repo);
-    if (this.get('repo') !== repo) throw new Error('This state directory belongs to a different checkout');
+  assertBinding(repo, sourceRepo = null) {
+    const bound = this.get('repo');
+    if (bound === undefined) return;
+    if (bound !== repo) throw new Error('This state directory belongs to a different checkout');
+    if ((this.get('sourceRepo') ?? null) !== sourceRepo) {
+      throw new Error('This state directory belongs to a different task source');
+    }
+  }
+  bind(repo, sourceRepo = null) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.assertBinding(repo, sourceRepo);
+      if (this.get('repo') === undefined) {
+        this.set('repo', repo);
+        if (sourceRepo) this.set('sourceRepo', sourceRepo);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
   list() { return this.db.prepare('SELECT * FROM tasks ORDER BY number').all(); }
   task(number) { return this.db.prepare('SELECT * FROM tasks WHERE number = ?').get(number); }

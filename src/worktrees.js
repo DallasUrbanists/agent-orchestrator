@@ -40,11 +40,11 @@ export function verifyTarget(target, allowedRepos, stateDir) {
   return repo;
 }
 
-export function worktreeLocation(stateDir, number) {
+export function worktreeLocation(stateDir, number, sourceRepo = null) {
   const root = join(stateDir, 'worktrees');
   mkdirSync(root, { recursive: true });
   if (relative(realpathSync(root), root) !== '') throw new Error('Worktree directory redirects elsewhere');
-  const branch = 'orchestrator/task-' + number;
+  const branch = 'orchestrator/' + (sourceRepo ? 'github-issue-' : 'task-') + number;
   return { path: join(root, 'task-' + number), branch };
 }
 

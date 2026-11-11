@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { findCodex, MODELS } from './codex.js';
 import { execute, preview } from './controller.js';
+import { pollGithubIssues } from './github.js';
 import { plan } from './scheduler.js';
 import { lease, State, stateDirectory } from './state.js';
 import { removeCleanWorktree } from './worktrees.js';
@@ -22,6 +23,8 @@ async function main() {
     allowPositionals: true,
     options: {
       queue: { type: 'string' }, state: { type: 'string', default: './state' },
+      repo: { type: 'string' }, polls: { type: 'string', default: '1' },
+      'interval-seconds': { type: 'string', default: '15' },
       execute: { type: 'boolean' }, limit: { type: 'string', default: '1' },
       'timeout-seconds': { type: 'string', default: '900' },
       'confirm-process-exited': { type: 'boolean' }, help: { type: 'boolean' }
@@ -29,14 +32,23 @@ async function main() {
   });
   const [command = 'run', argument, ...extra] = positionals;
   if (values.help) {
-    console.log('Commands: run | doctor | status | pause | stop | unpause | acknowledge N | cleanup N');
+    console.log('Commands: run | poll | doctor | status | pause | stop | unpause | acknowledge N | cleanup N');
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
+    console.log('Poll GitHub read-only with poll --repo OWNER/REPO --polls N --interval-seconds N.');
     return;
   }
   const withNumber = ['acknowledge', 'cleanup'].includes(command);
   if (extra.length || (withNumber ? !/^[1-9]\d*$/.test(argument ?? '') ||
       !Number.isSafeInteger(Number(argument)) : argument !== undefined)) {
     throw new Error('Unexpected command arguments. Use --help');
+  }
+
+  if (values.repo && command !== 'poll') throw new Error('--repo is only used with poll');
+  const polling = { polls: Number(values.polls), intervalMs: 1000 * Number(values['interval-seconds']) };
+  if (command === 'poll') {
+    if (values.execute) throw new Error('poll is read-only. Use run with a reviewed queue for execution');
+    for await (const snapshot of pollGithubIssues(values.repo, polling)) print(snapshot);
+    return;
   }
 
   if (command === 'doctor') {
@@ -51,7 +63,7 @@ async function main() {
     const queueFile = values.queue ?? fileURLToPath(new URL('../fixtures/issues.json', import.meta.url));
     const data = JSON.parse(readFileSync(queueFile, 'utf8').replace(/^\uFEFF/, ''));
     if (!values.execute) {
-      return print(Array.isArray(data) ? { mode: 'dry-run', ...plan(data) } : preview(data, resolve(values.state)));
+      return print(Array.isArray(data) ? { mode: 'dry-run', ...plan(data) } : await preview(data, resolve(values.state)));
     }
     if (!values.queue) throw new Error('Real execution requires an explicit local queue');
     const executable = findCodex();
@@ -62,7 +74,7 @@ async function main() {
     try {
       const result = await execute(data, resolve(values.state), {
         executable, limit: Number(values.limit), timeoutMs: 1000 * Number(values['timeout-seconds']),
-        signal: abort.signal
+        signal: abort.signal, ...polling
       });
       print(result);
       if (result.reason === 'interrupted-worker-needs-review' ||
@@ -86,7 +98,10 @@ async function main() {
   let state;
   try {
     state = new State(stateDir);
-    if (command === 'status') return print({ control: state.get('control') ?? 'running', tasks: state.list() });
+    if (command === 'status') {
+      const sourceRepo = state.get('sourceRepo');
+      return print({ control: state.get('control') ?? 'running', ...(sourceRepo && { sourceRepo }), tasks: state.list() });
+    }
     if (command === 'acknowledge') {
       if (!values['confirm-process-exited']) throw new Error('Verify the process tree exited and pass --confirm-process-exited');
       state.recover();
