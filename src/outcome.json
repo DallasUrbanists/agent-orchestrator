@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "outcome": { "type": "string", "enum": ["done", "blocked"] },
+    "summary": { "type": "string" }
+  },
+  "required": ["outcome", "summary"],
+  "additionalProperties": false
+}

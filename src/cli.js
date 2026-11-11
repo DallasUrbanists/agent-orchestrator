@@ -1,0 +1,111 @@
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
+import { findCodex, MODELS } from './codex.js';
+import { execute, preview } from './controller.js';
+import { plan } from './scheduler.js';
+import { lease, State, stateDirectory } from './state.js';
+import { removeCleanWorktree } from './worktrees.js';
+
+function print(value) { console.log(JSON.stringify(value, null, 2)); }
+
+function diagnostic(executable, args, includeOutput = true) {
+  const result = spawnSync(executable, args, { windowsHide: true, encoding: 'utf8', timeout: 5000 });
+  return { ok: result.status === 0, ...(result.status === 0 && includeOutput
+    ? { version: result.stdout.trim().split(/\r?\n/)[0] } : {}) };
+}
+
+async function main() {
+  const { values, positionals } = parseArgs({
+    allowPositionals: true,
+    options: {
+      queue: { type: 'string' }, state: { type: 'string', default: './state' },
+      execute: { type: 'boolean' }, limit: { type: 'string', default: '1' },
+      'timeout-seconds': { type: 'string', default: '900' },
+      'confirm-process-exited': { type: 'boolean' }, help: { type: 'boolean' }
+    }
+  });
+  const [command = 'run', argument, ...extra] = positionals;
+  if (values.help) {
+    console.log('Commands: run | doctor | status | pause | stop | unpause | acknowledge N | cleanup N');
+    console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
+    return;
+  }
+  const withNumber = ['acknowledge', 'cleanup'].includes(command);
+  if (extra.length || (withNumber ? !/^[1-9]\d*$/.test(argument ?? '') ||
+      !Number.isSafeInteger(Number(argument)) : argument !== undefined)) {
+    throw new Error('Unexpected command arguments. Use --help');
+  }
+
+  if (command === 'doctor') {
+    let codex;
+    try { codex = findCodex(); } catch { /* Report missing executable. */ }
+    return print({ node: process.version, platform: process.platform, git: diagnostic('git', ['--version']),
+      gh: diagnostic('gh', ['--version']), codex: codex ? diagnostic(codex, ['--version']) : { ok: false },
+      login: codex ? diagnostic(codex, ['login', 'status'], false) : { ok: false }, models: MODELS });
+  }
+
+  if (command === 'run') {
+    const queueFile = values.queue ?? fileURLToPath(new URL('../fixtures/issues.json', import.meta.url));
+    const data = JSON.parse(readFileSync(queueFile, 'utf8').replace(/^\uFEFF/, ''));
+    if (!values.execute) {
+      return print(Array.isArray(data) ? { mode: 'dry-run', ...plan(data) } : preview(data, resolve(values.state)));
+    }
+    if (!values.queue) throw new Error('Real execution requires an explicit local queue');
+    const executable = findCodex();
+    const abort = new AbortController();
+    const stop = () => abort.abort();
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+    try {
+      const result = await execute(data, resolve(values.state), {
+        executable, limit: Number(values.limit), timeoutMs: 1000 * Number(values['timeout-seconds']),
+        signal: abort.signal
+      });
+      print(result);
+      if (result.reason === 'interrupted-worker-needs-review' ||
+          result.results.some(task => task.state === 'failed')) process.exitCode = 1;
+    } finally {
+      process.off('SIGINT', stop);
+      process.off('SIGTERM', stop);
+    }
+    return;
+  }
+
+  if (!['status', 'pause', 'stop', 'unpause', 'acknowledge', 'cleanup'].includes(command)) {
+    throw new Error('Unknown command. Use --help');
+  }
+  const path = resolve(values.state);
+  if (command === 'status' && !existsSync(resolve(path, 'tasks.sqlite'))) {
+    return print({ control: 'running', tasks: [] });
+  }
+  const stateDir = stateDirectory(path);
+  const release = withNumber ? lease(stateDir) : () => {};
+  let state;
+  try {
+    state = new State(stateDir);
+    if (command === 'status') return print({ control: state.get('control') ?? 'running', tasks: state.list() });
+    if (command === 'acknowledge') {
+      if (!values['confirm-process-exited']) throw new Error('Verify the process tree exited and pass --confirm-process-exited');
+      state.recover();
+      state.acknowledge(Number(argument));
+      return print({ acknowledged: Number(argument) });
+    }
+    if (command === 'cleanup') {
+      const task = state.task(Number(argument));
+      if (task?.state !== 'done' || task.cleaned) throw new Error('Cleanup requires a completed task with a worktree');
+      removeCleanWorktree(task.target, { path: task.worktree, branch: task.branch });
+      state.cleaned(task.number);
+      return print({ cleaned: task.number, retainedBranch: task.branch });
+    }
+    const control = command === 'unpause' ? 'running' : command;
+    state.set('control', control);
+    print({ control });
+  } finally {
+    try { state?.close(); } finally { release(); }
+  }
+}
+
+main().catch(error => { console.error(error.message); process.exitCode = 1; });

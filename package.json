@@ -1,0 +1,19 @@
+{
+  "name": "@dallasurbanists/agent-orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "doctor": "node src/cli.js doctor",
+    "dry-run": "node src/cli.js",
+    "start": "node src/cli.js",
+    "status": "node src/cli.js status",
+    "pause": "node src/cli.js pause",
+    "stop": "node src/cli.js stop",
+    "unpause": "node src/cli.js unpause",
+    "test:integration": "node --test integration/codex.test.js"
+  },
+  "license": "MIT"
+}
