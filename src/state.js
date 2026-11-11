@@ -1,6 +1,17 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
+
+/** Resolve existing ancestors before a missing state directory is created. */
+export function resolveStatePath(path) {
+  try {
+    return realpathSync(path);
+  } catch (error) {
+    const parent = dirname(path);
+    if (error.code !== 'ENOENT' || parent === path) throw error;
+    return join(resolveStatePath(parent), basename(path));
+  }
+}
 
 export function stateDirectory(path) {
   mkdirSync(path, { recursive: true });
@@ -20,9 +31,11 @@ export function lease(path) {
 }
 
 export class State {
-  constructor(path) {
-    this.db = new DatabaseSync(join(path, 'tasks.sqlite'));
-    this.db.exec('PRAGMA busy_timeout = 3000; PRAGMA journal_mode = WAL;');
+  constructor(path, { readOnly = false } = {}) {
+    this.db = new DatabaseSync(join(path, 'tasks.sqlite'), { readOnly });
+    this.db.exec('PRAGMA busy_timeout = 3000;');
+    if (readOnly) return;
+    this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec(
       "CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);" +
       "CREATE TABLE IF NOT EXISTS tasks (" +

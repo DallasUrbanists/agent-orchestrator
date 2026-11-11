@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { findCodex, MODELS } from './codex.js';
-import { execute } from './controller.js';
+import { execute, preview } from './controller.js';
 import { plan } from './scheduler.js';
 import { lease, State, stateDirectory } from './state.js';
 import { removeCleanWorktree } from './worktrees.js';
@@ -50,7 +50,9 @@ async function main() {
   if (command === 'run') {
     const queueFile = values.queue ?? fileURLToPath(new URL('../fixtures/issues.json', import.meta.url));
     const data = JSON.parse(readFileSync(queueFile, 'utf8').replace(/^\uFEFF/, ''));
-    if (!values.execute) return print({ mode: 'dry-run', ...plan(Array.isArray(data) ? data : data.issues) });
+    if (!values.execute) {
+      return print(Array.isArray(data) ? { mode: 'dry-run', ...plan(data) } : preview(data, resolve(values.state)));
+    }
     if (!values.queue) throw new Error('Real execution requires an explicit local queue');
     const executable = findCodex();
     const abort = new AbortController();
@@ -58,7 +60,7 @@ async function main() {
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
     try {
-      const result = await execute(data, stateDirectory(resolve(values.state)), {
+      const result = await execute(data, resolve(values.state), {
         executable, limit: Number(values.limit), timeoutMs: 1000 * Number(values['timeout-seconds']),
         signal: abort.signal
       });

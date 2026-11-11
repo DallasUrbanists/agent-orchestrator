@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { execute } from '../src/controller.js';
+import { execute, preview } from '../src/controller.js';
 import { stateDirectory, State } from '../src/state.js';
 import { createWorktree, git, removeCleanWorktree, worktreeLocation } from '../src/worktrees.js';
 
@@ -61,6 +61,19 @@ test('continues after a blocked task, then releases dependent work after success
   const rerun = await execute(queue, stateDir, options, () => assert.fail('duplicate work'));
   assert.deepEqual(rerun, { reason: 'no-eligible-work', results: [] });
   assert.ok(existsSync(join(stateDir, 'worktrees', 'task-1', 'partial.txt')));
+});
+
+test('holds independent tasks when a worker cannot confirm tree termination', async t => {
+  const { queue, stateDir } = fixture(t, [task(1), task(2)]);
+  let launched = 0;
+  const result = await execute(queue, stateDir, options, async () => {
+    launched++;
+    return { state: 'interrupted', detail: 'process-tree-exit-unconfirmed' };
+  });
+  assert.equal(result.reason, 'interrupted-worker-needs-review');
+  assert.equal(launched, 1);
+  assert.equal(withState(stateDir, store => store.task(1).state), 'interrupted');
+  assert.deepEqual(preview(queue, stateDir).eligible, []);
 });
 
 test('a second controller cannot claim tasks while a run owns the state', async t => {
@@ -125,4 +138,41 @@ test('stop cancels the current worker and persists across restarts', async t => 
   assert.equal(result.results.length, 1);
   assert.equal(withState(stateDir, store => store.task(1).state), 'stopped');
   assert.equal((await execute(queue, stateDir, options, () => assert.fail())).reason, 'stop');
+});
+
+test('previews local tasks in real dispatch order using saved outcomes and controls', async t => {
+  const { queue, stateDir } = fixture(t, [task(1), { ...task(2), priority: 0 }, task(3, [2])]);
+  const missing = join(stateDir, 'unused');
+  assert.deepEqual(preview(queue, missing).eligible.map(row => row.number), [2, 1]);
+  assert.equal(existsSync(missing), false);
+  const first = await execute(queue, stateDir, { ...options, limit: 1 }, done);
+  assert.equal(first.results[0].number, 2);
+  assert.deepEqual(preview(queue, stateDir).eligible.map(row => row.number), [1, 3]);
+  withState(stateDir, store => store.set('control', 'pause'));
+  assert.deepEqual(preview(queue, stateDir), { mode: 'dry-run', reason: 'pause', eligible: [] });
+});
+
+test('rejects state paths under a checkout or its shared Git directory before creating them', async t => {
+  const { queue, repo, stateDir } = fixture(t);
+  const linked = join(stateDir, 'linked-checkout');
+  git(repo, ['worktree', 'add', '--detach', '--', linked, 'HEAD']);
+  for (const [target, path] of [[repo, join(repo, 'new-state')], [linked, join(repo, '.git', 'new-state')]]) {
+    await assert.rejects(execute({ ...queue, target, allowedRepos: [target] }, path, options,
+      () => assert.fail('unsafe state directory')), /must be separate/);
+    assert.equal(existsSync(path), false);
+  }
+});
+
+test('a log collision preserves the existing log and stops before launching any worker', async t => {
+  const { queue, stateDir } = fixture(t, [task(1), task(2)]);
+  const dir = join(stateDir, 'logs');
+  mkdirSync(dir);
+  const log = join(dir, 'task-1.jsonl');
+  writeFileSync(log, 'previous output');
+  const result = await execute(queue, stateDir, options, () => assert.fail('log collision'));
+  assert.deepEqual(result, { reason: 'recording-failed', results: [
+    { number: 1, state: 'failed', detail: 'recording-failed' }
+  ] });
+  assert.equal(withState(stateDir, store => store.task(1).state), 'failed');
+  assert.equal(readFileSync(log, 'utf8'), 'previous output');
 });

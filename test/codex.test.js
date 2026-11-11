@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
-import { codexArgs, jsonLines, MODELS, runCodex } from '../src/codex.js';
+import { codexArgs, jsonLines, MODELS, runCodex, terminateTree } from '../src/codex.js';
 
 const thread = '0199a213-81c0-7800-8aa1-bbab2a035a53';
 const encode = event => JSON.stringify(event) + '\n';
@@ -104,3 +104,56 @@ for (const reason of ['timeout', 'cancelled', 'unconfirmed']) {
     assert.equal(result.detail, reason === 'unconfirmed' ? 'process-tree-exit-unconfirmed' : reason);
   });
 }
+
+test('terminates the worker if recording fails after launch', async () => {
+  const { child, options, spawn } = fixture({
+    onRecord(event) {
+      if (event.type === 'turn.started') throw new Error('log unavailable');
+    }
+  });
+  let killed = false;
+  const run = runCodex(options, spawn, async pid => {
+    assert.equal(pid, child.pid);
+    killed = true;
+    child.emit('close', 1, null);
+    return true;
+  });
+  child.stdout.write(encode({ type: 'turn.started' }));
+  assert.equal((await run).detail, 'recording-failed');
+  assert.ok(killed);
+});
+
+test('reports a terminal record failure without signalling an exited PID', async () => {
+  const { child, options, spawn } = fixture({
+    onRecord(event) {
+      if (event.type === 'worker-exit') throw new Error('log unavailable');
+    }
+  });
+  let signalled = false;
+  const run = runCodex(options, spawn, () => { signalled = true; return false; });
+  child.emit('exit', 1, null);
+  child.emit('close', 1, null);
+  assert.equal((await run).detail, 'recording-failed');
+  assert.equal(signalled, false);
+});
+
+test('does not signal an exited PID while waiting for its streams to close', async () => {
+  const { child, options, spawn } = fixture();
+  const cancel = new AbortController();
+  let signalled = false;
+  const run = runCodex({ ...options, signal: cancel.signal }, spawn, () => {
+    signalled = true;
+    return false;
+  });
+  child.emit('exit', 0, null);
+  cancel.abort();
+  child.emit('close', 0, null);
+  assert.equal((await run).state, 'interrupted');
+  assert.equal(signalled, false);
+});
+
+test('a POSIX group signal cannot confirm descendant exit', { skip: process.platform === 'win32' }, async t => {
+  const signal = t.mock.method(process, 'kill', () => true);
+  assert.equal(await terminateTree(1234), false);
+  assert.deepEqual(signal.mock.calls[0].arguments, [-1234, 'SIGKILL']);
+});

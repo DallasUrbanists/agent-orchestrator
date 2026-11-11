@@ -6,6 +6,7 @@ export const DEFAULT_WORKERS = Object.freeze([
 ]);
 
 const VALID_STATES = new Set(['ready', 'in-progress', 'blocked', 'done']);
+const byPriority = (a, b) => (a.priority ?? 99) - (b.priority ?? 99) || a.number - b.number;
 export function validateIssues(issues) {
   if (!Array.isArray(issues)) throw new Error('Issues must be an array');
   const ids = new Set();
@@ -14,6 +15,9 @@ export function validateIssues(issues) {
       throw new Error(`Invalid or duplicate issue number: ${issue.number}`);
     }
     ids.add(issue.number);
+    if (issue.priority != null && !Number.isSafeInteger(issue.priority)) {
+      throw new Error('Invalid priority for #' + issue.number);
+    }
     if (!VALID_STATES.has(issue.state)) throw new Error(`Invalid state for #${issue.number}`);
     if (!['terra', 'sol'].includes(issue.model)) throw new Error(`Invalid model for #${issue.number}`);
     if (!Array.isArray(issue.dependencies) || !issue.dependencies.every(Number.isSafeInteger)) {
@@ -47,7 +51,7 @@ export function plan(issues, workers = DEFAULT_WORKERS, active = []) {
   const assigned = new Set();
   const reservations = new Set(active.flatMap(x => x.paths ?? []));
   const available = issues.filter(issue => issue.state === 'ready' && !activeIssueIds.has(issue.number))
-    .sort((a,b) => (a.priority ?? 99) - (b.priority ?? 99) || a.number - b.number);
+    .sort(byPriority);
   const assignments = [];
   for (const worker of workers) {
     if (activeWorkers.has(worker.id)) continue;
@@ -76,10 +80,10 @@ export function plan(issues, workers = DEFAULT_WORKERS, active = []) {
   }};
 }
 
-/** Picks the next runnable task for the single slot from the persisted queue. */
-export function nextIssue(issues, persisted) {
+/** Returns currently runnable tasks in the order used by the controller. */
+export function eligibleIssues(issues, persisted) {
   const byId = new Map(issues.map(issue => [issue.number, issue]));
   return issues.filter(issue => issue.state === 'ready' && !persisted.has(issue.number) &&
     issue.dependencies.every(number => (persisted.get(number) ?? byId.get(number).state) === 'done'))
-    .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99) || a.number - b.number)[0];
+    .sort(byPriority);
 }

@@ -92,10 +92,11 @@ export function terminateTree(pid) {
   }
   try {
     process.kill(-pid, 'SIGKILL');
-    return Promise.resolve(true);
   } catch {
-    return Promise.resolve(false);
+    // The group may have already exited.
   }
+  // A detached descendant can outlive the original process group.
+  return Promise.resolve(false);
 }
 
 const eventTypes = new Set(['thread.started', 'turn.started', 'turn.completed', 'turn.failed',
@@ -130,12 +131,25 @@ export function runCodex({ executable, cwd, model, prompt, timeoutMs, signal,
     let turnFailed = false;
     let spawnFailed = false;
     let finished = false;
+    let rootExited = false;
+    let closed = false;
+    let recordingFailed = false;
     const found = new Set();
+
+    function record(event) {
+      if (recordingFailed) return;
+      try {
+        onRecord(event);
+      } catch {
+        recordingFailed = true;
+        stop('recording-failed');
+      }
+    }
     function diagnose(value) {
       for (const [name, pattern] of diagnostics) {
         if (pattern.test(value) && !found.has(name)) {
           found.add(name);
-          onRecord({ type: 'diagnostic', category: name });
+          record({ type: 'diagnostic', category: name });
         }
       }
     }
@@ -149,13 +163,13 @@ export function runCodex({ executable, cwd, model, prompt, timeoutMs, signal,
       if (event.type === 'item.completed' && event.item?.type === 'agent_message') {
         final = event.item.text;
       }
-      onRecord({
+      record({
         type: eventTypes.has(event.type) ? event.type : 'unknown-event',
         ...(threadId && event.type === 'thread.started' ? { threadId } : {}),
         ...(itemTypes.has(event.item?.type) ? { itemType: event.item.type } : {}),
         ...(Number.isInteger(event.item?.exit_code) ? { commandExit: event.item.exit_code } : {})
       });
-    }, () => onRecord({ type: 'malformed-output' }));
+    }, () => record({ type: 'malformed-output' }));
 
     function finish(state, detail, code = null, processSignal = null, result) {
       if (finished) return;
@@ -163,14 +177,18 @@ export function runCodex({ executable, cwd, model, prompt, timeoutMs, signal,
       clearTimeout(timer);
       clearTimeout(grace);
       signal?.removeEventListener('abort', cancel);
-      onRecord({ type: 'worker-exit', state, detail, code, signal: processSignal });
+      record({ type: 'worker-exit', state, detail, code, signal: processSignal });
+      if (recordingFailed && state !== 'interrupted' && state !== 'stopped') {
+        resolve({ state: 'failed', detail: 'recording-failed', code, signal: processSignal, threadId });
+        return;
+      }
       resolve({ state, detail, code, signal: processSignal, threadId, result });
     }
 
     function stop(reason) {
-      if (finished || stopReason) return;
+      if (finished || closed || stopReason) return;
       stopReason = reason;
-      termination = Promise.resolve().then(() => killTree(child.pid)).catch(() => false);
+      termination = Promise.resolve().then(() => !rootExited && killTree(child.pid)).catch(() => false);
       grace = setTimeout(() => {
         child.stdout.destroy();
         child.stderr.destroy();
@@ -184,14 +202,21 @@ export function runCodex({ executable, cwd, model, prompt, timeoutMs, signal,
 
     child.stdout.setEncoding('utf8').on('data', chunk => { if (!finished) parser.push(chunk); });
     child.stderr.setEncoding('utf8').on('data', chunk => { if (!finished) diagnose(chunk); });
-    child.stdin.on('error', () => onRecord({ type: 'stdin-error' }));
+    child.stdin.on('error', () => { if (!finished) record({ type: 'stdin-error' }); });
     child.once('error', () => { spawnFailed = true; });
+    child.once('exit', () => { rootExited = true; });
     child.once('close', async (code, processSignal) => {
       if (finished) return;
-      parser.finish();
+      closed = true;
       if (stopReason) {
         if (!await termination) return finish('interrupted', 'process-tree-exit-unconfirmed', code, processSignal);
-        return finish(stopReason === 'timeout' ? 'failed' : 'stopped', stopReason, code, processSignal);
+        return finish(stopReason === 'cancelled' ? 'stopped' : 'failed', stopReason, code, processSignal);
+      }
+      // Flush the last partial line after the process exits. A failed write here
+      // cannot trigger process-tree termination because its PID may be reused.
+      parser.finish();
+      if (recordingFailed) {
+        return finish('failed', 'recording-failed', code, processSignal);
       }
       if (code !== 0 || turnFailed) {
         const detail = spawnFailed ? 'spawn-error' : [...found].join(', ') || 'codex-exit-or-turn-failed';
@@ -207,7 +232,8 @@ export function runCodex({ executable, cwd, model, prompt, timeoutMs, signal,
     timer = setTimeout(() => stop('timeout'), timeoutMs);
     signal?.addEventListener('abort', cancel, { once: true });
     if (signal?.aborted) cancel();
-    onRecord({ type: 'worker-started', pid: child.pid ?? null });
-    child.stdin.end(prompt, 'utf8');
+    record({ type: 'worker-started', pid: child.pid ?? null });
+    if (stopReason) child.stdin.end();
+    else child.stdin.end(prompt, 'utf8');
   });
 }

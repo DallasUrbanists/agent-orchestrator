@@ -63,9 +63,11 @@ Save a queue such as the following as `queue.local.json`. Replace both paths wit
 ```
 
 ```powershell
-npm run dry-run -- --queue queue.local.json
+npm run dry-run -- --queue queue.local.json --state .\state\demo
 npm run start -- --queue queue.local.json --state .\state\demo --execute --limit 2 --timeout-seconds 300
 ```
+
+For a local queue, dry-run lists tasks eligible now in dispatch order. Use the same state path for preview and execution so the preview accounts for previous task outcomes and pause or stop flags.
 
 The controller snapshots the target's current committed HEAD at the start of each invocation. Every task in that invocation starts from that commit. A dependency's completion opens the scheduling gate. To use its edits as a later task's base, inspect and integrate them yourself before starting the later task. Use `--limit 1`, the default, when you need to review between tasks.
 
@@ -82,11 +84,11 @@ npm run stop -- --state .\state\demo
 Get-Content .\state\demo\logs\task-1.jsonl -Tail 20
 ```
 
-Pause lets the current worker finish and prevents the next dispatch. Stop asks the controller to terminate the active process tree and prevents later dispatch. Ctrl+C asks the current controller to stop. Pause and stop set a durable control flag. Run `npm run unpause -- --state .\state\demo` and start the controller again when ready.
+Pause lets the current worker finish and prevents the next dispatch. Stop asks the controller to terminate the active process tree and prevents later dispatch. Ctrl+C asks the current controller to stop. On Windows, the controller uses `taskkill /T` for tree termination. On POSIX it signals the worker's process group and records an interruption because detached descendants may survive. Pause and stop set a durable control flag. Run `npm run unpause -- --state .\state\demo` and start the controller again when ready.
 
 The controller stores task claims, timestamps, model, branch, worktree, PID, Codex session ID, terminal state, and diagnostic categories in SQLite. Logs record structured event types and exit codes. Raw prompts, command output, and the free-form model response are omitted from controller logs and the database. Codex keeps its own session record under the signed-in user.
 
-A failed or blocked task leaves its worktree available. Dependencies wait, and independent tasks can continue within the run limit. The controller does not retry failed tasks automatically. After an abrupt restart, it marks the previous claim interrupted and holds dispatch because a worker might still be alive. Inspect the recorded worktree and PID, verify that the old worker and its children have exited, and then clear the hold with the following command. Acknowledging the interruption never reruns that task.
+A failed or blocked task leaves its worktree available if one was created. A controller logging or control-state failure ends the run. Dependencies wait, and independent tasks can continue within the run limit. The controller does not retry failed tasks automatically. After an abrupt restart, it marks the previous claim interrupted and holds dispatch because a worker might still be alive. Inspect the recorded worktree and PID, verify that the old worker and its children have exited, and then clear the hold with the following command. Acknowledging the interruption never reruns that task.
 
 ```powershell
 node src/cli.js acknowledge 1 --state .\state\demo --confirm-process-exited

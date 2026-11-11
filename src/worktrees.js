@@ -22,7 +22,7 @@ export function inside(root, path) {
 }
 
 export function verifyTarget(target, allowedRepos, stateDir) {
-  if (!isAbsolute(target) || !Array.isArray(allowedRepos) ||
+  if (typeof target !== 'string' || !isAbsolute(target) || !Array.isArray(allowedRepos) ||
       !allowedRepos.every(path => typeof path === 'string' && isAbsolute(path))) {
     throw new Error('Real execution requires absolute target and allowedRepos paths');
   }
@@ -33,7 +33,8 @@ export function verifyTarget(target, allowedRepos, stateDir) {
   const root = realpathSync(git(repo, ['rev-parse', '--show-toplevel']));
   if (relative(root, repo) !== '') throw new Error('Target must be the root of a Git checkout');
   const common = realpathSync(git(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
-  if (inside(repo, stateDir) || inside(stateDir, repo) || inside(stateDir, common)) {
+  if (inside(repo, stateDir) || inside(stateDir, repo) ||
+      inside(common, stateDir) || inside(stateDir, common)) {
     throw new Error('The state directory and target checkout must be separate');
   }
   return repo;
