@@ -1,0 +1,8 @@
+[
+  {"number":1,"title":"Bootstrap workspace","state":"done","model":"terra","dependencies":[],"priority":0,"skill":"general","paths":["package.json"]},
+  {"number":2,"title":"Create Quasar shell","state":"ready","model":"terra","dependencies":[1],"priority":0,"skill":"ui","paths":["apps/editor"]},
+  {"number":3,"title":"Build rendering contract","state":"ready","model":"sol","dependencies":[1],"priority":0,"skill":"rendering","paths":["packages/renderer"]},
+  {"number":4,"title":"Write contributor guide","state":"ready","model":"terra","dependencies":[1],"priority":1,"skill":"docs","paths":["docs"]},
+  {"number":5,"title":"Integrate scene preview","state":"ready","model":"sol","dependencies":[2,3],"priority":0,"skill":"rendering","paths":["apps/editor","packages/renderer"]},
+  {"number":6,"title":"Confirm imagery license","state":"blocked","model":"sol","dependencies":[1],"priority":1,"skill":"gis","paths":["packages/geography"]}
+]
