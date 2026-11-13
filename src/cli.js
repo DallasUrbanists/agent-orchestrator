@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -23,7 +23,7 @@ async function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
     options: {
-      queue: { type: 'string' }, state: { type: 'string', default: './state' },
+      queue: { type: 'string' }, 'watch-acceptance': { type: 'string' }, state: { type: 'string', default: './state' },
       repo: { type: 'string' }, polls: { type: 'string', default: '1' },
       'interval-seconds': { type: 'string', default: '15' },
       execute: { type: 'boolean' }, 'github-decisions': { type: 'boolean' },
@@ -36,6 +36,7 @@ async function main() {
   if (values.help) {
     console.log('Commands: run | poll | doctor | status | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID');
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
+    console.log('Watch supervised merges with run --execute --queue FILE --watch-acceptance FILE --polls N.');
     console.log('Poll GitHub read-only with poll --repo OWNER/REPO --polls N --interval-seconds N.');
     console.log('Opt in to decision comments with run --execute --github-decisions and a reviewed GitHub queue.');
     return;
@@ -51,6 +52,9 @@ async function main() {
 
   if (values['github-decisions'] && (command !== 'run' || !values.execute)) {
     throw new Error('--github-decisions requires a real run with --execute');
+  }
+  if (values['watch-acceptance'] !== undefined && (command !== 'run' || !values.execute || !values.queue)) {
+    throw new Error('--watch-acceptance requires --execute and an explicit --queue');
   }
   if (values.repo && command !== 'poll') throw new Error('--repo is only used with poll');
   const polling = { polls: Number(values.polls), intervalMs: 1000 * Number(values['interval-seconds']) };
@@ -76,6 +80,8 @@ async function main() {
     }
     if (!values.queue) throw new Error('Real execution requires an explicit local queue');
     const executable = findCodex();
+    const acceptancePath = values['watch-acceptance'] === undefined ? null : realpathSync(resolve(values['watch-acceptance']));
+    const readAcceptance = acceptancePath ? () => JSON.parse(readFileSync(acceptancePath, 'utf8').replace(/^\uFEFF/, '')) : undefined;
     const abort = new AbortController();
     const stop = () => abort.abort();
     process.on('SIGINT', stop);
@@ -83,7 +89,7 @@ async function main() {
     try {
       const result = await execute(data, resolve(values.state), {
         executable, limit: Number(values.limit), timeoutMs: 1000 * Number(values['timeout-seconds']),
-        signal: abort.signal, decisionsEnabled: values['github-decisions'], ...polling
+        signal: abort.signal, decisionsEnabled: values['github-decisions'], readAcceptance, acceptancePath, ...polling
       });
       print(result);
       if (result.reason === 'interrupted-worker-needs-review' ||
