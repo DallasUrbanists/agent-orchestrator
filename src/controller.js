@@ -532,8 +532,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           if (candidate) state.adoptRecovery(number, kind, recoveryScope(candidate));
         }
         for (let row of state.recoveryRows()) {
-          const verifier = technical.verifierFor(row.number);
-          const retryableHold = row.hold === 'verification-runner-required' || row.hold === 'verification-runner-unavailable';
+          const retryableHold = row.hold === 'verification-runner-required' || row.hold === 'verification-runner-unavailable' ||
+            row.hold === 'verification-profile-ambiguous';
           const final = finalHostVerification && row.number === finalHostVerification.number &&
             row.kind === 'environment' && row.hold === 'recovery-budget-exhausted' &&
             state.attempts().filter(attempt => attempt.number === row.number).at(-1)?.id === finalHostVerification.afterAttempt &&
@@ -553,6 +553,12 @@ export async function execute(queue, statePath, options, worker = runCodex) {
             state.holdRecovery(row.number, 'task-scope-changed');
             continue;
           }
+          const profile = technical.selectProfile?.(row.number, row.kind, handoff?.issues.get(row.number)?.paths);
+          if (profile?.hold) {
+            state.holdRecovery(row.number, profile.hold);
+            continue;
+          }
+          const verifier = technical.verifierFor(row.number) ?? profile?.read;
           if (coolingDown) {
             if (!state.resetRecoveryBudget(row.number, RECOVERY_COOLDOWN_MS)) continue;
             row = { ...row, used: 0, hold: null };
@@ -571,7 +577,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
               }
             }
             if (row.hold && !final && !blocker) state.holdRecovery(row.number, null);
-            recovery.set(row.number, { ...row, verifierCode, final, blocker });
+            recovery.set(row.number, { ...row, verifierCode, final, blocker, profileEvidence: profile?.evidence });
           }
         }
       }
@@ -732,7 +738,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
             result = { state: 'blocked', detail: 'publication-scope-required',
               result: { technicalBlocker: 'environment' } };
           }
-          const profileEvidence = technical?.profileEvidence?.(issue.number);
+          const profileEvidence = retry?.profileEvidence ?? technical?.profileEvidence?.(issue.number);
           const repairedButNeedsHost = profileEvidence && (resumingImplementation || retry?.kind === 'code') && result?.state === 'blocked' &&
             result.result?.technicalBlocker === 'environment' && !result.result?.decisionKey;
           if (verifying || repairedButNeedsHost || (result.state === 'done' && (publicationEntry || profileEvidence ||
@@ -793,7 +799,9 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           (kind === 'code' || kind === 'environment') ? { kind, scope: recoveryScope(issue) } : null;
         if (verification) result = { ...result, state: 'awaiting-handoff' };
         state.finish(issue.number, attempt, result, request, nextRecovery, verification);
-        if (nextRecovery && ((retry ? retry.used + 1 : 0) >= technical.limit || state.activeMillis(issue.number) >= ACTIVE_BUDGET_MS)) {
+        if (retry?.profileEvidence && result.detail === 'verification-environment-failure') {
+          state.holdRecovery(issue.number, 'verification-host-setup-failed');
+        } else if (nextRecovery && ((retry ? retry.used + 1 : 0) >= technical.limit || state.activeMillis(issue.number) >= ACTIVE_BUDGET_MS)) {
           state.holdRecovery(issue.number, 'recovery-budget-exhausted');
         } else if (nextRecovery?.kind === 'environment' && !technical.verifierFor(issue.number)) {
           state.holdRecovery(issue.number, 'verification-runner-required');

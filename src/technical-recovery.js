@@ -25,13 +25,28 @@ export function recoveryPolicy(value, repo, stateDir) {
     (blockerTasks.length && !hostVerification)) throw new Error('Invalid blocker task configuration');
   if (hostVerification !== undefined) {
     if (verifier !== undefined) throw new Error('Choose either a single verifier or project host verification profiles');
-    const { runner, profiles, issues, toolchain = {} } = hostVerification ?? {};
+    const { runner, profiles, issues = [], rules = [], toolchain = {} } = hostVerification ?? {};
     if (!runner || !profiles || typeof profiles !== 'object' || Array.isArray(profiles) ||
-        !Array.isArray(issues) || !issues.length || !toolchain || typeof toolchain !== 'object' ||
+        !Array.isArray(issues) || (!issues.length && !rules?.length) || !toolchain || typeof toolchain !== 'object' ||
         Array.isArray(toolchain) || Object.entries(toolchain).some(([key, entry]) =>
           !/^[a-z][a-zA-Z0-9]{0,39}$/.test(key) || typeof entry !== 'string' || !entry || entry.length > 4096
         )) throw new Error('Host verification requires a runner, profiles and issue bindings');
     const base = recoveryPolicy({ verifier: { ...runner, number: 1 } }, repo, stateDir).verifierFor(1);
+    if (!Array.isArray(rules) || rules.some(rule =>
+        typeof rule?.profile !== 'string' || !Object.hasOwn(profiles, rule.profile) ||
+        !/^[a-z][a-z0-9-]{0,63}$/.test(rule.profile) ||
+        typeof profiles[rule.profile] !== 'string' || !profiles[rule.profile].trim() ||
+        profiles[rule.profile].length > 2000 ||
+        !Array.isArray(rule.paths) || !rule.paths.length || rule.paths.some(path => typeof path !== 'string' || !path) ||
+        !Array.isArray(rule.blockers) || !rule.blockers.length ||
+        rule.blockers.some(kind => !['environment', 'code'].includes(kind)))) {
+      throw new Error('Host profile rules require a reviewed profile, scope paths and blocker kinds');
+    }
+    const bind = (profile, resumeImplementation = false) => ({
+      evidence: profiles[profile], resumeImplementation,
+      read: () => Buffer.concat([Buffer.from('const orchestratorProfile = ' + JSON.stringify(profile) +
+        ';\nconst orchestratorToolchain = ' + JSON.stringify(toolchain) + ';\n'), base()])
+    });
     const byIssue = new Map();
     for (const row of issues) {
       const { profile, resumeImplementation = false } = row ?? {};
@@ -41,14 +56,18 @@ export function recoveryPolicy(value, repo, stateDir) {
           typeof evidence !== 'string' || !evidence.trim() || evidence.length > 2000) {
         throw new Error('Host verification issue bindings require a unique issue and reviewed profile');
       }
-      byIssue.set(row.number, {
-        evidence, resumeImplementation,
-        read: () => Buffer.concat([Buffer.from('const orchestratorProfile = ' + JSON.stringify(profile) +
-          ';\nconst orchestratorToolchain = ' + JSON.stringify(toolchain) + ';\n'), base()])
-      });
+      byIssue.set(row.number, bind(profile, resumeImplementation));
     }
     if (blockerTasks.some(task => !byIssue.has(task.number))) throw new Error('Blocker task needs an approved host profile');
     return { limit, adopt, blockerTasks: new Map(blockerTasks.map(task => [task.number, task])),
+      selectProfile(number, kind, paths) {
+        if (byIssue.has(number) || !paths?.length) return {};
+        const matches = new Set(rules.filter(rule => rule.blockers.includes(kind) &&
+          rule.paths.every(path => paths.includes(path))).map(rule => rule.profile));
+        if (matches.size > 1) return { hold: 'verification-profile-ambiguous' };
+        const [profile] = matches;
+        return profile ? bind(profile) : {};
+      },
       verifierFor: issue => byIssue.get(issue)?.read,
       profileEvidence: issue => byIssue.get(issue)?.evidence,
       resumeImplementation: issue => byIssue.get(issue)?.resumeImplementation };

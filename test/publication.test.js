@@ -219,6 +219,39 @@ test('dispatches independent work while GitHub publication is pending', async t 
   assert.equal(f.inspect(state => state.task(8)), undefined);
 });
 
+test('matches an approved host profile for a saved blocker after restart and rechecks a repair', async t => {
+  const f = fixture(t);
+  const path = join(f.root, 'verifier.mjs');
+  const body = "import {readFileSync} from 'node:fs'; if (orchestratorProfile !== 'schema') process.exit(11); if (readFileSync('renderer.txt','utf8') !== 'fixed') process.exit(10);";
+  writeFileSync(path, body);
+  f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'] }] };
+  f.queue.technicalRecovery = { limit: 4, hostVerification: {
+    runner: { path, sha256: createHash('sha256').update(body).digest('hex') },
+    profiles: { schema: 'Reviewed schema checks.', alternate: 'Other checks.' }, issues: [],
+    rules: [{ profile: 'schema', blockers: ['environment', 'code'], paths: ['renderer.txt'] }]
+  } };
+  await f.executeWith(async ({ cwd }) => {
+    writeFileSync(join(cwd, 'renderer.txt'), 'broken');
+    return { state: 'blocked', result: { technicalBlocker: 'environment' } };
+  }, { limit: 1 });
+  const original = f.inspect(state => state.task(7).worktree);
+  const rules = f.queue.technicalRecovery.hostVerification.rules;
+  rules.push({ ...rules[0], profile: 'alternate' });
+  await f.executeWith(workerForbidden);
+  assert.equal(f.inspect(state => state.recoveryRows()[0].hold), 'verification-profile-ambiguous');
+  assert.equal(f.inspect(state => state.attempts().length), 1);
+  rules.pop();
+  const resumed = await f.executeWith(async ({ cwd, prompt }) => {
+    assert.equal(cwd, original);
+    assert.match(prompt, /bounded repair/);
+    writeFileSync(join(cwd, 'renderer.txt'), 'fixed');
+    return { state: 'done' };
+  });
+  assert.deepEqual(resumed.results.map(row => row.detail), ['verification-code-failure', 'verification-passed']);
+  assert.equal(f.inspect(state => state.handoff(7).linked), 1);
+  assert.equal(f.inspect(state => state.task(8)), undefined);
+});
+
 test('publishes measured profile checks and holds malformed verifier evidence', async t => {
   for (const valid of [true, false]) {
     const f = fixture(t);
