@@ -16,9 +16,10 @@ export function recoveryPolicy(value, repo, stateDir) {
     throw new Error('Invalid technical recovery adoption list');
   }
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 2) throw new Error('Technical recovery requires a limit of one or two attempts');
-  if (verifier === undefined) return { limit, adopt };
-  if (typeof verifier?.path !== 'string' || !isAbsolute(verifier.path) ||
-      !/^[a-f0-9]{64}$/.test(verifier.sha256 ?? '')) throw new Error('Verification runner requires an absolute path and SHA-256');
+  if (verifier === undefined) return { limit, adopt, verifierFor: () => null };
+  if (!Number.isSafeInteger(verifier?.number) || verifier.number < 1 ||
+      typeof verifier.path !== 'string' || !isAbsolute(verifier.path) ||
+      !/^[a-f0-9]{64}$/.test(verifier.sha256 ?? '')) throw new Error('Verification runner requires an issue number, absolute path, and SHA-256');
   const path = realpathSync(verifier.path);
   if (inside(repo, path) || inside(stateDir, path)) throw new Error('Keep the approved verifier outside the target and state');
   const read = () => {
@@ -29,7 +30,7 @@ export function recoveryPolicy(value, repo, stateDir) {
     return code;
   };
   read();
-  return { limit, adopt, verifier: read };
+  return { limit, adopt, verifierFor: number => number === verifier.number ? read : null };
 }
 
 export function recoveryScope(issue) {

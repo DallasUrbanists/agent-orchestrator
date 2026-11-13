@@ -219,7 +219,7 @@ worktree, or exhausted budget holds the task. Dependencies still require the
 configured acceptance receipts from merged history.
 
 For environment blockers, also add `verifier` inside `technicalRecovery`.
-Set `path` to an absolute path to an operator-reviewed standalone Node module
+Set `number` to the issue the runner verifies. Set `path` to an absolute path to an operator-reviewed standalone Node module
 outside the target and state directories. Set `sha256` to the lowercase hash
 returned by `Get-FileHash -Algorithm SHA256`. The controller verifies the bytes
 and supplies them directly to Node. The verifier runs on the controller host
@@ -231,7 +231,7 @@ that runner.
 
 Exit zero means verification passed. Exit 10 means the verifier found a code
 failure that a Codex repair can address. Other exits mean the verification
-environment failed. If a repair reports success and a verifier is configured,
+environment failed. If a repair reports success and a verifier is configured for that issue,
 the controller runs the verifier again before marking that attempt complete.
 Status shows held recoveries and their reasons.
 

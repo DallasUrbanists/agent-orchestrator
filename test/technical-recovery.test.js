@@ -29,7 +29,7 @@ function fixture(t, verifier) {
   if (verifier) {
     const path = join(root, 'verifier.mjs');
     writeFileSync(path, verifier);
-    queue.technicalRecovery.verifier = { path, sha256: createHash('sha256').update(verifier).digest('hex') };
+    queue.technicalRecovery.verifier = { number: 7, path, sha256: createHash('sha256').update(verifier).digest('hex') };
   }
   const read = callback => {
     const state = new State(stateDir, { readOnly: true });
@@ -109,6 +109,15 @@ test('adopts an operator-classified legacy blocker without recreating its worktr
   assert.deepEqual(result.results.map(row => [row.number, row.state, row.recovery]), [[7, 'done', 'environment']]);
   assert.equal(read(state => state.task(7).worktree), original.worktree);
   assert.equal(readFileSync(join(original.worktree, 'legacy.txt'), 'utf8'), 'preserved');
+});
+
+test('an issue-specific verifier cannot complete another issue with the same blocker', async t => {
+  const { queue, stateDir, read } = fixture(t, 'process.exit(0);');
+  const result = await execute(queue, stateDir, options, async () => blocker('environment'));
+  assert.deepEqual(result.results.map(row => [row.number, row.state, row.recovery]),
+    [[7, 'blocked', undefined], [9, 'blocked', undefined], [7, 'done', 'environment']]);
+  assert.equal(read(state => state.recoveryRows().find(row => row.number === 9).hold), 'verification-runner-required');
+  assert.equal(read(state => state.task(8)), undefined);
 });
 
 test('a changed verifier fails closed before dispatch', async t => {
