@@ -3,6 +3,7 @@ import { join, relative } from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
 import { MODELS, runCodex } from './codex.js';
 import { githubDecisions, githubOrigin, githubRepo, readGithubIssues, validatePolling } from './github.js';
+import { readIssueIntake } from './intake.js';
 import { approvedInstruction, decisionRequest, responderIds, reviewedDecisions, syncDecisions } from './decisions.js';
 import { eligibleIssues, validateIssues } from './scheduler.js';
 import { hasJournal, lease, resolveStatePath, State, stateDirectory } from './state.js';
@@ -35,7 +36,10 @@ function validatePrompt(issue) {
   }
 }
 
-function prepareQueue(queue, repo, readIssues, decisionsEnabled = false) {
+function prepareQueue(queue, repo, readIssues, decisionsEnabled = false, intakeApi) {
+  if (Object.hasOwn(queue, 'githubIntake') && queue.sourceRepo === undefined) {
+    throw new Error('GitHub intake requires sourceRepo');
+  }
   if (queue.sourceRepo === undefined) {
     if (decisionsEnabled) throw new Error('GitHub decisions require a GitHub-backed queue');
     validateIssues(queue.issues);
@@ -50,6 +54,14 @@ function prepareQueue(queue, repo, readIssues, decisionsEnabled = false) {
   catch { /* A source checkout must have an origin. */ }
   if (!origin || githubOrigin(origin) !== sourceRepo) {
     throw new Error('The checkout origin must match sourceRepo on github.com');
+  }
+  if (Object.hasOwn(queue, 'githubIntake')) {
+    const { coordinatorId } = queue.githubIntake ?? {};
+    if (!Number.isSafeInteger(coordinatorId) || coordinatorId < 1 || Object.hasOwn(queue, 'issues') ||
+        !Array.isArray(queue.acceptedPrerequisites) || decisionsEnabled) {
+      throw new Error('GitHub intake requires coordinatorId and acceptedPrerequisites, with no local issues or decision posting');
+    }
+    return { sourceRepo, coordinatorId, load: signal => readIssueIntake(sourceRepo, coordinatorId, { signal }, intakeApi) };
   }
   if (!Array.isArray(queue.issues)) throw new Error('GitHub queues need an issues array of reviewed prompts');
   const requireAcceptance = Object.hasOwn(queue, 'acceptedPrerequisites');
@@ -111,23 +123,30 @@ function verifyAcceptedPrerequisites(queue, repo, base) {
   return accepted;
 }
 
-function watchAcceptance(queue, repo, readAcceptance) {
+function watchAcceptance(queue, repo, readAcceptance, refreshMain, saved = {}) {
   if (!Object.hasOwn(queue, 'acceptedPrerequisites')) {
     throw new Error('Watching acceptance requires an explicit acceptedPrerequisites array in the queue');
   }
-  const main = () => git(repo, ['rev-parse', '--verify', 'refs/heads/main^{commit}']);
-  let previous = main();
-  const baseline = verifyAcceptedPrerequisites(queue, repo, previous);
+  const main = refreshMain ?? (() => git(repo, ['rev-parse', '--verify', 'refs/heads/main^{commit}']));
+  let previous = saved.base ?? null;
+  let baseline = null;
   return () => {
     const receipts = readAcceptance();
     if (!Array.isArray(receipts)) throw new Error('The watched acceptance file must contain a JSON array');
     const base = main();
-    if (git(repo, ['symbolic-ref', 'HEAD']) !== 'refs/heads/main') {
+    if (!refreshMain && git(repo, ['symbolic-ref', 'HEAD']) !== 'refs/heads/main') {
       throw new Error('The watched checkout no longer points to local main');
     }
-    if (previous !== base) {
+    if (previous && previous !== base) {
       try { git(repo, ['merge-base', '--is-ancestor', previous, base]); }
-      catch { throw new Error('Local main changed non-fast-forward while watching acceptance'); }
+      catch { throw new Error('Dispatch main changed non-fast-forward while watching acceptance'); }
+    }
+    if (!baseline) {
+      baseline = verifyAcceptedPrerequisites(queue, repo, base);
+      for (const [number, commit] of saved.accepted ?? []) {
+        if (baseline.has(number) && baseline.get(number) !== commit) throw new Error('Initial receipt disagrees with saved acceptance');
+        baseline.set(number, commit);
+      }
     }
     const accepted = verifyAcceptedPrerequisites({ acceptedPrerequisites: receipts }, repo, base);
     for (const [number, commit] of baseline) {
@@ -145,27 +164,34 @@ function runnable(issues, rows, sourceRepo, resumable, acceptedPrerequisites) {
   });
 }
 
-export async function preview(queue, statePath, { readIssues = readGithubIssues, signal } = {}) {
+export async function preview(queue, statePath, { readIssues = readGithubIssues, signal, intakeApi } = {}) {
   const stateDir = resolveStatePath(statePath);
   const repo = verifyTarget(queue?.target, queue?.allowedRepos, stateDir);
-  const { sourceRepo, load } = prepareQueue(queue, repo, readIssues);
+  const { sourceRepo, coordinatorId, load } = prepareQueue(queue, repo, readIssues, false, intakeApi);
   const accepted = Object.hasOwn(queue, 'acceptedPrerequisites')
     ? verifyAcceptedPrerequisites(queue, repo, git(repo, ['rev-parse', '--verify', 'HEAD^{commit}'])) : null;
   let state;
   try {
     if (hasJournal(stateDir)) {
       state = new State(stateDir, { readOnly: true });
-      state.assertBinding(repo, sourceRepo, accepted !== null);
+      state.assertBinding(repo, sourceRepo, accepted !== null, coordinatorId);
     }
     const rows = state?.list() ?? [];
     const hold = state?.get('restoreHold') === 'true'
       ? 'restored-state-needs-reconciliation' : dispatchHold(rows, state?.get('control'));
     const issues = hold ? [] : await load(signal);
-    const eligible = runnable(issues, rows, sourceRepo, undefined, accepted).map(issue => ({
+    const claimedIds = new Set(state?.intakeClaims().map(claim => claim.issue_id));
+    const unclaimed = issues.filter(issue => !claimedIds.has(issue.intake?.issueId));
+    const eligible = runnable(unclaimed, rows, sourceRepo, undefined, accepted).map(issue => ({
       number: issue.number, model: MODELS[issue.model], title: issue.title
     }));
     return { mode: 'dry-run', ...(sourceRepo && { sourceRepo }),
-      reason: hold ?? (eligible.length ? 'eligible-work' : 'no-eligible-work'), eligible };
+      reason: hold ?? (eligible.length ? 'eligible-work' : 'no-eligible-work'), eligible,
+      ...(coordinatorId && { coordinatorId, admitted: unclaimed.filter(issue => issue.state === 'ready' &&
+        !accepted.has(issue.number) && !rows.some(row => row.number === issue.number))
+        .map(issue => issue.number), awaitingApproval: issues.filter(issue => issue.reason === 'needs-coordinator-approval')
+        .map(issue => issue.number), held: issues.filter(issue => issue.reason === 'unsupported-task-metadata-or-revision')
+        .map(issue => issue.number) }) };
   } finally {
     state?.close();
   }
@@ -174,7 +200,7 @@ export async function preview(queue, statePath, { readIssues = readGithubIssues,
 export async function execute(queue, statePath, options, worker = runCodex) {
   const { executable, limit = 1, timeoutMs = 15 * 60 * 1000, signal,
     polls = 1, intervalMs = 15000, readIssues = readGithubIssues, decisionsEnabled = false,
-    decisionApi = githubDecisions, readAcceptance, acceptancePath } = options;
+    decisionApi = githubDecisions, readAcceptance, acceptancePath, intakeApi } = options;
   if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) {
     throw new Error('Specify a positive execution limit and a worker timeout up to one hour');
@@ -182,25 +208,36 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   validatePolling(polls, intervalMs);
   const stateDir = resolveStatePath(statePath);
   const repo = verifyTarget(queue?.target, queue?.allowedRepos, stateDir);
-  const { sourceRepo, load } = prepareQueue(queue, repo, readIssues, decisionsEnabled);
+  const { sourceRepo, coordinatorId, load } = prepareQueue(queue, repo, readIssues, decisionsEnabled, intakeApi);
+  if (coordinatorId && !readAcceptance) throw new Error('GitHub intake requires --watch-acceptance');
   const responders = decisionsEnabled ? responderIds(queue) : null;
   if (acceptancePath && (inside(repo, acceptancePath) || inside(stateDir, acceptancePath))) {
     throw new Error('Keep the acceptance file outside the target checkout and state directory');
   }
-  const loadAcceptance = readAcceptance && watchAcceptance(queue, repo, readAcceptance);
-  const startupBase = git(repo, ['rev-parse', '--verify', 'HEAD^{commit}']);
-  const initial = loadAcceptance ? loadAcceptance() : {
-    base: startupBase, accepted: verifyAcceptedPrerequisites(queue, repo, startupBase)
-  };
+
   if (relative(stateDirectory(stateDir), stateDir) !== '') throw new Error('State directory redirected during setup');
   const release = lease(stateDir);
   const results = [];
   let state;
   try {
     state = new State(stateDir);
-    state.bind(repo, sourceRepo, initial.accepted !== null);
+    state.bind(repo, sourceRepo, Object.hasOwn(queue, 'acceptedPrerequisites'), coordinatorId);
     if (state.get('restoreHold') === 'true') return { reason: 'restored-state-needs-reconciliation', results };
     state.recover();
+    const refreshMain = coordinatorId ? () => {
+      const origin = git(repo, ['config', '--local', '--get-all', 'remote.origin.url']);
+      if (githubOrigin(origin) !== sourceRepo) throw new Error('The checkout origin changed during intake');
+      const ref = 'refs/remotes/orchestrator/main';
+      git(repo, ['fetch', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head', '--refmap=',
+        'origin', 'refs/heads/main:' + ref]);
+      return git(repo, ['rev-parse', '--verify', ref + '^{commit}']);
+    } : undefined;
+    const saved = JSON.parse(state.get('intakeAcceptance') ?? '{}');
+    const loadAcceptance = readAcceptance && watchAcceptance(queue, repo, readAcceptance, refreshMain, saved);
+    const startupBase = loadAcceptance ? null : git(repo, ['rev-parse', '--verify', 'HEAD^{commit}']);
+    const initial = loadAcceptance ? null : {
+      base: startupBase, accepted: verifyAcceptedPrerequisites(queue, repo, startupBase)
+    };
     const logDir = join(stateDir, 'logs');
     mkdirSync(logDir, { recursive: true });
     if (relative(realpathSync(logDir), logDir) !== '') throw new Error('Log directory redirects elsewhere');
@@ -217,6 +254,10 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const afterPoll = dispatchHold(previous, state.get('control'));
       if (afterPoll) return { reason: afterPoll, results };
       const { base, accepted } = loadAcceptance ? loadAcceptance() : initial;
+      if (coordinatorId) {
+        const observed = JSON.stringify({ base, accepted: [...accepted] });
+        if (state.get('intakeAcceptance') !== observed) state.set('intakeAcceptance', observed);
+      }
       const answers = new Map();
       if (decisionsEnabled) {
         const ready = new Map(issues.filter(issue => issue.state === 'ready').map(issue => [issue.number, issue]));
@@ -235,7 +276,12 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         }
       }
       if (results.length >= limit) break;
-      const [issue] = runnable(issues, previous, sourceRepo, new Set(answers.keys()), accepted);
+      const claimedIds = new Set(state.intakeClaims().map(claim => claim.issue_id));
+      const [issue] = runnable(issues.filter(issue => !claimedIds.has(issue.intake?.issueId)),
+        previous, sourceRepo, new Set(answers.keys()), accepted);
+      const beforeClaim = dispatchHold(previous, state.get('control'));
+      if (beforeClaim) return { reason: beforeClaim, results };
+      if (signal?.aborted) return { reason: 'stopped', results };
       if (!issue) {
         if ((!sourceRepo && !loadAcceptance) || ++idlePolls >= polls) return { reason: 'no-eligible-work', results };
         await wait(intervalMs, undefined, { signal });
@@ -267,7 +313,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const templates = (issue.decisions ?? []).filter(template => !usedKeys.has(template.key));
       // Record the attempt before creating a worktree or spawning a process.
       const approvedChoices = answer ? state.resumeDecision(answer.id, issue.number, MODELS[issue.model], log) : [];
-      if (!answer) state.reserve({ number: issue.number, repo, worker: 'local-1', model: MODELS[issue.model], location, log });
+      if (!answer) state.reserve({ number: issue.number, repo, worker: 'local-1', model: MODELS[issue.model], location, log,
+        intake: issue.intake, base });
       let logFile;
       try {
         logFile = openSync(log, 'ax');
@@ -298,7 +345,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       try {
         if (!answer) createWorktree(repo, location, base);
         if (signal?.aborted || state.get('control') === 'stop') abort();
-        result = await worker({ executable, cwd: location.path, model: issue.model,
+        result = await worker({ executable, cwd: location.path, model: issue.model, reasoning: issue.reasoning,
           prompt: workerPrompt(issue, templates, approvedChoices), timeoutMs, signal: cancel.signal, onRecord: record });
       } catch {
         // If a worker adapter threw after launching, its process state is unknown.

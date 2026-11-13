@@ -56,6 +56,9 @@ export class State {
       "  pid INTEGER, session TEXT, started TEXT NOT NULL, completed TEXT, detail TEXT, exit_code INTEGER," +
       "  retries INTEGER NOT NULL DEFAULT 0, acknowledged INTEGER NOT NULL DEFAULT 0," +
       "  cleaned INTEGER NOT NULL DEFAULT 0);" +
+      "CREATE TABLE IF NOT EXISTS issue_intake_claims (" +
+      "  number INTEGER PRIMARY KEY REFERENCES tasks(number), issue_id TEXT NOT NULL UNIQUE," +
+      "  revision TEXT NOT NULL, coordinator_id INTEGER NOT NULL, comment_id TEXT, base TEXT NOT NULL);" +
       "CREATE TABLE IF NOT EXISTS decisions (" +
       "  id TEXT PRIMARY KEY, number INTEGER NOT NULL, decision_key TEXT NOT NULL, template TEXT NOT NULL," +
       "  requested TEXT NOT NULL, publisher_id INTEGER, posting INTEGER NOT NULL DEFAULT 0," +
@@ -70,12 +73,16 @@ export class State {
   set(name, value) {
     this.db.prepare('INSERT OR REPLACE INTO settings VALUES (?, ?)').run(name, value);
   }
-  assertBinding(repo, sourceRepo = null, requireAcceptance = false) {
+  assertBinding(repo, sourceRepo = null, requireAcceptance = false, coordinatorId = null) {
     const bound = this.get('repo');
     if (bound === undefined) return;
     if (bound !== repo) throw new Error('This state directory belongs to a different checkout');
     if ((this.get('sourceRepo') ?? null) !== sourceRepo) {
       throw new Error('This state directory belongs to a different task source');
+    }
+    const coordinator = this.get('intakeCoordinatorId');
+    if (coordinator !== undefined && coordinator !== String(coordinatorId)) {
+      throw new Error('This state directory uses a different GitHub intake coordinator');
     }
     if ((this.get('requireAcceptance') === 'true') !== requireAcceptance) {
       throw new Error('This state directory uses a different prerequisite policy');
@@ -92,24 +99,36 @@ export class State {
       throw error;
     }
   }
-  bind(repo, sourceRepo = null, requireAcceptance = false) {
+  bind(repo, sourceRepo = null, requireAcceptance = false, coordinatorId = null) {
     this.transaction(() => {
-      this.assertBinding(repo, sourceRepo, requireAcceptance);
+      this.assertBinding(repo, sourceRepo, requireAcceptance, coordinatorId);
       if (this.get('repo') === undefined) {
         this.set('repo', repo);
         if (sourceRepo) this.set('sourceRepo', sourceRepo);
         if (requireAcceptance) this.set('requireAcceptance', 'true');
       }
+      if (coordinatorId !== null) this.set('intakeCoordinatorId', String(coordinatorId));
     });
   }
   list() { return this.db.prepare('SELECT * FROM tasks ORDER BY number').all(); }
   task(number) { return this.db.prepare('SELECT * FROM tasks WHERE number = ?').get(number); }
 
-  reserve({ number, repo, worker, model, location, log }) {
-    this.db.prepare(
+  intakeClaims() {
+    if (this.get('intakeCoordinatorId') === undefined) return [];
+    return this.db.prepare('SELECT * FROM issue_intake_claims ORDER BY number').all();
+  }
+
+  reserve({ number, repo, worker, model, location, log, intake, base }) {
+    const reserveTask = () => this.db.prepare(
       "INSERT INTO tasks (number, target, worker, model, state, worktree, branch, log, started)" +
       " VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)"
     ).run(number, repo, worker, model, location.path, location.branch, log, new Date().toISOString());
+    if (!intake) return reserveTask();
+    this.transaction(() => {
+      reserveTask();
+      this.db.prepare('INSERT INTO issue_intake_claims VALUES (?, ?, ?, ?, ?, ?)')
+        .run(number, intake.issueId, intake.hash, intake.coordinatorId, intake.commentId, base);
+    });
   }
   process(number, { pid, threadId }) {
     this.db.prepare('UPDATE tasks SET pid = coalesce(?, pid), session = coalesce(?, session) WHERE number = ?')
