@@ -193,7 +193,20 @@ npm run start -- --queue intake.local.json --state .\state\intake-demo --execute
 npm run status -- --state .\state\intake-demo
 ```
 
-The SQLite claim records the issue ID, the approved revision hash, the coordinator ID, the approval comment ID when applicable, and the dispatch base. The same journal prevents a claimed issue from running again across polls and restarts, even after a fresh approval. Keep the journal and worktree paths when restarting. The controller also keeps the last verified base and receipts and rejects a rewind or removed receipt. Intake reads GitHub with GraphQL queries. It does not post comments, push changes, or merge. The `--github-decisions` option still requires a separate queue with reviewed decision templates.
+The SQLite claim records the issue ID, the approved revision hash, the coordinator ID, the approval comment ID when applicable, and the dispatch base. The same journal prevents a claimed issue from running again across polls and restarts, even after a fresh approval. Keep the journal and worktree paths when restarting. The controller also keeps the last verified base and receipts and rejects a rewind or removed receipt. Intake reads GitHub with GraphQL queries. With no write options enabled, it
+only reads. To enable authorized decision replies in the same run, add
+`--github-decisions`, set `authorizedResponders` to the approved numeric IDs,
+and add an `intakeDecisions` array in the trusted queue configuration. Each
+entry has a GitHub issue `number`, its reviewed `revision` from the dry-run
+output, and a `decisions` array using the decision template format below.
+This configuration supplies decision options. Issue discovery and approval
+still come from GitHub.
+
+An intake decision resumes the claim in its existing worktree only while
+the issue is approved at the original revision and the saved template still
+matches the local configuration. An edit or a replacement template holds
+that claim even if an authorized reply already exists. A newly approved
+revision does not rerun an existing claim.
 
 Run the intake loop against a disposable bare Git origin with fixture GitHub responses and real Codex workers on Windows.
 
@@ -355,7 +368,7 @@ pending human decisions, and never resets the recovery counter.
 
 Enable issue comments explicitly with `--github-decisions` on a real run. Use a GitHub-backed queue, a signed-in `gh` account with permission to comment on the target issues, and a local list of authorized GitHub account IDs. To find an account ID, run `gh api users/LOGIN --jq .id` and verify the account before adding it.
 
-Add `authorizedResponders` to the queue and add reviewed decisions to the relevant issue entries. The worker can select each reviewed key once. GitHub receives the question, choice labels, and exact reply commands. Choice instructions stay local until the controller sends the chosen instruction to Codex.
+Add `authorizedResponders` to the queue. For a queue with reviewed issue entries, add decisions as shown below. For GitHub issue intake, put the same decision templates in the revision-bound `intakeDecisions` entries. The worker can select each reviewed key once. GitHub receives the question, choice labels, and exact reply commands. Choice instructions stay local until the controller sends the chosen instruction to Codex.
 
 ```json
 {
@@ -387,7 +400,7 @@ npm run start -- --queue queue.local.json --state .\state\github-demo --execute 
 npm run status -- --state .\state\github-demo
 ```
 
-The controller saves the blocked claim and request together, then posts the reviewed question on the issue. Independent tasks can run while the controller waits. From GitHub on mobile or desktop, add a new comment containing exactly one command from the request. The controller records the first matching, unedited reply from an authorized account. Before resuming, it checks the request and reply again against GitHub and the current account allowlist. If the saved reply was deleted, edited, or lost authorization, a newer valid reply can replace it. If GitHub comments are unavailable, the task stays blocked while unrelated eligible work can continue. Each resumption starts a fresh Codex session in the original worktree with all approved choice instructions saved for that task, in request order. The issue must remain ready, approved locally, and eligible under its dependencies. A successful resumption counts toward `--limit`. When the run reaches its poll limit, use the same command and state directory to check for replies again.
+The controller saves the blocked claim and request together, then posts the reviewed question on the issue. Independent tasks can run while the controller waits. From GitHub on mobile or desktop, add a new comment containing exactly one command from the request. The controller records the first matching, unedited reply from an authorized account. Before resuming, it checks the request and reply again against GitHub and the current account allowlist. If the saved reply was deleted, edited, or lost authorization, a newer valid reply can replace it. If GitHub comments are unavailable, the task stays blocked while unrelated eligible work can continue. Each resumption starts a fresh Codex session in the original worktree with all approved choice instructions saved for that task, in request order. The issue must remain ready, retain its applicable approval, and satisfy its dependencies. A successful resumption counts toward `--limit`. When the run reaches its poll limit, use the same command and state directory to check for replies again.
 
 If a comment request times out, the controller checks later polls for the original message from the publishing account. Status shows `delivery-unconfirmed` when that check cannot confirm delivery. If you have inspected the issue and verified that the request was never posted, rearm that request with `node src/cli.js retry-decision REQUEST-ID --state .\state\github-demo`, then run the controller again. It checks for the original comment before posting. Keep the same signed-in publishing account during recovery.
 

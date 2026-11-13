@@ -62,6 +62,76 @@ function fixtureApi(rows, comments, { detail = row => row, beforePoll = () => {}
     comments: (id, options) => githubIntake.comments(id, options, run) };
 }
 
+test('intake resumes the same approved claim after an authorized decision reply', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'intake-decisions-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const repo = join(root, 'target');
+  const remote = join(root, 'origin.git');
+  const stateDir = join(root, 'run');
+  git(root, ['init', '--initial-branch=main', repo]);
+  git(root, ['init', '--bare', '--initial-branch=main', remote]);
+  git(repo, ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+    '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'Seed fixture']);
+  git(remote, ['fetch', '--', repo, 'refs/heads/main:refs/heads/main']);
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/' + repoName]);
+  git(repo, ['config', '--local', 'url.' + pathToFileURL(remote).href + '.insteadOf', 'https://github.com/' + repoName]);
+  const original = issue(1, coordinatorId, 'Work needing a decision');
+  const edited = issue(2, coordinatorId, 'Another task needing a decision');
+  let rows = [original, edited, issue(3, coordinatorId, 'Independent task')];
+  const intakeApi = fixtureApi(() => rows, new Map());
+  const queue = { target: repo, allowedRepos: [repo], sourceRepo: repoName, githubIntake: { coordinatorId },
+    acceptedPrerequisites: [], authorizedResponders: [coordinatorId] };
+  const { revisions } = await preview(queue, stateDir, { intakeApi });
+  const template = { key: 'layout', question: 'Which layout should we use?',
+    choices: [{ id: 'grid', label: 'Grid', instruction: 'Use the reviewed grid.' },
+      { id: 'list', label: 'List', instruction: 'Use the reviewed list.' }] };
+  queue.intakeDecisions = revisions.slice(0, 2).map(revision => ({ ...revision, decisions: [template] }));
+  const comments = new Map();
+  const decisionApi = {
+    async viewer() { return coordinatorId; },
+    async comments(_repo, number) { return comments.get(number) ?? []; },
+    async post(_repo, number, body) {
+      assert.equal(comments.has(number), false, 'duplicate decision question');
+      const posted = { id: 10, user: { id: coordinatorId }, body, created_at: time(1) };
+      comments.set(number, [posted]);
+      return posted;
+    }
+  };
+  const opts = { decisionsEnabled: true, decisionApi, intakeApi, limit: 3, polls: 2, intervalMs: 5,
+    readAcceptance: () => [] };
+  const started = await execute(queue, stateDir, opts, async ({ cwd, prompt }) => {
+    if (prompt.includes('Independent task')) {
+      assert.doesNotMatch(prompt, /Which layout/);
+      return { state: 'done' };
+    }
+    assert.match(prompt, /Which layout/);
+    writeFileSync(join(cwd, 'prior.txt'), 'saved work');
+    return { state: 'blocked', result: { decisionKey: 'layout' } };
+  });
+  assert.deepEqual(started.results.map(row => [row.number, row.state]), [[1, 'blocked'], [2, 'blocked'], [3, 'done']]);
+  for (const { number, decision } of started.results.slice(0, 2)) {
+    const reply = (id, author) => ({ id, user: { id: author, type: 'User' },
+      body: '/orchestrator decide ' + decision + ' grid', created_at: time(2), updated_at: time(2) });
+    comments.get(number).push(reply(11, 99), reply(12, coordinatorId), reply(13, coordinatorId));
+  }
+  rows = [original, edit(edited, 1, coordinatorId, 'Different task'), rows[2]];
+  const resumed = await execute(queue, stateDir, opts, async ({ cwd, prompt }) => {
+    assert.match(prompt, /Use the reviewed grid/);
+    assert.match(prompt, /Work needing a decision/);
+    assert.equal(readFileSync(join(cwd, 'prior.txt'), 'utf8'), 'saved work');
+    return { state: 'done' };
+  });
+  assert.deepEqual(resumed.results.map(row => [row.number, row.state]), [[1, 'done']]);
+  const final = new State(stateDir, { readOnly: true });
+  try {
+    assert.equal(final.intakeClaims().length, 3);
+    assert.equal(final.decisionStatus().find(row => row.number === 1).reply_comment, 12);
+    assert.equal(final.decisionStatus().find(row => row.number === 2).last_error, 'intake-decision-scope-no-longer-approved');
+    assert.equal(final.task(2).state, 'blocked');
+  } finally { final.close(); }
+  assert.deepEqual((await execute(queue, stateDir, opts, () => assert.fail('duplicate dispatch'))).results, []);
+});
+
 test('only the exact unedited command from the numeric coordinator approves the current issue revision', async () => {
   const author = issue(1, coordinatorId, 'A scoped task');
   const other = issue(2, 111, 'Another scoped task');
