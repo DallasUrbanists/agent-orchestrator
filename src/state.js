@@ -349,6 +349,16 @@ export class State {
       " AND NOT EXISTS (SELECT 1 FROM decisions WHERE decisions.number = tasks.number AND consumed IS NULL)"
     ).run(kind, scope, number);
   }
+  retryInvalidVerificationEvidence(number, scope) {
+    this.db.prepare(
+      "UPDATE technical_recovery SET kind = 'environment', hold = NULL" +
+      " WHERE number = ? AND scope = ? AND hold = 'finished'" +
+      " AND EXISTS (SELECT 1 FROM tasks WHERE number = ? AND state = 'blocked'" +
+      " AND detail = 'invalid-verification-evidence' AND cleaned = 0)" +
+      " AND NOT EXISTS (SELECT 1 FROM decisions WHERE decisions.number = ? AND consumed IS NULL)"
+    ).run(number, scope, number, number);
+  }
+
   recoveryRows() {
     return this.db.prepare('SELECT * FROM technical_recovery ORDER BY number').all();
   }
