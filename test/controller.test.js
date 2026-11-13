@@ -549,6 +549,48 @@ test('watched acceptance rejects a receipt file in the worker state directory', 
   }, () => assert.fail('unsafe receipt path')), /outside the target checkout and state directory/);
 });
 
+test('retries a transient GitHub read and schedules only from the fresh snapshot', async t => {
+  const { queue, stateDir, repo } = fixture(t, [task(1), task(2), task(3)]);
+  queue.sourceRepo = 'fixture/issue-queue';
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/issue-queue.git']);
+  let reads = 0;
+  const waits = [];
+  const readIssues = async () => {
+    reads++;
+    if (reads === 1) return [remoteReady(1), remoteReady(2)];
+    if (reads <= 3) throw Object.assign(new Error('temporary poll error'), { transient: true });
+    return [remoteReady(3)];
+  };
+  const result = await execute(queue, stateDir, {
+    ...options, readIssues, limit: 2,
+    waitForIssueRetry: async delay => {
+      waits.push(delay);
+      assert.equal(withState(stateDir, store => store.task(2)), undefined);
+    }
+  }, done);
+  assert.deepEqual(waits, [5000, 15000]);
+  assert.deepEqual(result.results.map(row => row.number), [1, 3]);
+  assert.equal(withState(stateDir, store => store.task(2)), undefined);
+});
+
+test('caps transient issue-read retries and honors a pause before retrying', async t => {
+  const { queue, stateDir, repo } = fixture(t);
+  queue.sourceRepo = 'fixture/issue-queue';
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/issue-queue.git']);
+  const waits = [];
+  const readIssues = async () => { throw Object.assign(new Error('temporary poll error'), { transient: true }); };
+  const noWorker = () => assert.fail('dispatch during failed poll');
+  await assert.rejects(execute(queue, stateDir, {
+    ...options, readIssues, waitForIssueRetry: async delay => { waits.push(delay); }
+  }, noWorker), /temporary poll error/);
+  assert.deepEqual(waits, [5000, 15000, 60000]);
+  const result = await execute(queue, stateDir, {
+    ...options, readIssues,
+    waitForIssueRetry: async () => withState(stateDir, store => store.set('control', 'pause'))
+  }, noWorker);
+  assert.equal(result.reason, 'pause');
+});
+
 test('preserves earlier claims when a later GitHub poll fails', async t => {
   const { queue, stateDir, repo } = fixture(t, [task(1), task(2)]);
   queue.sourceRepo = 'fixture/issue-queue';
