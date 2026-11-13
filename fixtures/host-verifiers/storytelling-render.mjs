@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative } from 'node:path';
 
 // The coordinator supplies this project-local profile name from its trusted configuration.
@@ -41,33 +41,18 @@ function inspectRun(before, name, validate) {
   assert.equal(added[0].isDirectory(), true);
   const location = join(outputRoot, added[0].name);
   assert.equal(relative(location, realpathSync(location)), '');
-  try {
-    const receipt = JSON.parse(readFileSync(join(location, 'receipt.json'), 'utf8'));
-    validate(location, receipt);
-    report.runs.push({ name, runId: added[0].name, receiptSha256: hash(join(location, 'receipt.json')) });
-  } finally {
-    renameSync(location, join(evidence, name + '-' + added[0].name));
-  }
+  const receipt = JSON.parse(readFileSync(join(location, 'receipt.json'), 'utf8'));
+  report.runs.push({ name, runId: added[0].name, receiptSha256: hash(join(location, 'receipt.json')) });
+  validate(location, receipt);
 }
 
 function exportRun(name, args, validate) {
   const before = new Set(existsSync(outputRoot) ? readdirSync(outputRoot) : []);
-  try {
-    run(name, node, [npm, 'run', 'render:fixture', '--', ...args], { timeout: 25 * 60000 });
-    inspectRun(before, name, (folder, receipt) => {
-      assert.equal(receipt.status, 'passed');
-      validate(folder, receipt);
-    });
-  } catch (error) {
-    if (existsSync(outputRoot) && !relative(outputRoot, realpathSync(outputRoot))) {
-      for (const entry of readdirSync(outputRoot, { withFileTypes: true })) {
-        if (before.has(entry.name) || !entry.isDirectory()) continue;
-        const path = join(outputRoot, entry.name);
-        if (!relative(path, realpathSync(path))) renameSync(path, join(evidence, 'failed-' + name + '-' + entry.name));
-      }
-    }
-    throw error;
-  }
+  run(name, node, [npm, 'run', 'render:fixture', '--', ...args], { timeout: 25 * 60000 });
+  inspectRun(before, name, (folder, receipt) => {
+    assert.equal(receipt.status, 'passed');
+    validate(folder, receipt);
+  });
 }
 
 async function main() {

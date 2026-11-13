@@ -312,8 +312,9 @@ trusted path and pass only coordinator-reviewed profiles to it.
 
 The script receives `orchestratorProfile` and `orchestratorToolchain` as constants. The example in
 `fixtures/host-verifiers/storytelling-render.mjs` checks the pinned Storytelling
-Studio toolchain and retains the exported media, decode logs, and receipt under
-its worktree's ignored `.local` directory. Each profile description
+Studio toolchain. The export command retains media and per-run receipts under
+`out/verification/`. The verifier keeps decode logs and its summary under
+`.local/`. Exclude these output paths locally before enabling publication. Each profile description
 is reviewed evidence text for the handoff. Issue text and worker output cannot
 supply a command or choose a host profile. A bound issue gets host verification
 after a worker reports completion or after an environment blocker is recovered.
