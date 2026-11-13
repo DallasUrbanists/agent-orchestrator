@@ -47,26 +47,36 @@ function readPull(repo, number) {
   return JSON.parse(output).data.repository.pullRequest;
 }
 
-export async function reconcileRepairedThreads({ state, repo, number, branch, head, reviewers, signal,
-  lookup = readPull, api = githubHandoff }) {
+export async function reconcileRepairedThreads({ state, repo, number, branch, head, reviewers, signal, target,
+  lookup = readPull, api = githubHandoff, isAncestor = (commit, currentHead) =>
+    spawnSync('git', ['merge-base', '--is-ancestor', commit, currentHead],
+      { cwd: target, windowsHide: true, stdio: 'ignore', timeout: 5000 }).status === 0 }) {
   const key = 'pullRepair:' + number;
   const stopped = () => signal?.aborted || ['pause', 'stop'].includes(state.get('control'));
   if (stopped() || !commitId.test(head) || state.get(key) !== 'published:' + head) return;
   const current = pull => pull?.state === 'OPEN' && !pull.isCrossRepository &&
     pull.headRefName === branch && pull.baseRefName === 'main' && pull.headRefOid === head &&
     !pull.reviewThreads.pageInfo.hasNextPage;
-  const eligible = thread => !thread.isResolved &&
-    state.get(key + ':published-thread:' + thread.id) === head &&
-    reviewers.includes(thread.comments.nodes[0]?.author?.login);
+  const confirmed = thread => key + ':confirmed-thread:' + thread.id;
+  const recorded = thread => {
+    const commit = state.get(key + ':published-thread:' + thread.id);
+    return !state.get(confirmed(thread)) && commitId.test(commit ?? '') &&
+      reviewers.includes(thread.comments.nodes[0]?.author?.login) &&
+      (commit === head || isAncestor(commit, head));
+  };
   const pull = lookup(repo, number);
   if (!current(pull)) return;
-  for (const thread of pull.reviewThreads.nodes.filter(eligible)) {
+  for (const thread of pull.reviewThreads.nodes.filter(recorded)) {
     if (stopped()) return;
     const latest = lookup(repo, number);
     if (!current(latest)) return;
-    if (!latest.reviewThreads.nodes.some(row => row.id === thread.id && eligible(row))) continue;
-    const resolved = await api.resolveThread(thread.id, { signal });
-    if (resolved?.id !== thread.id || !resolved.isResolved) throw new Error('Unconfirmed review thread resolution');
+    const candidate = latest.reviewThreads.nodes.find(row => row.id === thread.id);
+    if (!candidate || !recorded(candidate)) continue;
+    if (!candidate.isResolved) {
+      const resolved = await api.resolveThread(candidate.id, { signal });
+      if (resolved?.id !== candidate.id || !resolved.isResolved) throw new Error('Unconfirmed review thread resolution');
+    }
+    state.set(confirmed(candidate), head);
   }
 }
 

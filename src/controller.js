@@ -463,7 +463,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
                 { signal }, publishOptions?.api);
               if (queue.pullRepair && repair?.startsWith('published:')) {
                 await reconcileRepairedThreads({ state, repo: handoff.repo, number: receipt.pull, branch: task.branch,
-                  head, reviewers: queue.pullRepair.reviewers ?? [], signal, api: publishOptions?.api });
+                  head, reviewers: queue.pullRepair.reviewers ?? [], signal, target: repo, api: publishOptions?.api });
               }
             } catch {
               // The durable comment intent is reconciled on the next poll.

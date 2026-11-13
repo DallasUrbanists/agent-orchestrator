@@ -126,5 +126,21 @@ test('resolves only threads recorded for the current verified repair and reconci
   pull.headRefOid = head;
   await assert.rejects(reconcileRepairedThreads(options), /response lost/);
   await reconcileRepairedThreads(options);
+  fixed.isResolved = false;
+  await reconcileRepairedThreads(options);
   assert.deepEqual(calls, ['fixed']);
+
+  const descendant = 'c'.repeat(40);
+  state.set('pullRepair:1', 'published:' + descendant);
+  state.set('pullRepair:1:published-thread:unrelated', head);
+  pull.headRefOid = descendant;
+  const resolveThread = async id => {
+    calls.push(id);
+    return { id, isResolved: true };
+  };
+  await reconcileRepairedThreads({ ...options, head: descendant, api: { resolveThread },
+    isAncestor: (commit, current) => commit === head && current === descendant });
+  assert.deepEqual(calls, ['fixed', 'unrelated']);
+  assert.equal(state.get('pullRepair:1:confirmed-thread:unrelated'), descendant);
+
 });
