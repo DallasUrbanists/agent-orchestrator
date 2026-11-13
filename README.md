@@ -535,7 +535,7 @@ publication scope. Failed or interrupted repairs preserve the worktree for revie
 ### Automatic repair of open pull requests
 
 Set `"pullRepair": { "issues": [41], "reviewers": ["reviewer-login"] }` in the
-trusted queue to enable repair for selected issues. Each issue needs a linked
+trusted queue to enable repair for selected issues. To discover eligible PRs automatically, set `"allPublished": true` in `pullRepair`. This uses the existing issue publication scopes and still requires a linked handoff, an approved verifier, and an authorized reviewer for review feedback. Each issue needs a linked
 orchestrator PR, a publication scope, and an approved host verification profile.
 During an idle poll, the controller can dispatch a worker for a merge conflict
 or an unresolved in-scope thread opened by an allowlisted reviewer. It keeps the

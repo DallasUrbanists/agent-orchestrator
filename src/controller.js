@@ -561,7 +561,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const [issue] = independent.length ? independent
         : runnable(issues, previous, sourceRepo, new Set(recovery.keys()), accepted).filter(issue => recovery.has(issue.number));
       if (!issue && !active.size && !finalHostVerification && queue.pullRepair && !signal?.aborted && handoff) {
-        for (const number of queue.pullRepair.issues ?? []) {
+        for (const number of queue.pullRepair.allPublished === true ? handoff.issues.keys() : (queue.pullRepair.issues ?? [])) {
           const receipt = state.handoff(number);
           const task = state.task(number);
           const candidate = issues.find(row => row.number === number && row.state === 'ready');
