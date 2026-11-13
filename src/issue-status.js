@@ -48,7 +48,7 @@ function matchesHandoff(candidate, task, repo) {
 function commentBody(attempt, marker, repo, pull, now, recoveryHold) {
   const launched = launchTime(attempt);
   const duration = Math.max(0, Math.floor((Date.parse(attempt.completed ?? now) - Date.parse(launched)) / 1000));
-  const outcome = { running: 'In progress', done: pull ? 'Ready for review' : 'Completed locally. Awaiting PR handoff.',
+  const outcome = { 'awaiting-handoff': 'Verified. Awaiting PR handoff.', running: 'In progress', done: pull ? 'Ready for review' : 'Completed locally. Awaiting PR handoff.',
     blocked: 'Blocked. Needs intervention.', failed: 'Failed. Needs intervention.',
     interrupted: 'Interrupted. Review the local worker state.', stopped: 'Stopped.' }[attempt.state];
   const last = attempt.activity ? 'Last observed activity: ' + attempt.activity : 'No activity observed since launch.';

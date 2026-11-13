@@ -152,6 +152,12 @@ export class State {
     return this.db.prepare('SELECT * FROM verified_handoffs WHERE number = ?').get(number);
   }
 
+  completeHandoff(number) {
+    for (const table of ['tasks', 'attempts']) {
+      this.db.prepare("UPDATE " + table + " SET state = 'done' WHERE number = ? AND state = 'awaiting-handoff'").run(number);
+    }
+  }
+
   recordVerification(number, { repo, base, tree, evidence }) {
     this.db.prepare('INSERT INTO verified_handoffs (number, repo, base, tree, evidence) VALUES (?, ?, ?, ?, ?)')
       .run(number, repo, base, tree, evidence);
@@ -320,6 +326,17 @@ export class State {
       ' AND consumed IS NOT NULL ORDER BY rowid'
     ).all(number);
   }
+  reconcileUnverifiedHandoff(number, scope) {
+    this.transaction(() => {
+      const changed = this.db.prepare(
+        "UPDATE tasks SET state = 'blocked', detail = 'publication-verifier-required'" +
+        " WHERE number = ? AND state = 'done' AND cleaned = 0" +
+        " AND NOT EXISTS (SELECT 1 FROM verified_handoffs WHERE number = ?)"
+      ).run(number, number);
+      if (changed.changes) this.adoptRecovery(number, 'environment', scope);
+    });
+  }
+
   adoptRecovery(number, kind, scope) {
     this.db.prepare(
       "INSERT OR IGNORE INTO technical_recovery (number, kind, scope) SELECT number, ?, ? FROM tasks" +
