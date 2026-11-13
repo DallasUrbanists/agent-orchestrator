@@ -47,13 +47,13 @@ function assertWorktree(target, stateDir, task) {
   return path;
 }
 
-function permitted(path, scope) {
+export function permitted(path, scope) {
   return !reserved.test(path) && !/[\0-\x1f\x7f\\:]/.test(path) &&
     path.split('/').every(part => part && part !== '.' && part !== '..') &&
     scope.some(entry => entry.endsWith('/') ? path.startsWith(entry) : path === entry);
 }
 
-function assertRegularPath(cwd, path) {
+export function assertRegularPath(cwd, path) {
   const file = join(cwd, path);
   try {
     if (!lstatSync(file).isFile() || relative(file, realpathSync(file))) {
@@ -102,8 +102,8 @@ function marker(number, commit) {
   return '<!-- orchestrator-handoff:' + number + ':' + commit + ' -->';
 }
 
-async function ensureLink(state, api, repo, number, body, options) {
-  const key = 'handoff-link:' + repo + ':' + number + ':' + body.split('\n')[0];
+async function ensureLink(state, api, repo, number, body, options, marker = body.split('\n')[0]) {
+  const key = 'handoff-link:' + repo + ':' + number + ':' + marker;
   const pending = state.get(key);
   const actor = await api.viewer(options);
   if (!id(actor) || (pending && pending !== String(actor))) throw new Error('Handoff comment publisher changed');
@@ -121,6 +121,20 @@ async function ensureLink(state, api, repo, number, body, options) {
     if ([401, 403, 404, 422, 429].includes(error.status)) state.set(key, '');
     throw error;
   }
+}
+
+export async function requestCodexReview(state, repo, number, branch, head, options, api = githubHandoff) {
+  if (!id(number) || !oid(head)) return;
+  const marker = 'codex-review:' + head;
+  const key = marker + ':' + repo + ':' + number;
+  if (state.get(key)) return;
+  const pulls = await api.pulls(repo, branch, options);
+  if (!pulls.some(pull => pull.number === number && pull.state === 'open' &&
+    pull.head?.ref === branch && pull.head?.sha === head && pull.head?.repo?.full_name?.toLowerCase() === repo &&
+    pull.base?.ref === 'main' && pull.base?.repo?.full_name?.toLowerCase() === repo)) return;
+  if (options.signal?.aborted || ['pause', 'stop'].includes(state.get('control'))) return;
+  await ensureLink(state, api, repo, number, '@codex review\n\n<!-- ' + marker + ' -->', options, marker);
+  state.set(key, 'requested');
 }
 
 export async function publishVerified({ state, stateDir, target, policy, number, signal,
