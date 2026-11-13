@@ -301,6 +301,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
 
   if (relative(stateDirectory(stateDir), stateDir) !== '') throw new Error('State directory redirected during setup');
   const active = new Map();
+  const modelSlots = new Map();
+  const pendingPublications = new Map();
   let serial = Promise.resolve();
   function exclusive(operation) {
     const next = serial.then(operation);
@@ -367,7 +369,13 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     if (relative(realpathSync(logDir), logDir) !== '') throw new Error('Log directory redirects elsewhere');
     const holdDispatch = () => dispatchHold(
       state.list().filter(row => row.state !== 'running' || !active.has(row.number)), state.get('control'));
-    const publishTask = number => exclusive(() => publishTaskNow(number));
+    const publishTask = number => {
+      if (!pendingPublications.has(number)) {
+        const job = exclusive(() => publishTaskNow(number)).finally(() => pendingPublications.delete(number));
+        pendingPublications.set(number, job);
+      }
+      return pendingPublications.get(number);
+    };
     async function publishTaskNow(number) {
       if (!handoff?.issues.has(number) || !['done', 'awaiting-handoff'].includes(state.task(number)?.state) ||
           state.handoff(number)?.linked || signal?.aborted ||
@@ -401,8 +409,9 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     while (dispatched < limit || newDecision || active.size) {
       if (fatal) throw fatal;
       if (terminal) return { reason: terminal, results };
-      if (active.size >= slots || (active.size && dispatched >= limit)) {
-        await Promise.race(active.values());
+      if (modelSlots.size >= slots || (active.size && dispatched >= limit)) {
+        await Promise.race(modelSlots.size >= slots && dispatched < limit
+          ? [...modelSlots.values()].map(slot => slot.released) : active.values());
         continue;
       }
       if (signal?.aborted) return { reason: 'stopped', results };
@@ -470,8 +479,10 @@ export async function execute(queue, statePath, options, worker = runCodex) {
             }
           }
           if ((finalHostVerification && finalHostVerification.number !== number) || accepted.has(number) || state.handoff(number)?.linked) continue;
-          await publishTask(number);
-          if (state.handoff(number)?.linked) await publisher?.sync(number);
+          if (!active.has(number) && ['done', 'awaiting-handoff'].includes(task?.state)) {
+            const publication = publishTask(number);
+            if (!continuous && !active.size) await publication;
+          }
         }
       }
 
@@ -645,14 +656,23 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const current = state.task(issue.number);
       if (active.has(issue.number) || (current && current.state !== 'blocked') ||
           (current && !answers.has(issue.number) && !recovery.has(issue.number))) continue;
-      const usedSlots = new Set([...active.values()].map(job => job.slot));
-      const slot = [1, 2, 3].find(id => !usedSlots.has(id));
+      const slot = [1, 2, 3].find(id => !modelSlots.has(id));
+      let wake;
+      const released = new Promise(resolve => { wake = resolve; });
+      modelSlots.set(slot, { released });
+      const releaseModel = () => {
+        if (modelSlots.get(slot)?.released !== released) return;
+        modelSlots.delete(slot);
+        wake();
+      };
       const job = runIssue().then(outcome => {
         if (outcome) terminal ??= outcome.reason;
-      }).catch(error => { fatal ??= error; }).finally(() => active.delete(issue.number));
-      job.slot = slot;
+      }).catch(error => { fatal ??= error; }).finally(() => {
+        releaseModel();
+        active.delete(issue.number);
+      });
       active.set(issue.number, job);
-      if (slots === 1) await job;
+      if (slots === 1) await released;
       continue;
 
       async function runIssue() {
@@ -774,10 +794,16 @@ export async function execute(queue, statePath, options, worker = runCodex) {
                   return { base: attemptBase, tree };
                 } catch { return null; }
               };
+              state.set('attempt-stage:' + attempt, 'awaiting-verification');
+              releaseModel();
               const before = snapshot();
+              const verificationQueued = Date.now();
               result = publicationEntry && !before ? { state: 'blocked', detail: 'publication-scope-not-verified' }
-                : await exclusive(() => verifyTechnical({ ...execution, verifierCode: bytes, collectEvidence: Boolean(profileEvidence),
-                  timeoutMs: Math.max(1, execution.timeoutMs - (Date.now() - Date.parse(state.task(issue.number).started))) }));
+                : await exclusive(() => {
+                  state.set('attempt-stage:' + attempt, 'verifying');
+                  return verifyTechnical({ ...execution, verifierCode: bytes, collectEvidence: Boolean(profileEvidence),
+                    timeoutMs: Math.max(1, execution.timeoutMs - (verificationQueued - Date.parse(state.task(issue.number).started))) });
+                });
               if (result.state === 'done' && before) {
                 const after = snapshot();
                 if (after?.tree === before.tree) {
@@ -821,6 +847,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         } else if (nextRecovery?.kind === 'environment' && !technical.verifierFor(issue.number)) {
           state.holdRecovery(issue.number, 'verification-runner-required');
         }
+        if (verification) releaseModel();
         await publication;
         if (verification && !accepted.has(issue.number)) await publishTask(issue.number);
         await publisher?.sync(issue.number);
@@ -841,6 +868,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     throw error;
   } finally {
     await Promise.allSettled(active.values());
+    await Promise.allSettled(pendingPublications.values());
     try { state?.close(); } finally { release(); }
   }
 }
