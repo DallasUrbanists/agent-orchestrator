@@ -479,7 +479,9 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         const publicationEntry = handoff?.issues.get(issue.number);
         result = verifying ? null : await worker({ ...execution, executable, model: issue.model, reasoning: issue.reasoning,
           prompt: workerPrompt(issue, templates, approvedChoices, Boolean(retry), Boolean(technical)) });
-        if (verifying || (result.state === 'done' && (publicationEntry || (retry?.kind === 'code' && verifierCode)))) {
+        const profileEvidence = technical?.profileEvidence?.(issue.number);
+        if (verifying || (result.state === 'done' && (publicationEntry || profileEvidence ||
+            (retry?.kind === 'code' && verifierCode)))) {
           let bytes = verifierCode;
           if (!bytes) {
             try { bytes = technical?.verifierFor(issue.number)?.(); }
@@ -506,7 +508,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
                 verification = { repo: handoff.repo, ...before,
                   evidence: 'Approved verification runner exited successfully. Journal attempt ' + attempt + '.\n' +
                     'Verifier SHA-256: ' + createHash('sha256').update(bytes).digest('hex') + '.\n' +
-                    'Verified tree: ' + before.tree + '.' };
+                    'Verified tree: ' + before.tree + '.' + (profileEvidence ? '\n\n' + profileEvidence : '') };
               } else result = { state: 'blocked', detail: 'verified-worktree-changed-during-verification' };
             }
           }
