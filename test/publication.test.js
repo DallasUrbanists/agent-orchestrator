@@ -152,6 +152,51 @@ test('automatically verifies and publishes a recovered task, without releasing i
   assert.match(f.pulls[0].body, /Approved verification runner exited successfully[\s\S]*Verifier SHA-256/);
 });
 
+test('legacy handoff reopens finished recovery without resetting its budget', async t => {
+  const f = fixture(t);
+  await f.executeWith(async () => ({ state: 'done' }));
+  const state = new State(f.stateDir);
+  try {
+    state.db.prepare("INSERT INTO technical_recovery VALUES (7, 'code', 'old-scope', 1, 'finished')").run();
+    state.reconcileUnverifiedHandoff(7, 'approved-scope');
+
+    const expected = { number: 7, kind: 'environment', scope: 'approved-scope', used: 1, hold: null };
+    assert.deepEqual({ ...state.recoveryRows()[0] }, expected);
+    assert.equal(state.task(7).state, 'blocked');
+    assert.equal(state.attempts().length, 1);
+    state.reconcileUnverifiedHandoff(7, 'different-scope');
+    assert.deepEqual({ ...state.recoveryRows()[0] }, expected);
+  } finally { state.close(); }
+});
+
+test('a verified attempt stays pending across restart until its PR link is recorded', async t => {
+  const f = fixture(t);
+  const path = join(f.root, 'verifier.mjs');
+  const body = 'process.exit(0);';
+  writeFileSync(path, body);
+  f.queue.technicalRecovery = { verifier: { number: 7, path, sha256: createHash('sha256').update(body).digest('hex') } };
+  f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'] }] };
+  const api = f.publishOptions.api;
+  const listPulls = api.pulls;
+  api.pulls = async () => { throw new Error('GitHub unavailable'); };
+  await f.executeWith(async ({ cwd }) => {
+    writeFileSync(join(cwd, 'renderer.txt'), 'verified');
+    return { state: 'done' };
+  });
+  assert.equal(f.inspect(state => state.task(7).state), 'awaiting-handoff');
+  assert.equal(f.inspect(state => state.attempts()[0].state), 'awaiting-handoff');
+  assert.equal(f.inspect(state => state.handoff(7).linked), 0);
+
+  api.pulls = listPulls;
+  await f.executeWith(workerForbidden);
+  assert.equal(f.inspect(state => state.task(7).state), 'done');
+  assert.equal(f.inspect(state => state.attempts()[0].state), 'done');
+  assert.equal(f.inspect(state => state.attempts().length), 1);
+  assert.equal(f.inspect(state => state.task(8)), undefined);
+  assert.equal(f.pulls.length, 1);
+  assert.equal(f.comments.length, 1);
+});
+
 test('publishes measured profile checks and holds malformed verifier evidence', async t => {
   for (const valid of [true, false]) {
     const f = fixture(t);

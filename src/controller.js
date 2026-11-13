@@ -369,7 +369,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       state.list().filter(row => row.state !== 'running' || !active.has(row.number)), state.get('control'));
     const publishTask = number => exclusive(() => publishTaskNow(number));
     async function publishTaskNow(number) {
-      if (!handoff?.issues.has(number) || state.task(number)?.state !== 'done' ||
+      if (!handoff?.issues.has(number) || !['done', 'awaiting-handoff'].includes(state.task(number)?.state) ||
           state.handoff(number)?.linked || signal?.aborted ||
           holdDispatch()) return;
       const claim = coordinatorId && state.intakeClaims().find(row => row.number === number);
@@ -514,6 +514,16 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         if (state.get('intakeWaiting') !== report) state.set('intakeWaiting', report);
       }
       const independent = finalHostVerification ? [] : runnable(dispatchable, previous, sourceRepo, new Set(answers.keys()), accepted);
+      if (coordinatorId && handoff && technical && !finalHostVerification) {
+        for (const candidate of issues) {
+          const number = candidate.number;
+          const entry = handoff.issues.get(number);
+          const claim = claimsByIssue.get(number);
+          if (candidate.state !== 'ready' || !entry || entry.verified || accepted.has(number) ||
+              claim?.issue_id !== candidate.intake?.issueId || claim?.revision !== candidate.intake?.hash) continue;
+          state.reconcileUnverifiedHandoff(number, recoveryScope(candidate));
+        }
+      }
       const recovery = new Map();
       if (technical && !independent.length) {
         const candidates = new Map(issues.filter(issue => issue.state === 'ready').map(issue => [issue.number, issue]));
@@ -537,7 +547,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           if ((finalHostVerification && !final) || (row.hold && !retryableHold && !final && !blocker && !coolingDown) ||
               (active.has(row.number) || state.task(row.number)?.state !== 'blocked')) continue;
           const candidate = candidates.get(row.number);
-          if (!candidate) continue;
+          if (!candidate || (coordinatorId && handoff && row.kind === 'environment' && !handoff.issues.has(row.number))) continue;
           if (coordinatorId && !claimsByIssue.has(row.number)) continue;
           if (recoveryScope(candidate) !== row.scope) {
             state.holdRecovery(row.number, 'task-scope-changed');
@@ -628,7 +638,9 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         const location = worktreeLocation(stateDir, issue.number, sourceRepo);
         const answer = answers.get(issue.number);
         const retry = recovery.get(issue.number);
-        const resumingImplementation = retry?.kind === 'environment' && !retry.final && retry.used === 0 &&
+        const pendingHandoff = retry && ['publication-verifier-required', 'publication-scope-required']
+          .includes(state.task(issue.number)?.detail);
+        const resumingImplementation = retry?.kind === 'environment' && !pendingHandoff && !retry.final && retry.used === 0 &&
           !state.get('recovery-budget-reset:' + issue.number) && technical.resumeImplementation?.(issue.number);
         const verifying = retry?.kind === 'environment' && !resumingImplementation;
         const verifierCode = retry?.verifierCode;
@@ -716,6 +728,10 @@ export async function execute(queue, statePath, options, worker = runCodex) {
             prompt: workerPrompt(issue, templates, approvedChoices, resumingImplementation ? 'implementation' : retry?.kind, Boolean(technical)) +
               (retry?.blocker ? '\nCoordinator-approved blocker assignment. Limit edits to resolving this blocker:\n' +
                 retry.blocker.instruction : '') });
+          if (coordinatorId && handoff && result?.state === 'done' && !publicationEntry) {
+            result = { state: 'blocked', detail: 'publication-scope-required',
+              result: { technicalBlocker: 'environment' } };
+          }
           const profileEvidence = technical?.profileEvidence?.(issue.number);
           const repairedButNeedsHost = profileEvidence && (resumingImplementation || retry?.kind === 'code') && result?.state === 'blocked' &&
             result.result?.technicalBlocker === 'environment' && !result.result?.decisionKey;
@@ -775,6 +791,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         const kind = result.result?.technicalBlocker;
         const nextRecovery = technical && result.state === 'blocked' && !result.result?.decisionKey &&
           (kind === 'code' || kind === 'environment') ? { kind, scope: recoveryScope(issue) } : null;
+        if (verification) result = { ...result, state: 'awaiting-handoff' };
         state.finish(issue.number, attempt, result, request, nextRecovery, verification);
         if (nextRecovery && ((retry ? retry.used + 1 : 0) >= technical.limit || state.activeMillis(issue.number) >= ACTIVE_BUDGET_MS)) {
           state.holdRecovery(issue.number, 'recovery-budget-exhausted');
@@ -785,7 +802,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         if (verification && !accepted.has(issue.number)) await publishTask(issue.number);
         await publisher?.sync(issue.number);
         newDecision ||= Boolean(request);
-        results.push({ number: issue.number, state: result.state, detail: result.detail,
+        results.push({ number: issue.number, state: state.task(issue.number).state, detail: result.detail,
           ...(request && { decision: request.id }), ...(answer && { resumedFrom: answer.id }),
           ...(retry && { recovery: retry.kind }) });
         if (result.state === 'interrupted') return { reason: 'interrupted-worker-needs-review', results };

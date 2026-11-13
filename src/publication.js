@@ -142,7 +142,7 @@ export async function publishVerified({ state, stateDir, target, policy, number,
   const { repo, issues } = policy;
   const entry = issues.get(number);
   const task = state.task(number);
-  if (task?.state !== 'done' || !entry || task.cleaned || signal?.aborted) return null;
+  if (!['done', 'awaiting-handoff'].includes(task?.state) || !entry || task.cleaned || signal?.aborted) return null;
   async function verifyApproval() {
     if (!authorize || await authorize()) return;
     throw Object.assign(new Error('Publication requires the original approved intake revision'), {
@@ -227,6 +227,7 @@ export async function publishVerified({ state, stateDir, target, policy, number,
   state.transaction(() => {
     state.updateGithubStatus(number, { pull: pull.number });
     state.updateHandoff(number, { linked: 1 });
+    state.completeHandoff(number);
   });
   return pull.html_url;
 }
