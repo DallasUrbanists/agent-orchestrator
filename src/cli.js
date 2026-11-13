@@ -29,7 +29,7 @@ async function main() {
       queue: { type: 'string' }, 'watch-acceptance': { type: 'string' }, state: { type: 'string', default: './state' },
       repo: { type: 'string' }, polls: { type: 'string', default: '1' },
       'interval-seconds': { type: 'string', default: '15' },
-      execute: { type: 'boolean' }, 'github-decisions': { type: 'boolean' },
+      execute: { type: 'boolean' }, continuous: { type: 'boolean' }, 'github-decisions': { type: 'boolean' },
       'github-status': { type: 'boolean' }, pr: { type: 'string' }, 'merge-evidence': { type: 'string' },
       limit: { type: 'string', default: '1' },
       'timeout-seconds': { type: 'string', default: '900' }, 'final-host-verification': { type: 'string' },
@@ -51,10 +51,13 @@ async function main() {
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
     console.log('Authorize one host-only verification after exhaustion with --final-host-verification ISSUE:ATTEMPT.');
     console.log('For GitHub intake, configure githubIntake.coordinatorId in the queue file.');
-    console.log('Watch supervised merges with run --execute --queue FILE --watch-acceptance FILE --polls N.');
+    console.log('Watch supervised merges with run --execute --queue FILE --watch-acceptance FILE --polls N or --continuous.');
     console.log('Poll GitHub read-only with poll --repo OWNER/REPO --polls N --interval-seconds N.');
     console.log('Opt in to decision comments with run --execute --github-decisions and a reviewed GitHub queue.');
     return;
+  }
+  if (values.continuous && (command !== 'run' || !values.execute)) {
+    throw new Error('--continuous requires a real run with --execute');
   }
   const publish = command === 'sync-status' || command === 'handoff';
   const withNumber = ['acknowledge', 'cleanup', 'handoff', 'check-merge'].includes(command) ||
@@ -126,7 +129,7 @@ async function main() {
       const result = await execute(data, resolve(values.state), {
         executable, limit: Number(values.limit), timeoutMs: 1000 * Number(values['timeout-seconds']),
         signal: abort.signal, decisionsEnabled: values['github-decisions'], publishStatus: values['github-status'],
-        readAcceptance, acceptancePath, finalHostVerification, ...polling
+        readAcceptance, acceptancePath, finalHostVerification, continuous: values.continuous, ...polling
       });
       print(result);
       if (['interrupted-worker-needs-review', 'restored-state-needs-reconciliation'].includes(result.reason) ||
