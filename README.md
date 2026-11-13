@@ -153,6 +153,12 @@ npm run start -- --queue queue.local.json --state .\state\github-demo --execute 
 
 After reviewing the worker output and checks, the supervising coordinator merges the accepted change and advances the dedicated checkout's local `main`. Then replace the acceptance file atomically with the complete receipt array, including the new merged commit. The controller checks ancestry against the refreshed `main` and creates the dependent worktree from that exact commit. It stops on a non-fast-forward change or a receipt that is removed, changed, or outside the base history. The journal carries the last observed base and receipts across restarts. A later run without the watcher still has to include those receipts and use a descendant of that base. A GitHub merge becomes visible after the coordinator updates the local checkout. The controller does not fetch or merge automatically in this mode. The dispatch and idle poll limits still apply.
 
+For a run that should stay available while waiting for a supervised merge or a
+GitHub reply, use `--continuous` with `--execute`. The controller keeps polling
+when no issue is eligible. It still exits at the configured `--limit`, on Pause
+or Stop, or when a hold or error requires reconciliation. Use the same state
+directory and acceptance file when restarting.
+
 ### GitHub issue intake with coordinator approval
 
 This mode discovers open issues on every poll, including issues opened after the controller starts. Use a dedicated checkout and a single persistent state directory. The local configuration identifies the target and coordinator. Each task comes directly from its GitHub issue, without an entry in an `issues` array or an approval label.

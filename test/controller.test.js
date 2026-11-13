@@ -496,6 +496,45 @@ test('strict scheduling waits for a reviewed prerequisite in the actual worktree
   await assert.rejects(preview(queue, stateDir, { readIssues }), /different prerequisite policy/);
 });
 
+test('continuous watch dispatches after several idle polls and stops at its execution limit', async t => {
+  const { queue, repo, stateDir } = fixture(t, [task(1, [3])]);
+  queue.issues.push({ ...task(3), state: 'done' });
+  queue.acceptedPrerequisites = [];
+  let polls = 0, merged;
+  const result = await execute(queue, stateDir, {
+    ...options, limit: 1, polls: 1, continuous: true, intervalMs: 5,
+    readAcceptance() {
+      if (++polls < 4) return [];
+      writeFileSync(join(repo, 'accepted.txt'), 'new main');
+      git(repo, ['add', 'accepted.txt']);
+      git(repo, ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+        '-c', 'commit.gpgsign=false', 'commit', '-m', 'Integrate prerequisite']);
+      merged = git(repo, ['rev-parse', 'HEAD']);
+      return [{ number: 3, commit: merged }];
+    }
+  }, async ({ cwd }) => {
+    assert.equal(git(cwd, ['rev-parse', 'HEAD']), merged);
+    assert.equal(readFileSync(join(cwd, 'accepted.txt'), 'utf8'), 'new main');
+    return done();
+  });
+  assert.equal(polls, 4);
+  assert.equal(result.reason, 'execution-limit');
+  assert.deepEqual(result.results.map(row => row.number), [1]);
+});
+
+test('continuous watch honors a pause during an idle poll', async t => {
+  const { queue, stateDir } = fixture(t, [{ ...task(1), state: 'blocked' }]);
+  queue.acceptedPrerequisites = [];
+  const result = await execute(queue, stateDir, {
+    ...options, polls: 1, continuous: true, intervalMs: 5,
+    readAcceptance() {
+      withState(stateDir, state => state.set('control', 'pause'));
+      return [];
+    }
+  }, () => assert.fail('unexpected worker'));
+  assert.deepEqual(result, { reason: 'pause', results: [] });
+});
+
 test('watched acceptance holds if a recorded receipt disappears between dispatches', async t => {
   const { queue, repo, stateDir } = fixture(t, [task(1), task(2)]);
   const base = git(repo, ['rev-parse', 'HEAD']);

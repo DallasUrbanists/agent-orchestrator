@@ -240,7 +240,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const { executable, limit = 1, timeoutMs = 15 * 60 * 1000, signal,
     polls = 1, intervalMs = 15000, readIssues = readGithubIssues, decisionsEnabled = false,
     decisionApi = githubDecisions, readAcceptance, acceptancePath, intakeApi, publishStatus = false, statusApi,
-    waitForIssueRetry = wait, publishOptions, finalHostVerification } = options;
+    waitForIssueRetry = wait, publishOptions, finalHostVerification, continuous = false } = options;
   if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) {
     throw new Error('Specify a positive execution limit and a worker timeout up to one hour');
@@ -251,6 +251,9 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const { sourceRepo, coordinatorId, load } = prepareQueue(queue, repo, readIssues, decisionsEnabled, intakeApi);
   if (publishStatus && !sourceRepo) throw new Error('GitHub status publishing requires a GitHub-backed queue');
   if (coordinatorId && !readAcceptance) throw new Error('GitHub intake requires --watch-acceptance');
+  if (continuous && ((!sourceRepo && !readAcceptance) || finalHostVerification)) {
+    throw new Error('Continuous polling requires GitHub or watched acceptance and a regular execution run');
+  }
   const technical = recoveryPolicy(queue.technicalRecovery, repo, stateDir);
   const handoff = queue.publication === undefined ? null : publicationPolicy(queue.publication);
   if (handoff) {
@@ -437,7 +440,10 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       if (beforeClaim) return { reason: beforeClaim, results };
       if (signal?.aborted) return { reason: 'stopped', results };
       if (!issue) {
-        if ((!sourceRepo && !loadAcceptance) || ++idlePolls >= polls) return { reason: 'no-eligible-work', results };
+        idlePolls++;
+        if (!continuous && ((!sourceRepo && !loadAcceptance) || idlePolls >= polls)) {
+          return { reason: 'no-eligible-work', results };
+        }
         await wait(intervalMs, undefined, { signal });
         continue;
       }
