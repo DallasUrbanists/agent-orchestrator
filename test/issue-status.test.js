@@ -79,6 +79,11 @@ test('single-issue status reconciliation validates the legacy origin without reb
   assert.equal(statusRepository(state, stateDir, 'Fixture/Status'), repo);
   assert.throws(() => statusRepository(state, stateDir, 'fixture/other'), /saved checkout origin/);
   assert.equal(state.get('sourceRepo'), undefined);
+  state.set('statusRepo', repo);
+  assert.equal(statusRepository(state, stateDir), repo);
+  assert.throws(() => statusRepository(state, stateDir, 'fixture/other'), /does not match the journal/);
+  git(target, ['remote', 'set-url', 'origin', 'https://github.com/fixture/other.git']);
+  assert.throws(() => statusRepository(state, stateDir), /saved checkout origin/);
 });
 
 test('launch opens one comment and the five-minute update reports observed activity and quiet time', async t => {

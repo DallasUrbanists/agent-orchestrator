@@ -170,13 +170,14 @@ async function main() {
     if (publish) {
       if (state.get('restoreHold') === 'true') throw new Error('Status publishing requires reconciled state');
       const sourceRepo = statusRepository(state, stateDir, values.repo);
-      if (!sourceRepo) throw new Error('Status publishing requires GitHub-backed state or single-issue sync-status with --repo');
+      if (!sourceRepo) throw new Error('Status publishing requires a saved GitHub repository or single-issue sync-status with --repo');
       const number = Number(argument);
       if (argument !== undefined && !state.task(number)) {
         if (command === 'handoff') throw new Error('Handoff requires an existing task');
         return print({ number, status: 'unclaimed' });
       }
-      if (values.repo !== undefined && !state.get('sourceRepo') && state.task(number).state === 'running') {
+      if (!state.get('sourceRepo') && (argument === undefined ? state.list() : [state.task(number)])
+        .some(task => task.state === 'running')) {
         throw new Error('Review the running claim in the original journal before publishing');
       }
       if (state.get('sourceRepo')) state.recover();

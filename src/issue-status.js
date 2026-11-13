@@ -163,12 +163,16 @@ export function statusPublisher(state, sourceRepo, { api = githubStatus, signal,
 
 export function statusRepository(state, stateDir, requestedRepo) {
   const bound = state.get('sourceRepo');
-  if (requestedRepo === undefined) return bound;
-  const repo = githubRepo(requestedRepo);
   if (bound) {
-    if (repo !== bound) throw new Error('Status repository does not match the journal');
+    if (requestedRepo !== undefined && githubRepo(requestedRepo) !== bound) {
+      throw new Error('Status repository does not match the journal');
+    }
     return bound;
   }
+  const saved = state.get('statusRepo');
+  if (requestedRepo === undefined && !saved) return undefined;
+  const repo = githubRepo(requestedRepo ?? saved);
+  if (saved && repo !== saved) throw new Error('Status repository does not match the journal');
   const target = state.get('repo');
   const checkout = verifyTarget(target, [target], stateDir);
   const origin = git(checkout, ['config', '--local', '--get-all', 'remote.origin.url']);
