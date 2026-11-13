@@ -33,9 +33,9 @@ test('restores a stopped controller journal and holds dispatch until reconciliat
   await execute(queue, stateDir, { executable: 'fixture', limit: 1 }, async () => ({ state: 'done' }));
   const store = new State(stateDir);
   try {
-    store.reserve({ number: 2, repo, worker: 'local-1', model: 'gpt-6.1-terra',
-      location: worktreeLocation(stateDir, 2), log: 'fixture' });
-    store.finish(2, { state: 'blocked' }, { id: 'decision-fixture', key: 'check', template: {} });
+    const attempt = store.reserve({ number: 2, repo, worker: 'local-1', model: 'gpt-6.1-terra',
+      location: worktreeLocation(stateDir, 2), log: 'fixture', base: git(repo, ['rev-parse', 'HEAD']) });
+    store.finish(2, attempt, { state: 'blocked' }, { id: 'decision-fixture', key: 'check', template: {} });
     store.answerDecision('decision-fixture', { comment: 12, author: 7, choice: 'yes' });
   } finally { store.close(); }
 

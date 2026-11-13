@@ -35,7 +35,7 @@ async function main() {
   });
   const [command = 'run', argument, ...extra] = positionals;
   if (values.help) {
-    console.log('Commands: run | poll | doctor | status | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID | backup | restore FILE');
+    console.log('Commands: run | poll | doctor | status | attempts | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID | backup | restore FILE');
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
     console.log('Watch supervised merges with run --execute --queue FILE --watch-acceptance FILE --polls N.');
     console.log('Poll GitHub read-only with poll --repo OWNER/REPO --polls N --interval-seconds N.');
@@ -109,10 +109,11 @@ async function main() {
       : { restored: restoreJournal(stateDir, argument), control: 'pause', reconciliationRequired: true });
   }
 
-  if (!['status', 'pause', 'stop', 'unpause', 'acknowledge', 'cleanup', 'retry-decision'].includes(command)) {
+  if (!['status', 'attempts', 'pause', 'stop', 'unpause', 'acknowledge', 'cleanup', 'retry-decision'].includes(command)) {
     throw new Error('Unknown command. Use --help');
   }
   const path = resolve(values.state);
+  if (command === 'attempts' && !hasJournal(path)) return print({ attempts: [] });
   if (command === 'status' && !hasJournal(path)) {
     return print({ control: 'running', tasks: [] });
   }
@@ -129,6 +130,7 @@ async function main() {
         tasks: state.list(), ...(decisions.length && { decisions }),
         ...(state.get('restoreHold') === 'true' && { reconciliationRequired: true }) });
     }
+    if (command === 'attempts') return print({ attempts: state.attempts() });
     if (retryDecision) {
       state.retryDecision(argument);
       return print({ decision: argument, delivery: 'queued-for-reconciliation' });

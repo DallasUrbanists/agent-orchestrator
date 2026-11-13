@@ -60,7 +60,13 @@ export class State {
       "  id TEXT PRIMARY KEY, number INTEGER NOT NULL, decision_key TEXT NOT NULL, template TEXT NOT NULL," +
       "  requested TEXT NOT NULL, publisher_id INTEGER, posting INTEGER NOT NULL DEFAULT 0," +
       "  request_comment INTEGER, reply_comment INTEGER, responder_id INTEGER, choice TEXT," +
-      "  answered TEXT, consumed TEXT, last_error TEXT, UNIQUE(number, decision_key));"
+      "  answered TEXT, consumed TEXT, last_error TEXT, UNIQUE(number, decision_key));" +
+      "CREATE TABLE IF NOT EXISTS attempts (" +
+      "  id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, worker TEXT NOT NULL," +
+      "  model TEXT NOT NULL, base TEXT NOT NULL, state TEXT NOT NULL, log TEXT NOT NULL," +
+      "  decision TEXT, pid INTEGER, session TEXT, started TEXT NOT NULL, completed TEXT," +
+      "  detail TEXT, exit_code INTEGER);" +
+      "CREATE UNIQUE INDEX IF NOT EXISTS running_attempt_per_task ON attempts(number) WHERE state = 'running';"
     );
   }
   close() { this.db.close(); }
@@ -105,26 +111,49 @@ export class State {
   list() { return this.db.prepare('SELECT * FROM tasks ORDER BY number').all(); }
   task(number) { return this.db.prepare('SELECT * FROM tasks WHERE number = ?').get(number); }
 
-  reserve({ number, repo, worker, model, location, log }) {
-    this.db.prepare(
-      "INSERT INTO tasks (number, target, worker, model, state, worktree, branch, log, started)" +
-      " VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)"
-    ).run(number, repo, worker, model, location.path, location.branch, log, new Date().toISOString());
+  attempts() { return this.db.prepare('SELECT * FROM attempts ORDER BY id').all(); }
+
+  insertAttempt(number, base, decision = null) {
+    return this.db.prepare(
+      "INSERT INTO attempts (number, worker, model, base, state, log, decision, started)" +
+      " SELECT number, worker, model, ?, 'running', log, ?, started FROM tasks WHERE number = ?"
+    ).run(base, decision, number).lastInsertRowid;
   }
-  process(number, { pid, threadId }) {
-    this.db.prepare('UPDATE tasks SET pid = coalesce(?, pid), session = coalesce(?, session) WHERE number = ?')
-      .run(pid ?? null, threadId ?? null, number);
+
+  reserve({ number, repo, worker, model, location, log, base }) {
+    return this.transaction(() => {
+      this.db.prepare(
+        "INSERT INTO tasks (number, target, worker, model, state, worktree, branch, log, started)" +
+        " VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)"
+      ).run(number, repo, worker, model, location.path, location.branch, log, new Date().toISOString());
+      return this.insertAttempt(number, base);
+    });
   }
-  finish(number, { state, detail, code }, decision = null) {
-    const completed = new Date().toISOString();
-    const finishTask = () => this.db.prepare(
-      'UPDATE tasks SET state = ?, detail = ?, exit_code = ?, completed = ? WHERE number = ?'
-    ).run(state, detail ?? null, code ?? null, completed, number);
-    if (!decision) return finishTask();
+  process(number, attempt, { pid, threadId }) {
     this.transaction(() => {
-      finishTask();
-      this.db.prepare('INSERT INTO decisions (id, number, decision_key, template, requested) VALUES (?, ?, ?, ?, ?)')
-        .run(decision.id, number, decision.key, JSON.stringify(decision.template), completed);
+      const update = ' SET pid = coalesce(?, pid), session = coalesce(?, session)';
+      const result = this.db.prepare(
+        "UPDATE attempts" + update + " WHERE id = ? AND number = ? AND state = 'running'"
+      ).run(pid ?? null, threadId ?? null, attempt, number);
+      if (!result.changes) throw new Error('Worker attempt no longer owns the task');
+      this.db.prepare("UPDATE tasks" + update + " WHERE number = ? AND state = 'running'")
+        .run(pid ?? null, threadId ?? null, number);
+    });
+  }
+  finish(number, attempt, { state, detail, code }, decision = null) {
+    const completed = new Date().toISOString();
+    const values = [state, detail ?? null, code ?? null, completed];
+    const update = ' SET state = ?, detail = ?, exit_code = ?, completed = ?';
+    this.transaction(() => {
+      const result = this.db.prepare(
+        "UPDATE attempts" + update + " WHERE id = ? AND number = ? AND state = 'running'"
+      ).run(...values, attempt, number);
+      if (!result.changes) throw new Error('Worker attempt no longer owns the task');
+      this.db.prepare("UPDATE tasks" + update + " WHERE number = ? AND state = 'running'").run(...values, number);
+      if (decision) {
+        this.db.prepare('INSERT INTO decisions (id, number, decision_key, template, requested) VALUES (?, ?, ?, ?, ?)')
+          .run(decision.id, number, decision.key, JSON.stringify(decision.template), completed);
+      }
     });
   }
 
@@ -167,7 +196,7 @@ export class State {
     ).run(id);
     if (!result.changes) throw new Error('No blocked decision with unconfirmed delivery for that ID');
   }
-  resumeDecision(id, number, model, log) {
+  resumeDecision(id, number, model, log, base) {
     const now = new Date().toISOString();
     return this.transaction(() => {
       const answer = this.db.prepare(
@@ -180,17 +209,22 @@ export class State {
         " WHERE number = ? AND state = 'blocked'"
       ).run(model, log, now, number);
       if (!answer.changes || !task.changes) throw new Error('Decision or blocked claim is unavailable for resumption');
-      return this.db.prepare(
+      const attempt = this.insertAttempt(number, base, id);
+      const approvedChoices = this.db.prepare(
         'SELECT decision_key, choice, template FROM decisions WHERE number = ?' +
         ' AND consumed IS NOT NULL ORDER BY rowid'
       ).all(number);
+      return { attempt, approvedChoices };
     });
   }
   recover() {
-    this.db.prepare(
-      "UPDATE tasks SET state = 'interrupted', detail = 'previous-controller-exited', completed = ?" +
-      " WHERE state = 'running'"
-    ).run(new Date().toISOString());
+    const completed = new Date().toISOString();
+    this.transaction(() => {
+      for (const table of ['tasks', 'attempts']) {
+        this.db.prepare("UPDATE " + table + " SET state = 'interrupted', detail = 'previous-controller-exited'," +
+          " completed = ? WHERE state = 'running'").run(completed);
+      }
+    });
   }
   acknowledge(number) {
     const result = this.db.prepare(
