@@ -130,15 +130,13 @@ export function statusPublisher(state, sourceRepo, { api = githubStatus, signal,
       state.updateGithubStatus(number, { error: 'issue-lookup-failed' });
       return;
     }
-    if (issue.state !== 'open') {
-      state.updateGithubStatus(number);
-      return;
-    }
     try {
-      const labels = new Set(issue.labels.map(item => item.name?.toLowerCase()));
-      if (label && !labels.has(label)) await api.add(repo, number, label, options);
-      for (const previous of owned) {
-        if (previous !== label && labels.has(previous)) await api.remove(repo, number, previous, options);
+      if (issue.state === 'open') {
+        const labels = new Set(issue.labels.map(item => item.name?.toLowerCase()));
+        if (label && !labels.has(label)) await api.add(repo, number, label, options);
+        for (const previous of owned) {
+          if (previous !== label && labels.has(previous)) await api.remove(repo, number, previous, options);
+        }
       }
       state.updateGithubStatus(number, { error: handoffError });
     } catch {

@@ -21,12 +21,12 @@ function fixture(t) {
     location: { path: directory, branch }, log: join(directory, 'log'), base: 'base' });
   const labels = new Set(['keep-me']);
   const comments = [];
-  let pull;
+  let pull, issueState = 'open';
   let posts = 0, edits = 0;
   let postFailure, removeFailure;
   const api = {
     async viewer() { return 101; },
-    async issue() { return { number: 1, html_url: origin + '/issues/1', state: 'open',
+    async issue() { return { number: 1, html_url: origin + '/issues/1', state: issueState,
       labels: [...labels].map(name => ({ name })) }; },
     async openPulls() { return pull ? [pull] : []; },
     async add(_repo, _number, label) { labels.add(label); },
@@ -53,6 +53,7 @@ function fixture(t) {
     set postFailure(value) { postFailure = value; }, set removeFailure(value) { removeFailure = value; },
     restart() { state.close(); state = new State(directory); },
     time(ms) { now = instant(ms); },
+    closeIssue() { issueState = 'closed'; },
     observe(event, ms) { return observeProgress(state, attempt, event, instant(ms)); },
     finish(outcome) { state.finish(1, attempt, { state: outcome }); },
     handoff() {
@@ -135,4 +136,16 @@ test('retries a definite create rejection and leaves an interrupted attempt on i
   assert.equal(f.comments[0].id, id);
   assert.match(f.comments[0].body, /Interrupted/);
   assert.deepEqual([...f.labels], ['keep-me', 'blocked']);
+});
+
+test('a closed issue retains its labels and receives the final comment edit', async t => {
+  const f = fixture(t);
+  f.observe({ type: 'worker-started', pid: 321 }, 0);
+  await f.publisher().sync(1);
+  f.closeIssue();
+  f.finish('failed');
+  await f.publisher().sync(1);
+  assert.deepEqual([...f.labels], ['keep-me', 'in-progress']);
+  assert.equal(f.posts, 1);
+  assert.match(f.comments[0].body, /Failed/);
 });
