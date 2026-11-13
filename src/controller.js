@@ -231,20 +231,24 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const usedKeys = decisionsEnabled ? new Set(state.decisionKeys(issue.number)) : new Set();
       const templates = (issue.decisions ?? []).filter(template => !usedKeys.has(template.key));
       // Record the attempt before creating a worktree or spawning a process.
-      const approvedChoices = answer ? state.resumeDecision(answer.id, issue.number, MODELS[issue.model], log) : [];
-      if (!answer) state.reserve({ number: issue.number, repo, worker: 'local-1', model: MODELS[issue.model], location, log });
+      const model = MODELS[issue.model];
+      const dispatch = answer
+        ? state.resumeDecision(answer.id, issue.number, model, log, git(location.path, ['rev-parse', 'HEAD']))
+        : { attempt: state.reserve({ number: issue.number, repo, worker: 'local-1', model, location, log, base }),
+          approvedChoices: [] };
+      const { attempt, approvedChoices } = dispatch;
       let logFile;
       try {
         logFile = openSync(log, 'ax');
       } catch {
         const result = { state: 'failed', detail: 'recording-failed' };
-        state.finish(issue.number, result);
+        state.finish(issue.number, attempt, result);
         results.push({ number: issue.number, ...result });
         return { reason: result.detail, results };
       }
       function record(event) {
-        if (event.pid || event.threadId) state.process(issue.number, event);
-        appendFileSync(logFile, JSON.stringify({ at: new Date().toISOString(), ...event }) + '\n');
+        if (event.pid || event.threadId) state.process(issue.number, attempt, event);
+        appendFileSync(logFile, JSON.stringify({ ...event, at: new Date().toISOString(), attempt }) + '\n');
       }
 
       const cancel = new AbortController();
@@ -283,7 +287,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         result = { ...result, state: 'failed', detail: 'control-read-failed' };
       }
       const request = result.state === 'blocked' ? decisionRequest(templates, result.result?.decisionKey) : null;
-      state.finish(issue.number, result, request);
+      state.finish(issue.number, attempt, result, request);
       newDecision = Boolean(request);
       results.push({ number: issue.number, state: result.state, detail: result.detail,
         ...(request && { decision: request.id }), ...(answer && { resumedFrom: answer.id }) });
