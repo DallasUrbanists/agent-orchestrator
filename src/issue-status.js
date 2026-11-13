@@ -20,7 +20,7 @@ export function observeProgress(state, attempt, event, at) {
     return true;
   }
   // Publish controlled phrases only. Raw model output can contain secrets or mentions.
-  const kind = event.type.startsWith('item.') ? event.itemType : event.type;
+  const kind = event.type?.startsWith('item.') ? event.itemType : event.type;
   if (Object.hasOwn(activitySummaries, kind)) {
     const summary = kind === 'command_execution' && event.type !== 'item.completed'
       ? 'Codex reported a local command in progress.' : activitySummaries[kind];
