@@ -756,3 +756,27 @@ test('dispatch continues when a worker finishes during an intake poll', async t 
   assert.equal(result.reason, 'execution-limit');
   assert.deepEqual(result.results.map(row => row.number).sort(), [1, 2, 3]);
 });
+
+test('dispatches a dependent when its prerequisite finishes during polling', async t => {
+  const { queue, stateDir, repo } = fixture(t, [task(1), task(2, [1])]);
+  queue.sourceRepo = 'Fixture/Issue-Queue';
+  queue.workerSlots = 3;
+  git(repo, ['remote', 'add', 'origin', 'git@github.com:fixture/issue-queue.git']);
+  let reads = 0;
+  let finish;
+  const first = new Promise(resolve => { finish = resolve; });
+  const readIssues = async () => {
+    if (++reads === 2) {
+      finish();
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    return [remoteReady(1), remoteReady(2, [1])];
+  };
+  const result = await execute(queue, stateDir, { ...options, limit: 3, readIssues }, async ({ prompt }) => {
+    if (prompt.endsWith('Task 1')) await first;
+    return { state: 'done' };
+  });
+  assert.equal(result.reason, 'no-eligible-work');
+  assert.deepEqual(result.results.map(row => row.number).sort(), [1, 2]);
+});
+

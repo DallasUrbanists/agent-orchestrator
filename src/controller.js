@@ -404,7 +404,6 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       if (signal?.aborted) return { reason: 'stopped', results };
       if (idlePolls) await publisher?.all();
       if (signal?.aborted) return { reason: 'stopped', results };
-      const previous = state.list();
       const hold = holdDispatch();
       if (hold) return { reason: hold, results };
       let issues;
@@ -497,6 +496,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         }
       }
       if (dispatched >= limit) break;
+      const previous = state.list();
       const claimedIds = new Set(claims.map(claim => claim.issue_id));
       const dispatchable = issues.filter(issue => !claimedIds.has(issue.intake?.issueId) || answers.has(issue.number));
       const independent = finalHostVerification ? [] : runnable(dispatchable, previous, sourceRepo, new Set(answers.keys()), accepted);
