@@ -128,6 +128,16 @@ For a supervised queue that requires accepted work on the integration branch, ad
 
 Start the controller from a checkout of the reviewed integration branch. The runner verifies that each listed commit is in the exact history used to create new worktrees. Each approved issue in a GitHub-backed queue must specify a reviewed `dependencies` array in this mode. Use `[]` for an issue with no prerequisites. The controller uses this array even when the GitHub issue body has no numeric dependency list. A GitHub issue state or a worker's local result cannot release dependent work in this mode. A receipt also prevents the accepted issue from dispatching again. The coordinator supplies the receipts and is responsible for matching the issue to the correct integrated change. Restart the run after updating the checkout and receipts. A blocked worktree must already contain the accepted prerequisite commits before it can resume. Use a new state directory when first switching an existing queue to this prerequisite policy.
 
+### Keep dispatch running across supervised merges
+
+Start with a dedicated checkout of local `main`, a reviewed queue with `acceptedPrerequisites` (use `[]` for a new queue), and a separate JSON file containing the current full receipt array. Keep the file outside the target checkout and controller state directory.
+
+```powershell
+npm run start -- --queue queue.local.json --state .\state\github-demo --execute --watch-acceptance acceptance.json --limit 2 --polls 240 --interval-seconds 15
+```
+
+After reviewing the worker output and checks, the supervising coordinator merges the accepted change and advances the dedicated checkout's local `main`. Then replace the acceptance file atomically with the complete receipt array, including the new merged commit. The controller checks ancestry against the refreshed `main` and creates the dependent worktree from that exact commit. It stops on a non-fast-forward change or a receipt that is removed, changed, or outside the base history. A GitHub merge becomes visible after the coordinator updates the local checkout. The controller does not fetch or merge automatically in this mode. The dispatch and idle poll limits still apply.
+
 ## Ask for a decision on GitHub
 
 Enable issue comments explicitly with `--github-decisions` on a real run. Use a GitHub-backed queue, a signed-in `gh` account with permission to comment on the target issues, and a local list of authorized GitHub account IDs. To find an account ID, run `gh api users/LOGIN --jq .id` and verify the account before adding it.

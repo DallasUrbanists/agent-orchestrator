@@ -6,7 +6,7 @@ import { githubDecisions, githubOrigin, githubRepo, readGithubIssues, validatePo
 import { approvedInstruction, decisionRequest, responderIds, reviewedDecisions, syncDecisions } from './decisions.js';
 import { eligibleIssues, validateIssues } from './scheduler.js';
 import { hasJournal, lease, resolveStatePath, State, stateDirectory } from './state.js';
-import { createWorktree, git, verifyResumeWorktree, verifyTarget, worktreeLocation } from './worktrees.js';
+import { createWorktree, git, inside, verifyResumeWorktree, verifyTarget, worktreeLocation } from './worktrees.js';
 
 function workerPrompt(issue, templates, approvedChoices) {
   return [
@@ -111,6 +111,34 @@ function verifyAcceptedPrerequisites(queue, repo, base) {
   return accepted;
 }
 
+function watchAcceptance(queue, repo, readAcceptance) {
+  if (!Object.hasOwn(queue, 'acceptedPrerequisites')) {
+    throw new Error('Watching acceptance requires an explicit acceptedPrerequisites array in the queue');
+  }
+  const main = () => git(repo, ['rev-parse', '--verify', 'refs/heads/main^{commit}']);
+  let previous = main();
+  const baseline = verifyAcceptedPrerequisites(queue, repo, previous);
+  return () => {
+    const receipts = readAcceptance();
+    if (!Array.isArray(receipts)) throw new Error('The watched acceptance file must contain a JSON array');
+    const base = main();
+    if (git(repo, ['symbolic-ref', 'HEAD']) !== 'refs/heads/main') {
+      throw new Error('The watched checkout no longer points to local main');
+    }
+    if (previous !== base) {
+      try { git(repo, ['merge-base', '--is-ancestor', previous, base]); }
+      catch { throw new Error('Local main changed non-fast-forward while watching acceptance'); }
+    }
+    const accepted = verifyAcceptedPrerequisites({ acceptedPrerequisites: receipts }, repo, base);
+    for (const [number, commit] of baseline) {
+      if (accepted.get(number) !== commit) throw new Error('Acceptance receipt changed or disappeared for #' + number);
+    }
+    for (const [number, commit] of accepted) baseline.set(number, commit);
+    previous = base;
+    return { base, accepted };
+  };
+}
+
 function runnable(issues, rows, sourceRepo, resumable, acceptedPrerequisites) {
   return eligibleIssues(issues, new Map(rows.map(row => [row.number, row.state])), {
     acceptSourceCompletion: Boolean(sourceRepo), resumable, acceptedPrerequisites
@@ -146,7 +174,7 @@ export async function preview(queue, statePath, { readIssues = readGithubIssues,
 export async function execute(queue, statePath, options, worker = runCodex) {
   const { executable, limit = 1, timeoutMs = 15 * 60 * 1000, signal,
     polls = 1, intervalMs = 15000, readIssues = readGithubIssues, decisionsEnabled = false,
-    decisionApi = githubDecisions } = options;
+    decisionApi = githubDecisions, readAcceptance, acceptancePath } = options;
   if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) {
     throw new Error('Specify a positive execution limit and a worker timeout up to one hour');
@@ -156,15 +184,21 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const repo = verifyTarget(queue?.target, queue?.allowedRepos, stateDir);
   const { sourceRepo, load } = prepareQueue(queue, repo, readIssues, decisionsEnabled);
   const responders = decisionsEnabled ? responderIds(queue) : null;
-  const base = git(repo, ['rev-parse', '--verify', 'HEAD^{commit}']);
-  const accepted = verifyAcceptedPrerequisites(queue, repo, base);
+  if (acceptancePath && (inside(repo, acceptancePath) || inside(stateDir, acceptancePath))) {
+    throw new Error('Keep the acceptance file outside the target checkout and state directory');
+  }
+  const loadAcceptance = readAcceptance && watchAcceptance(queue, repo, readAcceptance);
+  const startupBase = git(repo, ['rev-parse', '--verify', 'HEAD^{commit}']);
+  const initial = loadAcceptance ? loadAcceptance() : {
+    base: startupBase, accepted: verifyAcceptedPrerequisites(queue, repo, startupBase)
+  };
   if (relative(stateDirectory(stateDir), stateDir) !== '') throw new Error('State directory redirected during setup');
   const release = lease(stateDir);
   const results = [];
   let state;
   try {
     state = new State(stateDir);
-    state.bind(repo, sourceRepo, accepted !== null);
+    state.bind(repo, sourceRepo, initial.accepted !== null);
     if (state.get('restoreHold') === 'true') return { reason: 'restored-state-needs-reconciliation', results };
     state.recover();
     const logDir = join(stateDir, 'logs');
@@ -182,6 +216,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       if (signal?.aborted) return { reason: 'stopped', results };
       const afterPoll = dispatchHold(previous, state.get('control'));
       if (afterPoll) return { reason: afterPoll, results };
+      const { base, accepted } = loadAcceptance ? loadAcceptance() : initial;
       const answers = new Map();
       if (decisionsEnabled) {
         const ready = new Map(issues.filter(issue => issue.state === 'ready').map(issue => [issue.number, issue]));
@@ -202,7 +237,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       if (results.length >= limit) break;
       const [issue] = runnable(issues, previous, sourceRepo, new Set(answers.keys()), accepted);
       if (!issue) {
-        if (!sourceRepo || ++idlePolls >= polls) return { reason: 'no-eligible-work', results };
+        if ((!sourceRepo && !loadAcceptance) || ++idlePolls >= polls) return { reason: 'no-eligible-work', results };
         await wait(intervalMs, undefined, { signal });
         continue;
       }

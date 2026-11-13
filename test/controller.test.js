@@ -473,6 +473,27 @@ test('strict scheduling waits for a reviewed prerequisite in the actual worktree
   await assert.rejects(preview(queue, stateDir, { readIssues }), /different prerequisite policy/);
 });
 
+test('watched acceptance holds if a recorded receipt disappears between dispatches', async t => {
+  const { queue, repo, stateDir } = fixture(t, [task(1), task(2)]);
+  const base = git(repo, ['rev-parse', 'HEAD']);
+  queue.acceptedPrerequisites = [{ number: 3, commit: base }];
+  let receipts = [...queue.acceptedPrerequisites];
+  await assert.rejects(execute(queue, stateDir, { ...options, readAcceptance: () => receipts }, async () => {
+    receipts = [];
+    return done();
+  }), /Acceptance receipt changed or disappeared for #3/);
+  assert.equal(withState(stateDir, store => store.task(1).state), 'done');
+  assert.equal(withState(stateDir, store => store.task(2)), undefined);
+});
+
+test('watched acceptance rejects a receipt file in the worker state directory', async t => {
+  const { queue, stateDir } = fixture(t);
+  queue.acceptedPrerequisites = [];
+  await assert.rejects(execute(queue, stateDir, {
+    ...options, acceptancePath: join(stateDir, 'acceptance.json'), readAcceptance: () => []
+  }, () => assert.fail('unsafe receipt path')), /outside the target checkout and state directory/);
+});
+
 test('preserves earlier claims when a later GitHub poll fails', async t => {
   const { queue, stateDir, repo } = fixture(t, [task(1), task(2)]);
   queue.sourceRepo = 'fixture/issue-queue';

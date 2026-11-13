@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -29,6 +29,81 @@ function disposable(t) {
     '-c', 'commit.gpgsign=false', 'commit', '-m', 'Seed disposable fixture']);
   return { scratch, repo, stateDir: stateDirectory(join(scratch, 'run')) };
 }
+
+test('one live controller dispatches a dependent task from supervised merged main', {
+  skip: !live || process.platform !== 'win32', timeout: 290000
+}, async t => {
+  const { scratch, repo, stateDir } = disposable(t);
+  const queuePath = join(scratch, 'reviewed-queue.json');
+  const receipts = join(scratch, 'acceptance.json');
+  const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+  writeFileSync(receipts, '[]');
+  writeFileSync(queuePath, JSON.stringify({ target: repo, allowedRepos: [repo],
+    acceptedPrerequisites: [], issues: [
+      { number: 1, model: 'terra', state: 'ready', dependencies: [],
+        prompt: 'Set terra.txt to exactly accepted-first and report done. Leave all other files alone.' },
+      { number: 2, model: 'sol', state: 'ready', dependencies: [1],
+        prompt: 'Read terra.txt. If it contains accepted-first, set sol.txt to exactly observed-accepted-first and report done.' }
+    ] }));
+  const seed = git(repo, ['rev-parse', 'HEAD']);
+  const controller = spawn(process.execPath, [cli, 'run', '--queue', queuePath, '--state', stateDir, '--execute',
+    '--watch-acceptance', receipts, '--polls', '60', '--interval-seconds', '1', '--limit', '2', '--timeout-seconds', '120'],
+  { cwd: scratch, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '', stderr = '';
+  controller.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; });
+  controller.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+  const exited = once(controller, 'close');
+  function task(number) {
+    if (!existsSync(join(stateDir, 'tasks.sqlite'))) return undefined;
+    const state = new State(stateDir, { readOnly: true });
+    try { return state.task(number); } finally { state.close(); }
+  }
+  function assertWatching() {
+    assert.equal(controller.exitCode, null, stderr || stdout);
+    assert.equal(controller.signalCode, null);
+    assert.equal(task(2), undefined, 'dependent claimed before acceptance');
+  }
+  try {
+    for (let tick = 0; tick < 1200 && task(1)?.state !== 'done'; tick++) {
+      assertWatching();
+      await delay(100);
+    }
+    const first = task(1);
+    assert.equal(first?.state, 'done', stderr || stdout);
+    assert.equal(readFileSync(join(first.worktree, 'terra.txt'), 'utf8').trim(), 'accepted-first');
+    assert.equal(git(first.worktree, ['rev-parse', 'HEAD']), seed);
+    await delay(1200);
+    assertWatching();
+
+    // The supervising coordinator, not the controller, commits and merges.
+    git(first.worktree, ['add', 'terra.txt']);
+    git(first.worktree, ['-c', 'user.name=Supervisor', '-c', 'user.email=test@example.invalid',
+      '-c', 'commit.gpgsign=false', 'commit', '-m', 'Accept fixture issue 1']);
+    git(repo, ['-c', 'user.name=Supervisor', '-c', 'user.email=test@example.invalid',
+      '-c', 'commit.gpgsign=false', 'merge', '--no-ff', '--no-edit', first.branch]);
+    const merged = git(repo, ['rev-parse', 'HEAD']);
+    assert.notEqual(merged, seed);
+    await delay(1200);
+    assertWatching();
+
+    const nextReceipts = receipts + '.next';
+    writeFileSync(nextReceipts, JSON.stringify([{ number: 1, commit: merged }]));
+    renameSync(nextReceipts, receipts);
+    const [code] = await exited;
+    assert.equal(code, 0, stderr || stdout);
+    const report = JSON.parse(stdout);
+    assert.deepEqual(report.results.map(row => [row.number, row.state]), [[1, 'done'], [2, 'done']]);
+    const second = task(2);
+    assert.equal(git(second.worktree, ['rev-parse', 'HEAD']), merged);
+    assert.equal(readFileSync(join(second.worktree, 'sol.txt'), 'utf8').trim(), 'observed-accepted-first');
+    t.diagnostic(JSON.stringify({ controllerPid: controller.pid, seed, merged, dependentBase: merged }));
+  } finally {
+    if (controller.exitCode === null && controller.signalCode === null) {
+      spawnSync(process.execPath, [cli, 'stop', '--state', stateDir], { windowsHide: true, timeout: 5000 });
+      await exited;
+    }
+  }
+});
 
 test('blocks, runs independent work, and resumes after an authorized fixture reply', {
   skip: !live, timeout: 470000
