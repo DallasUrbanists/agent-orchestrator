@@ -549,3 +549,9 @@ acceptance in its journal after the configured coordinator merges a tracked PR.
 The fetched main history must contain the merge, and the merge tree must match
 the previously verified PR tree exactly. Keep the watched acceptance file for
 existing receipts and for merges that need separate verification.
+
+Set `"workerSlots": 3` in a trusted queue to enable three concurrent local worker
+slots. The default is one. Use a run limit of at least three to fill all slots.
+Workers keep distinct task claims and worktrees. Host verification and PR branch
+publication share one serialized execution lane. A restart holds unacknowledged
+interrupted claims for reconciliation.

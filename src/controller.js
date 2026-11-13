@@ -260,6 +260,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) {
     throw new Error('Specify a positive execution limit and a worker timeout up to one hour');
   }
+  const slots = queue?.workerSlots ?? 1;
+  if (![1, 2, 3].includes(slots)) throw new Error('workerSlots must be 1, 2, or 3');
   validatePolling(polls, intervalMs);
   const stateDir = resolveStatePath(statePath);
   const repo = verifyTarget(queue?.target, queue?.allowedRepos, stateDir);
@@ -294,6 +296,13 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   }
 
   if (relative(stateDirectory(stateDir), stateDir) !== '') throw new Error('State directory redirected during setup');
+  const active = new Map();
+  let serial = Promise.resolve();
+  function exclusive(operation) {
+    const next = serial.then(operation);
+    serial = next.catch(() => {});
+    return next;
+  }
   const release = lease(stateDir);
   const results = [];
   let state;
@@ -352,10 +361,13 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     const logDir = join(stateDir, 'logs');
     mkdirSync(logDir, { recursive: true });
     if (relative(realpathSync(logDir), logDir) !== '') throw new Error('Log directory redirects elsewhere');
-    async function publishTask(number) {
+    const holdDispatch = (rows = state.list()) => dispatchHold(
+      rows.filter(row => row.state !== 'running' || !active.has(row.number)), state.get('control'));
+    const publishTask = number => exclusive(() => publishTaskNow(number));
+    async function publishTaskNow(number) {
       if (!handoff?.issues.has(number) || state.task(number)?.state !== 'done' ||
           state.handoff(number)?.linked || signal?.aborted ||
-          dispatchHold(state.list(), state.get('control'))) return;
+          holdDispatch()) return;
       const claim = coordinatorId && state.intakeClaims().find(row => row.number === number);
       const authorize = coordinatorId ? async () => {
         if (!claim) return false;
@@ -380,12 +392,19 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     const issueRetryDelays = [5000, 15000, 60000];
     let newDecision = false;
     const unavailable = new Set();
-    while (results.length < limit || newDecision) {
+    let fatal, terminal;
+    while (results.length + active.size < limit || newDecision || active.size) {
+      if (fatal) throw fatal;
+      if (terminal) return { reason: terminal, results };
+      if (active.size >= slots || (active.size && results.length + active.size >= limit)) {
+        await Promise.race(active.values());
+        continue;
+      }
       if (signal?.aborted) return { reason: 'stopped', results };
       if (idlePolls) await publisher?.all();
       if (signal?.aborted) return { reason: 'stopped', results };
       const previous = state.list();
-      const hold = dispatchHold(previous, state.get('control'));
+      const hold = holdDispatch(previous);
       if (hold) return { reason: hold, results };
       let issues;
       try {
@@ -394,13 +413,13 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       } catch (error) {
         if (!sourceRepo || error.transient !== true || pollFailures >= issueRetryDelays.length) throw error;
         if (signal?.aborted) return { reason: 'stopped', results };
-        const retryHold = dispatchHold(previous, state.get('control'));
+        const retryHold = holdDispatch(previous);
         if (retryHold) return { reason: retryHold, results };
         await waitForIssueRetry(issueRetryDelays[pollFailures++], undefined, { signal });
         continue;
       }
       if (signal?.aborted) return { reason: 'stopped', results };
-      const afterPoll = dispatchHold(previous, state.get('control'));
+      const afterPoll = holdDispatch(previous);
       if (afterPoll) return { reason: afterPoll, results };
       const { base, accepted } = loadAcceptance ? loadAcceptance() : initial;
       if (queue.autoAcceptMerged === true && coordinatorId && handoff) {
@@ -464,19 +483,19 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           state.decisionError(row.id, 'intake-decision-scope-no-longer-approved');
           return false;
         };
-        const canContinue = () => !signal?.aborted && !dispatchHold(previous, state.get('control'));
+        const canContinue = () => !signal?.aborted && !holdDispatch(previous);
         const pending = state.pendingDecisions().filter(approved);
         const verified = await syncDecisions(state, sourceRepo, pending, {
           api: decisionApi, responders, signal, canContinue
         });
         if (signal?.aborted) return { reason: 'stopped', results };
-        const afterDecisions = dispatchHold(previous, state.get('control'));
+        const afterDecisions = holdDispatch(previous);
         if (afterDecisions) return { reason: afterDecisions, results };
         for (const row of state.pendingDecisions().filter(approved)) {
           if (verified.has(row.id) && !unavailable.has(row.id)) answers.set(row.number, row);
         }
       }
-      if (results.length >= limit) break;
+      if (results.length + active.size >= limit) break;
       const claimedIds = new Set(claims.map(claim => claim.issue_id));
       const dispatchable = issues.filter(issue => !claimedIds.has(issue.intake?.issueId) || answers.has(issue.number));
       const independent = finalHostVerification ? [] : runnable(dispatchable, previous, sourceRepo, new Set(answers.keys()), accepted);
@@ -526,7 +545,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       }
       const [issue] = independent.length ? independent
         : runnable(issues, previous, sourceRepo, new Set(recovery.keys()), accepted).filter(issue => recovery.has(issue.number));
-      if (!issue && !finalHostVerification && queue.pullRepair && !signal?.aborted && handoff) {
+      if (!issue && !active.size && !finalHostVerification && queue.pullRepair && !signal?.aborted && handoff) {
         for (const number of queue.pullRepair.issues ?? []) {
           const receipt = state.handoff(number);
           const task = state.task(number);
@@ -553,10 +572,14 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           if (state.get('activePullRepair')) return { reason: 'pull-repair-interrupted', results };
         }
       }
-      const beforeClaim = dispatchHold(previous, state.get('control'));
+      const beforeClaim = holdDispatch();
       if (beforeClaim) return { reason: beforeClaim, results };
       if (signal?.aborted) return { reason: 'stopped', results };
       if (!issue) {
+        if (active.size) {
+          await Promise.race(active.values());
+          continue;
+        }
         idlePolls++;
         if (!continuous && ((!sourceRepo && !loadAcceptance) || idlePolls >= polls)) {
           return { reason: 'no-eligible-work', results };
@@ -566,177 +589,195 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       }
       idlePolls = 0;
 
-      const location = worktreeLocation(stateDir, issue.number, sourceRepo);
-      const answer = answers.get(issue.number);
-      const retry = recovery.get(issue.number);
-      const resumingImplementation = retry?.kind === 'environment' && !retry.final && retry.used === 0 &&
-        technical.resumeImplementation?.(issue.number);
-      const verifying = retry?.kind === 'environment' && !resumingImplementation;
-      const verifierCode = retry?.verifierCode;
-      const continuing = answer || retry;
-      const claim = continuing && state.task(issue.number);
-      if (continuing) {
-        try {
-          verifyResumeWorktree(repo, location, claim);
-          if (accepted) {
-            for (const number of issue.dependencies) {
-              git(location.path, ['merge-base', '--is-ancestor', accepted.get(number), 'HEAD']);
-            }
-          }
-        }
-        catch {
-          if (answer) {
-            state.decisionError(answer.id, 'worktree-unavailable');
-            unavailable.add(answer.id);
-          } else state.holdRecovery(issue.number, 'worktree-unavailable');
-          continue;
-        }
-      }
-      const suffix = continuing ? '-resume-' + (claim.retries + 1) : '';
-      const log = join(logDir, 'task-' + issue.number + suffix + '.jsonl');
-      const usedKeys = decisionsEnabled ? new Set(state.decisionKeys(issue.number)) : new Set();
-      const templates = (issue.decisions ?? []).filter(template => !usedKeys.has(template.key));
-      // Record the attempt before creating a worktree or spawning a process.
-      const model = MODELS[issue.model];
-      const dispatch = answer
-        ? state.resumeDecision(answer.id, issue.number, model, log, git(location.path, ['rev-parse', 'HEAD']))
-        : { attempt: retry
-          ? state.resumeRecovery(retry, verifying ? 'verification-runner' : model, log,
-            git(location.path, ['rev-parse', 'HEAD']), retry.final || retry.blocker ? retry.used + 1 : technical.limit)
-          : state.reserve({ number: issue.number, repo, worker: 'local-1', model, location, log, base, intake: issue.intake }),
-          approvedChoices: retry ? state.approvedChoices(issue.number) : [] };
-      const { attempt, approvedChoices } = dispatch;
-      let logFile;
-      try {
-        logFile = openSync(log, 'ax');
-      } catch {
-        const result = { state: 'failed', detail: 'recording-failed' };
-        state.finish(issue.number, attempt, result);
-        await publisher?.sync(issue.number);
-        results.push({ number: issue.number, ...result });
-        return { reason: result.detail, results };
-      }
-      let publication, heartbeat;
-      function publish() {
-        if (!publisher || publication) return;
-        publication = publisher.sync(issue.number).finally(() => { publication = undefined; });
-        // The foreground awaits publication before disposing the journal.
-        publication.catch(() => {});
-      }
-      function record(event) {
-        const at = new Date().toISOString();
-        if (event.pid || event.threadId) state.process(issue.number, attempt, event);
-        appendFileSync(logFile, JSON.stringify({ ...event, at, attempt }) + '\n');
-        if (observeProgress(state, attempt, event, at) && publisher && !heartbeat) {
-          publish();
-          heartbeat = setInterval(publish, HEARTBEAT_MS);
-        }
-      }
+      const current = state.task(issue.number);
+      if (active.has(issue.number) || (current && current.state !== 'blocked') ||
+          (current && !answers.has(issue.number) && !recovery.has(issue.number))) continue;
+      const usedSlots = new Set([...active.values()].map(job => job.slot));
+      const slot = [1, 2, 3].find(id => !usedSlots.has(id));
+      const job = runIssue().then(outcome => {
+        if (outcome) terminal ??= outcome.reason;
+      }).catch(error => { fatal ??= error; }).finally(() => active.delete(issue.number));
+      job.slot = slot;
+      active.set(issue.number, job);
+      if (slots === 1) await job;
+      continue;
 
-      const cancel = new AbortController();
-      const abort = () => cancel.abort();
-      signal?.addEventListener('abort', abort, { once: true });
-      let controlFailed = false;
-      const controlTimer = setInterval(() => {
-        try {
-          if (state.get('control') === 'stop') abort();
-        } catch {
-          controlFailed = true;
-          abort();
-        }
-      }, 200);
-      let result, verification;
-      try {
-        if (!continuing) createWorktree(repo, location, base);
-        if (signal?.aborted || state.get('control') === 'stop') abort();
-        const remaining = retry?.blocker ? 30 * 60 * 1000 : technical ? Math.max(1, ACTIVE_BUDGET_MS - state.activeMillis(issue.number)) : timeoutMs;
-        const execution = { cwd: location.path, timeoutMs: Math.min(timeoutMs, remaining), signal: cancel.signal, onRecord: record };
-        const publicationEntry = handoff?.issues.get(issue.number);
-        result = verifying ? null : await worker({ ...execution, executable, model: issue.model, reasoning: issue.reasoning,
-          prompt: workerPrompt(issue, templates, approvedChoices, resumingImplementation ? 'implementation' : retry?.kind, Boolean(technical)) +
-            (retry?.blocker ? '\nCoordinator-approved blocker assignment. Limit edits to resolving this blocker:\n' +
-              retry.blocker.instruction : '') });
-        const profileEvidence = technical?.profileEvidence?.(issue.number);
-        const repairedButNeedsHost = profileEvidence && (resumingImplementation || retry?.kind === 'code') && result?.state === 'blocked' &&
-          result.result?.technicalBlocker === 'environment' && !result.result?.decisionKey;
-        if (verifying || repairedButNeedsHost || (result.state === 'done' && (publicationEntry || profileEvidence ||
-            (retry?.kind === 'code' && verifierCode)))) {
-          let bytes = verifierCode;
-          if (!bytes) {
-            try { bytes = technical?.verifierFor(issue.number)?.(); }
-            catch { /* An unavailable verifier holds only its issue. */ }
-          }
-          if (!bytes) {
-            result = { state: 'blocked', detail: 'publication-verifier-required', result: { technicalBlocker: 'environment' } };
-          } else {
-            const snapshot = () => {
-              if (!publicationEntry) return null;
-              try {
-                const attemptBase = state.attempts().find(row => row.id === attempt).base;
-                const { tree } = captureVerifiedTree(repo, stateDir, state.task(issue.number), publicationEntry.paths, attemptBase);
-                return { base: attemptBase, tree };
-              } catch { return null; }
-            };
-            const before = snapshot();
-            result = publicationEntry && !before ? { state: 'blocked', detail: 'publication-scope-not-verified' }
-              : await verifyTechnical({ ...execution, verifierCode: bytes, collectEvidence: Boolean(profileEvidence),
-                timeoutMs: Math.max(1, execution.timeoutMs - (Date.now() - Date.parse(state.task(issue.number).started))) });
-            if (result.state === 'done' && before) {
-              const after = snapshot();
-              if (after?.tree === before.tree) {
-                verification = { repo: handoff.repo, ...before,
-                  evidence: 'Approved verification runner exited successfully. Journal attempt ' + attempt + '.\n' +
-                    'Verifier SHA-256: ' + createHash('sha256').update(bytes).digest('hex') + '.\n' +
-                    'Verified tree: ' + before.tree + '.' + (profileEvidence ? '\n\n' + profileEvidence : '') +
-                    (result.evidence ? '\n\n### Measured checks\n\n' + result.evidence : '') };
-              } else result = { state: 'blocked', detail: 'verified-worktree-changed-during-verification' };
+      async function runIssue() {
+        const location = worktreeLocation(stateDir, issue.number, sourceRepo);
+        const answer = answers.get(issue.number);
+        const retry = recovery.get(issue.number);
+        const resumingImplementation = retry?.kind === 'environment' && !retry.final && retry.used === 0 &&
+          technical.resumeImplementation?.(issue.number);
+        const verifying = retry?.kind === 'environment' && !resumingImplementation;
+        const verifierCode = retry?.verifierCode;
+        const continuing = answer || retry;
+        const claim = continuing && state.task(issue.number);
+        if (continuing) {
+          try {
+            verifyResumeWorktree(repo, location, claim);
+            if (accepted) {
+              for (const number of issue.dependencies) {
+                git(location.path, ['merge-base', '--is-ancestor', accepted.get(number), 'HEAD']);
+              }
             }
           }
+          catch {
+            if (answer) {
+              state.decisionError(answer.id, 'worktree-unavailable');
+              unavailable.add(answer.id);
+            } else state.holdRecovery(issue.number, 'worktree-unavailable');
+            return;
+          }
         }
-      } catch {
-        // If a worker adapter threw after launching, its process state is unknown.
-        const started = state.task(issue.number).pid;
-        result = started
-          ? { state: 'interrupted', detail: 'worker-adapter-failed-after-launch' }
-          : { state: 'failed', detail: 'worktree-or-worker-setup-failed' };
-        try { record({ type: 'setup-failure', detail: result.detail }); } catch {
-          // Preserve the durable outcome if writing the diagnostic fails.
+        const suffix = continuing ? '-resume-' + (claim.retries + 1) : '';
+        const log = join(logDir, 'task-' + issue.number + suffix + '.jsonl');
+        const usedKeys = decisionsEnabled ? new Set(state.decisionKeys(issue.number)) : new Set();
+        const templates = (issue.decisions ?? []).filter(template => !usedKeys.has(template.key));
+        // Record the attempt before creating a worktree or spawning a process.
+        const model = MODELS[issue.model];
+        const dispatch = answer
+          ? state.resumeDecision(answer.id, issue.number, model, log, git(location.path, ['rev-parse', 'HEAD']))
+          : { attempt: retry
+            ? state.resumeRecovery(retry, verifying ? 'verification-runner' : model, log,
+              git(location.path, ['rev-parse', 'HEAD']), retry.final || retry.blocker ? retry.used + 1 : technical.limit)
+            : state.reserve({ number: issue.number, repo, worker: 'local-' + slot, model, location, log, base, intake: issue.intake }),
+            approvedChoices: retry ? state.approvedChoices(issue.number) : [] };
+        const { attempt, approvedChoices } = dispatch;
+        let logFile;
+        try {
+          logFile = openSync(log, 'ax');
+        } catch {
+          const result = { state: 'failed', detail: 'recording-failed' };
+          state.finish(issue.number, attempt, result);
+          await publisher?.sync(issue.number);
+          results.push({ number: issue.number, ...result });
+          return { reason: result.detail, results };
         }
-      } finally {
-        clearInterval(controlTimer);
-        clearInterval(heartbeat);
-        signal?.removeEventListener('abort', abort);
-        closeSync(logFile);
+        let publication, heartbeat;
+        function publish() {
+          if (!publisher || publication) return;
+          publication = publisher.sync(issue.number).finally(() => { publication = undefined; });
+          // The foreground awaits publication before disposing the journal.
+          publication.catch(() => {});
+        }
+        function record(event) {
+          const at = new Date().toISOString();
+          if (event.pid || event.threadId) state.process(issue.number, attempt, event);
+          appendFileSync(logFile, JSON.stringify({ ...event, at, attempt }) + '\n');
+          if (observeProgress(state, attempt, event, at) && publisher && !heartbeat) {
+            publish();
+            heartbeat = setInterval(publish, HEARTBEAT_MS);
+          }
+        }
+
+        const cancel = new AbortController();
+        const abort = () => cancel.abort();
+        signal?.addEventListener('abort', abort, { once: true });
+        let controlFailed = false;
+        const controlTimer = setInterval(() => {
+          try {
+            if (state.get('control') === 'stop') abort();
+          } catch {
+            controlFailed = true;
+            abort();
+          }
+        }, 200);
+        let result, verification;
+        try {
+          if (!continuing) createWorktree(repo, location, base);
+          if (signal?.aborted || state.get('control') === 'stop') abort();
+          const remaining = retry?.blocker ? 30 * 60 * 1000 : technical ? Math.max(1, ACTIVE_BUDGET_MS - state.activeMillis(issue.number)) : timeoutMs;
+          const execution = { cwd: location.path, timeoutMs: Math.min(timeoutMs, remaining), signal: cancel.signal, onRecord: record };
+          const publicationEntry = handoff?.issues.get(issue.number);
+          result = verifying ? null : await worker({ ...execution, executable, model: issue.model, reasoning: issue.reasoning,
+            prompt: workerPrompt(issue, templates, approvedChoices, resumingImplementation ? 'implementation' : retry?.kind, Boolean(technical)) +
+              (retry?.blocker ? '\nCoordinator-approved blocker assignment. Limit edits to resolving this blocker:\n' +
+                retry.blocker.instruction : '') });
+          const profileEvidence = technical?.profileEvidence?.(issue.number);
+          const repairedButNeedsHost = profileEvidence && (resumingImplementation || retry?.kind === 'code') && result?.state === 'blocked' &&
+            result.result?.technicalBlocker === 'environment' && !result.result?.decisionKey;
+          if (verifying || repairedButNeedsHost || (result.state === 'done' && (publicationEntry || profileEvidence ||
+              (retry?.kind === 'code' && verifierCode)))) {
+            let bytes = verifierCode;
+            if (!bytes) {
+              try { bytes = technical?.verifierFor(issue.number)?.(); }
+              catch { /* An unavailable verifier holds only its issue. */ }
+            }
+            if (!bytes) {
+              result = { state: 'blocked', detail: 'publication-verifier-required', result: { technicalBlocker: 'environment' } };
+            } else {
+              const snapshot = () => {
+                if (!publicationEntry) return null;
+                try {
+                  const attemptBase = state.attempts().find(row => row.id === attempt).base;
+                  const { tree } = captureVerifiedTree(repo, stateDir, state.task(issue.number), publicationEntry.paths, attemptBase);
+                  return { base: attemptBase, tree };
+                } catch { return null; }
+              };
+              const before = snapshot();
+              result = publicationEntry && !before ? { state: 'blocked', detail: 'publication-scope-not-verified' }
+                : await exclusive(() => verifyTechnical({ ...execution, verifierCode: bytes, collectEvidence: Boolean(profileEvidence),
+                  timeoutMs: Math.max(1, execution.timeoutMs - (Date.now() - Date.parse(state.task(issue.number).started))) }));
+              if (result.state === 'done' && before) {
+                const after = snapshot();
+                if (after?.tree === before.tree) {
+                  verification = { repo: handoff.repo, ...before,
+                    evidence: 'Approved verification runner exited successfully. Journal attempt ' + attempt + '.\n' +
+                      'Verifier SHA-256: ' + createHash('sha256').update(bytes).digest('hex') + '.\n' +
+                      'Verified tree: ' + before.tree + '.' + (profileEvidence ? '\n\n' + profileEvidence : '') +
+                      (result.evidence ? '\n\n### Measured checks\n\n' + result.evidence : '') };
+                } else result = { state: 'blocked', detail: 'verified-worktree-changed-during-verification' };
+              }
+            }
+          }
+        } catch {
+          // If a worker adapter threw after launching, its process state is unknown.
+          const started = state.task(issue.number).pid;
+          result = started
+            ? { state: 'interrupted', detail: 'worker-adapter-failed-after-launch' }
+            : { state: 'failed', detail: 'worktree-or-worker-setup-failed' };
+          try { record({ type: 'setup-failure', detail: result.detail }); } catch {
+            // Preserve the durable outcome if writing the diagnostic fails.
+          }
+        } finally {
+          clearInterval(controlTimer);
+          clearInterval(heartbeat);
+          signal?.removeEventListener('abort', abort);
+          closeSync(logFile);
+        }
+        if (controlFailed && result.state !== 'interrupted') {
+          result = { ...result, state: 'failed', detail: 'control-read-failed' };
+        }
+        const request = result.state === 'blocked' ? decisionRequest(templates, result.result?.decisionKey) : null;
+        const kind = result.result?.technicalBlocker;
+        const nextRecovery = technical && result.state === 'blocked' && !result.result?.decisionKey &&
+          (kind === 'code' || kind === 'environment') ? { kind, scope: recoveryScope(issue) } : null;
+        state.finish(issue.number, attempt, result, request, nextRecovery, verification);
+        if (nextRecovery && ((retry ? retry.used + 1 : 0) >= technical.limit || state.activeMillis(issue.number) >= ACTIVE_BUDGET_MS)) {
+          state.holdRecovery(issue.number, 'recovery-budget-exhausted');
+        } else if (nextRecovery?.kind === 'environment' && !technical.verifierFor(issue.number)) {
+          state.holdRecovery(issue.number, 'verification-runner-required');
+        }
+        await publication;
+        if (verification && !accepted.has(issue.number)) await publishTask(issue.number);
+        await publisher?.sync(issue.number);
+        newDecision ||= Boolean(request);
+        results.push({ number: issue.number, state: result.state, detail: result.detail,
+          ...(request && { decision: request.id }), ...(answer && { resumedFrom: answer.id }),
+          ...(retry && { recovery: retry.kind }) });
+        if (result.state === 'interrupted') return { reason: 'interrupted-worker-needs-review', results };
+        if (['recording-failed', 'control-read-failed'].includes(result.detail)) return { reason: result.detail, results };
+        if (result.state === 'stopped') return { reason: 'stopped', results };
       }
-      if (controlFailed && result.state !== 'interrupted') {
-        result = { ...result, state: 'failed', detail: 'control-read-failed' };
-      }
-      const request = result.state === 'blocked' ? decisionRequest(templates, result.result?.decisionKey) : null;
-      const kind = result.result?.technicalBlocker;
-      const nextRecovery = technical && result.state === 'blocked' && !result.result?.decisionKey &&
-        (kind === 'code' || kind === 'environment') ? { kind, scope: recoveryScope(issue) } : null;
-      state.finish(issue.number, attempt, result, request, nextRecovery, verification);
-      if (nextRecovery && ((retry ? retry.used + 1 : 0) >= technical.limit || state.activeMillis(issue.number) >= ACTIVE_BUDGET_MS)) {
-        state.holdRecovery(issue.number, 'recovery-budget-exhausted');
-      } else if (nextRecovery?.kind === 'environment' && !technical.verifierFor(issue.number)) {
-        state.holdRecovery(issue.number, 'verification-runner-required');
-      }
-      await publication;
-      if (verification && !accepted.has(issue.number)) await publishTask(issue.number);
-      await publisher?.sync(issue.number);
-      newDecision = Boolean(request);
-      results.push({ number: issue.number, state: result.state, detail: result.detail,
-        ...(request && { decision: request.id }), ...(answer && { resumedFrom: answer.id }),
-        ...(retry && { recovery: retry.kind }) });
-      if (result.state === 'interrupted') return { reason: 'interrupted-worker-needs-review', results };
-      if (['recording-failed', 'control-read-failed'].includes(result.detail)) return { reason: result.detail, results };
-      if (result.state === 'stopped') return { reason: 'stopped', results };
     }
+    if (fatal) throw fatal;
+    if (terminal) return { reason: terminal, results };
     return { reason: 'execution-limit', results };
   } catch (error) {
     if (signal?.aborted && error.name === 'AbortError') return { reason: 'stopped', results };
     throw error;
   } finally {
+    await Promise.allSettled(active.values());
     try { state?.close(); } finally { release(); }
   }
 }
