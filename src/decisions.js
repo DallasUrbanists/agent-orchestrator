@@ -80,16 +80,17 @@ export function authorizedAnswer(comments, posted, decision, responders) {
 }
 
 export async function syncDecisions(state, repo, requests, { api, responders, signal, canContinue }) {
-  if (!requests.length || !canContinue()) return;
+  const verified = new Set();
+  if (!requests.length || !canContinue()) return verified;
   const options = { signal };
   let actor;
   try { actor = await api.viewer(options); }
   catch {
     for (const row of requests) state.decisionError(row.id, 'github-account-unavailable');
-    return;
+    return verified;
   }
   for (const row of requests) {
-    if (!canContinue()) return;
+    if (!canContinue()) return verified;
     if (row.publisher_id && row.publisher_id !== actor) {
       state.decisionError(row.id, 'publisher-account-changed');
       continue;
@@ -100,15 +101,29 @@ export async function syncDecisions(state, repo, requests, { api, responders, si
       state.decisionError(row.id, 'comments-unavailable');
       continue;
     }
-    if (!canContinue()) return;
+    if (!canContinue()) return verified;
 
     const body = decisionBody(row);
     const posted = comments.find(comment => requestMatches(comment, actor, body) &&
       (!row.request_comment || row.request_comment === comment.id));
     if (posted) {
       state.decisionPosted(row.id, posted.id);
-      const answer = authorizedAnswer(comments, posted, row, responders);
-      if (answer) state.answerDecision(row.id, answer);
+      const saved = row.reply_comment && authorizedAnswer(
+        comments.filter(comment => comment?.id === row.reply_comment), posted, row, responders
+      );
+      if (saved && saved.author === row.responder_id && saved.choice === row.choice) {
+        verified.add(row.id);
+        continue;
+      }
+      // A replacement must be newer than the invalidated reply.
+      const candidates = row.reply_comment ? comments.filter(comment => comment?.id > row.reply_comment) : comments;
+      const answer = authorizedAnswer(candidates, posted, row, responders);
+      if (answer) {
+        state.answerDecision(row.id, answer, row.reply_comment);
+        verified.add(row.id);
+      } else if (row.reply_comment) {
+        state.decisionError(row.id, 'saved-reply-no-longer-authorized');
+      }
       continue;
     }
     if (row.request_comment || row.posting) {
@@ -126,4 +141,5 @@ export async function syncDecisions(state, repo, requests, { api, responders, si
     if (requestMatches(created, actor, body)) state.decisionPosted(row.id, created.id);
     else state.decisionError(row.id, 'delivery-unconfirmed');
   }
+  return verified;
 }

@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { once } from 'node:events';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { findCodex, MODELS, runCodex } from '../src/codex.js';
 import { execute } from '../src/controller.js';
@@ -177,6 +179,96 @@ test('Chromium uses worktree-local scratch and loads a loopback page inside a Wi
   assert.equal(report.browser, 'passed');
   assert.equal(report.nodeSubprocess, 'passed');
   assert.equal(existsSync(report.scratch), false);
+});
+
+test('Windows controller death preserves the active claim and fences a surviving worker', {
+  skip: !live || process.platform !== 'win32', timeout: 45000
+}, async t => {
+  const { scratch, repo, stateDir } = disposable(t);
+  const controllerScript = join(scratch, 'controller.mjs');
+  const readyFile = join(scratch, 'worker-ready');
+  const releaseFile = join(scratch, 'worker-release');
+  const queue = { target: repo, allowedRepos: [repo], issues: [1, 2].map(number => ({
+    number, state: 'ready', model: 'terra', dependencies: [], prompt: 'Local crash fixture'
+  })) };
+  const moduleUrl = new URL('../src/controller.js', import.meta.url).href;
+  writeFileSync(controllerScript, [
+    "import { spawn } from 'node:child_process';",
+    "import { execute } from " + JSON.stringify(moduleUrl) + ";",
+    "const worker = " + JSON.stringify([
+      "const { existsSync, writeFileSync } = require('node:fs');",
+      "writeFileSync('unfinished.txt', 'preserve me');",
+      "writeFileSync(process.argv[1], String(process.pid));",
+      "const timer = setInterval(() => {",
+      "  if (existsSync(process.argv[2])) { clearInterval(timer); process.exit(0); }",
+      "}, 30);",
+      "setTimeout(() => process.exit(0), 30000).unref();"
+    ].join('\n')) + ";",
+    "await execute(" + JSON.stringify(queue) + ", " + JSON.stringify(stateDir) +
+      ", { executable: process.execPath, limit: 2 }, ({ cwd, onRecord }) => new Promise(resolve => {",
+    "  const child = spawn(process.execPath, ['-e', worker, ...process.argv.slice(2)], { cwd, stdio: 'ignore', detached: true, windowsHide: true });",
+    "  child.on('error', () => resolve({ state: 'failed' }));",
+    "  child.on('exit', () => resolve({ state: 'done' }));",
+    "  onRecord({ type: 'worker-started', pid: child.pid });",
+    "}));"
+  ].join('\n'));
+  const supervisor = spawn(process.execPath, [controllerScript, readyFile, releaseFile], {
+    cwd: scratch, stdio: 'ignore', windowsHide: true
+  });
+  const exited = once(supervisor, 'exit');
+  t.after(() => {
+    writeFileSync(releaseFile, '');
+    if (supervisor.exitCode === null && supervisor.signalCode === null) supervisor.kill();
+  });
+  for (let attempt = 0; attempt < 100 && !existsSync(readyFile); attempt++) await delay(50);
+  assert.ok(existsSync(readyFile), 'the disposable worker never started');
+
+  const workerPid = Number(readFileSync(readyFile, 'utf8'));
+  assert.ok(Number.isSafeInteger(workerPid) && workerPid > 0);
+  assert.equal(process.kill(workerPid, 0), true);
+  const neverLaunch = () => assert.fail('unexpected worker launch while interrupted');
+  await assert.rejects(execute(queue, stateDir, { executable: 'unused', limit: 2 }, neverLaunch),
+    /Another controller owns this state directory/);
+  assert.equal(supervisor.kill(), true);
+  await exited;
+  assert.equal(process.kill(workerPid, 0), true, 'worker should survive the supervisor crash');
+
+  const held = await execute(queue, stateDir, { executable: 'unused', limit: 2 }, neverLaunch);
+  assert.deepEqual(held, { reason: 'interrupted-worker-needs-review', results: [] });
+  const store = new State(stateDir, { readOnly: true });
+  try {
+    assert.equal(store.task(1).pid, workerPid);
+    assert.equal(store.task(1).state, 'interrupted');
+    assert.equal(store.task(2), undefined);
+    assert.equal(readFileSync(join(store.task(1).worktree, 'unfinished.txt'), 'utf8'), 'preserve me');
+  } finally { store.close(); }
+
+  const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+  const acknowledge = () => spawnSync(process.execPath, [
+    cli, 'acknowledge', '1', '--state', stateDir, '--confirm-process-exited'
+  ], { cwd: scratch, windowsHide: true, encoding: 'utf8', timeout: 5000 });
+  const rejected = acknowledge();
+  assert.equal(rejected.status, 1);
+  assert.match(rejected.stderr, /Recorded worker PID \d+ is still present/);
+
+  writeFileSync(releaseFile, '');
+  let absent = false;
+  for (let attempt = 0; attempt < 100 && !absent; attempt++) {
+    try { process.kill(workerPid, 0); }
+    catch (error) {
+      if (error.code !== 'ESRCH') throw error;
+      absent = true;
+    }
+    if (!absent) await delay(50);
+  }
+  assert.ok(absent, 'worker did not exit after releasing the fixture');
+  const acknowledged = acknowledge();
+  assert.equal(acknowledged.status, 0, acknowledged.stderr);
+  const next = await execute(queue, stateDir, { executable: 'unused', limit: 2 },
+    async () => ({ state: 'done' }));
+  assert.deepEqual(next.results.map(result => [result.number, result.state]), [[2, 'done']]);
+  assert.deepEqual(await execute(queue, stateDir, { executable: 'unused', limit: 2 }, neverLaunch),
+    { reason: 'no-eligible-work', results: [] });
 });
 
 for (const reason of ['cancelled', 'timeout']) {

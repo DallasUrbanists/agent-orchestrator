@@ -299,10 +299,14 @@ test('recovers an ambiguous decision delivery and resumes a saved answer once in
   let posted;
   let visible = false;
   let replies = [];
+  let commentsUnavailable = false;
   let dependencies = [];
   const decisionApi = {
     async viewer() { return 10; },
-    async comments() { return visible ? [posted, ...replies] : []; },
+    async comments() {
+      if (commentsUnavailable) throw new Error('fixture GitHub outage');
+      return visible ? [posted, ...replies] : [];
+    },
     async post(repoName, number, body) {
       assert.equal(repoName, queue.sourceRepo);
       assert.equal(number, 1);
@@ -347,6 +351,25 @@ test('recovers an ambiguous decision delivery and resumes a saved answer once in
   assert.equal(status().consumed, null);
 
   dependencies = [];
+  async function assertHeld(reason) {
+    const result = await execute(queue, stateDir, configured, () => assert.fail('invalid saved reply resumed'));
+    assert.deepEqual(result.results, []);
+    assert.equal(status().reply_comment, 23);
+    assert.equal(status().consumed, null);
+    assert.equal(status().last_error, reason);
+  }
+
+  commentsUnavailable = true;
+  await assertHeld('comments-unavailable');
+  commentsUnavailable = false;
+  queue.authorizedResponders = [52];
+  await assertHeld('saved-reply-no-longer-authorized');
+  queue.authorizedResponders = [51];
+  replies = [{ ...comment(23, 51), updated_at: '2026-11-11T10:01:00Z' }];
+  await assertHeld('saved-reply-no-longer-authorized');
+  replies = [];
+  await assertHeld('saved-reply-no-longer-authorized');
+  replies = [comment(24, 51)];
   queue.issues[0].decisions[0].choices[1].instruction = 'Changed local text after publication.';
   const resumed = await execute(queue, stateDir, configured, async ({ cwd, prompt }) => {
     assert.equal(cwd, originalWorktree);
@@ -358,6 +381,7 @@ test('recovers an ambiguous decision delivery and resumes a saved answer once in
   });
   assert.deepEqual(resumed.results.map(row => [row.number, row.state, row.resumedFrom]), [[1, 'done', id]]);
   assert.ok(status().consumed);
+  assert.equal(status().reply_comment, 24);
   assert.equal(withState(stateDir, store => store.task(1).retries), 1);
   assert.equal(posts, 1);
   const restart = await execute(queue, stateDir, configured, () => assert.fail('duplicate resume'));
