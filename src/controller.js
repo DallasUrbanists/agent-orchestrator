@@ -511,7 +511,9 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         result = verifying ? null : await worker({ ...execution, executable, model: issue.model, reasoning: issue.reasoning,
           prompt: workerPrompt(issue, templates, approvedChoices, Boolean(retry), Boolean(technical)) });
         const profileEvidence = technical?.profileEvidence?.(issue.number);
-        if (verifying || (result.state === 'done' && (publicationEntry || profileEvidence ||
+        const repairedButNeedsHost = profileEvidence && retry?.kind === 'code' && result?.state === 'blocked' &&
+          result.result?.technicalBlocker === 'environment' && !result.result?.decisionKey;
+        if (verifying || repairedButNeedsHost || (result.state === 'done' && (publicationEntry || profileEvidence ||
             (retry?.kind === 'code' && verifierCode)))) {
           let bytes = verifierCode;
           if (!bytes) {

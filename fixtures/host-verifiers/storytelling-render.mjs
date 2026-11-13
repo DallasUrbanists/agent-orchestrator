@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative } from 'node:path';
 
 // The coordinator supplies this project-local profile name from its trusted configuration.
@@ -41,33 +41,18 @@ function inspectRun(before, name, validate) {
   assert.equal(added[0].isDirectory(), true);
   const location = join(outputRoot, added[0].name);
   assert.equal(relative(location, realpathSync(location)), '');
-  try {
-    const receipt = JSON.parse(readFileSync(join(location, 'receipt.json'), 'utf8'));
-    validate(location, receipt);
-    report.runs.push({ name, runId: added[0].name, receiptSha256: hash(join(location, 'receipt.json')) });
-  } finally {
-    renameSync(location, join(evidence, name + '-' + added[0].name));
-  }
+  const receipt = JSON.parse(readFileSync(join(location, 'receipt.json'), 'utf8'));
+  report.runs.push({ name, runId: added[0].name, receiptSha256: hash(join(location, 'receipt.json')) });
+  validate(location, receipt);
 }
 
 function exportRun(name, args, validate) {
   const before = new Set(existsSync(outputRoot) ? readdirSync(outputRoot) : []);
-  try {
-    run(name, node, [npm, 'run', 'render:fixture', '--', ...args], { timeout: 25 * 60000 });
-    inspectRun(before, name, (folder, receipt) => {
-      assert.equal(receipt.status, 'passed');
-      validate(folder, receipt);
-    });
-  } catch (error) {
-    if (existsSync(outputRoot) && !relative(outputRoot, realpathSync(outputRoot))) {
-      for (const entry of readdirSync(outputRoot, { withFileTypes: true })) {
-        if (before.has(entry.name) || !entry.isDirectory()) continue;
-        const path = join(outputRoot, entry.name);
-        if (!relative(path, realpathSync(path))) renameSync(path, join(evidence, 'failed-' + name + '-' + entry.name));
-      }
-    }
-    throw error;
-  }
+  run(name, node, [npm, 'run', 'render:fixture', '--', ...args], { timeout: 25 * 60000 });
+  inspectRun(before, name, (folder, receipt) => {
+    assert.equal(receipt.status, 'passed');
+    validate(folder, receipt);
+  });
 }
 
 async function main() {
@@ -107,12 +92,23 @@ async function main() {
       const info = probe.streams?.[0];
       assert.deepEqual(info, { width, height, avg_frame_rate: '30/1', nb_read_frames: '300' });
       const decoded = run(variant + '-decode', ffmpeg, ['-hide_banner', '-v', 'error', '-xerror', '-i', video,
-        '-map', '0:v:0', '-f', 'framehash', '-'], { timeout: 180000 });
-      const hashes = decoded.split(/\r?\n/).filter(line => /^\s*0,/.test(line)).map(line => line.split(',').at(-1).trim());
-      assert.equal(hashes.length, 300);
-      assert.equal(new Set([hashes[0], hashes[149], hashes[299]]).size, 3);
-      report[variant] = { width, height, frames: hashes.length, rate: '30/1', sha256: hash(video),
-        representativeFrameHashes: [0, 149, 299].map(frame => ({ frame, sha256: hashes[frame] })) };
+        '-map', '0:v:0', '-fps_mode', 'passthrough', '-c:v', 'rawvideo', '-f', 'null', '-',
+        '-progress', 'pipe:1', '-nostats'], { timeout: 180000 });
+      const count = Number([...decoded.matchAll(/^frame=(\d+)\s*$/gm)].at(-1)?.[1]);
+      assert.equal(count, 300);
+      const representativeFrameHashes = [0, 149, 299].map(frame => {
+        const sample = join(evidence, variant + '-decoded-' + frame + '.png');
+        run(variant + '-sample-' + frame, ffmpeg, ['-hide_banner', '-v', 'error', '-xerror', '-i', video,
+          '-map', '0:v:0', '-vf', 'trim=start_frame=' + frame + ':end_frame=' + (frame + 1),
+          '-frames:v', '1', '-c:v', 'png',
+          '-f', 'image2', '-update', '1', sample]);
+        const bytes = readFileSync(sample);
+        assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+        assert.deepEqual([bytes.readUInt32BE(16), bytes.readUInt32BE(20)], [width, height]);
+        return { frame, sha256: hash(sample) };
+      });
+      assert.ok(new Set(representativeFrameHashes.map(sample => sample.sha256)).size > 1);
+      report[variant] = { width, height, frames: count, rate: '30/1', sha256: hash(video), representativeFrameHashes };
     });
   }
   exportRun('diagnostic', ['--format', 'portrait', '--frames', '0,1,149,150,299'], folder => {
