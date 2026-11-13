@@ -64,7 +64,6 @@ export async function repairPull({ state, stateDir, target, repo, task, receipt,
   git(target, ['merge-base','--is-ancestor',receipt.commit_sha,pull.headRefOid]);
   const conflict = hasMergeConflict(target, pull.headRefOid, pull.baseRefOid);
   if (!conflict && !notes.length) return;
-  state.set(key, 'started:' + pull.headRefOid);
   const cwd = mkdtempSync(join(stateDir, 'pull-repair-'));
   async function trackProcess(run) {
     state.set('activePullRepair', JSON.stringify({ pull: receipt.pull, cwd }));
@@ -95,12 +94,13 @@ export async function repairPull({ state, stateDir, target, repo, task, receipt,
   };
   git(target, ['worktree','add','--detach',cwd,pull.headRefOid]);
   if (conflict) {
-    try { git(cwd,['merge','--no-commit','--no-ff',pull.baseRefOid]); }
+    try { git(cwd,['-c','user.name=Agent Orchestrator','-c','user.email=orchestrator@users.noreply.github.com','merge','--no-commit','--no-ff',pull.baseRefOid]); }
     catch (error) {
       const paths = git(cwd,['diff','--name-only','--diff-filter=U']).split('\n');
       if (!paths.length || paths.some(path => !path || !inScope(path))) throw error;
     }
   }
+  state.set(key, 'started:' + pull.headRefOid);
   const outcome = await trackProcess(signal => worker({cwd,executable,model:issue.model,reasoning:issue.reasoning,signal,timeoutMs,onRecord:record,
     prompt: ['Repair this open PR within its approved paths: '+entry.paths.join(', '),
       'Preserve both sides of a conflict. Edit files only. Do not stage, commit, push, or modify Git metadata.',
