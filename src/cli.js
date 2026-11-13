@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { findCodex, MODELS } from './codex.js';
 import { execute, preview } from './controller.js';
-import { recordHandoff, statusPublisher } from './issue-status.js';
+import { recordHandoff, statusPublisher, statusRepository } from './issue-status.js';
 import { pollGithubIssues } from './github.js';
 import { plan } from './scheduler.js';
 import { hasJournal, lease, State, stateDirectory } from './state.js';
@@ -37,7 +37,7 @@ async function main() {
   });
   const [command = 'run', argument, ...extra] = positionals;
   if (values.help) {
-    console.log('Commands: run | poll | doctor | status | attempts | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID | backup | restore FILE | sync-status [N] | handoff N --pr N');
+    console.log('Commands: run | poll | doctor | status | attempts | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID | backup | restore FILE | sync-status [N] [--repo OWNER/REPO] | handoff N --pr N');
     console.log('Opt in to status labels and progress comments with run --execute --github-status.');
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
     console.log('For GitHub intake, configure githubIntake.coordinatorId in the queue file.');
@@ -69,7 +69,9 @@ async function main() {
   if (values['watch-acceptance'] !== undefined && (command !== 'run' || !values.execute || !values.queue)) {
     throw new Error('--watch-acceptance requires --execute and an explicit --queue');
   }
-  if (values.repo && command !== 'poll') throw new Error('--repo is only used with poll');
+  if (values.repo !== undefined && command !== 'poll' && !(command === 'sync-status' && withNumber)) {
+    throw new Error('--repo is only used with poll or single-issue sync-status');
+  }
   const polling = { polls: Number(values.polls), intervalMs: 1000 * Number(values['interval-seconds']) };
   if (command === 'poll') {
     if (values.execute) throw new Error('poll is read-only. Use run with a reviewed queue for execution');
@@ -138,16 +140,18 @@ async function main() {
   try {
     state = new State(stateDir);
     if (publish) {
-      const sourceRepo = state.get('sourceRepo');
-      if (!sourceRepo || state.get('restoreHold') === 'true') {
-        throw new Error('Status publishing requires reconciled GitHub-backed state');
-      }
+      if (state.get('restoreHold') === 'true') throw new Error('Status publishing requires reconciled state');
+      const sourceRepo = statusRepository(state, stateDir, values.repo);
+      if (!sourceRepo) throw new Error('Status publishing requires GitHub-backed state or single-issue sync-status with --repo');
       const number = Number(argument);
       if (argument !== undefined && !state.task(number)) {
         if (command === 'handoff') throw new Error('Handoff requires an existing task');
         return print({ number, status: 'unclaimed' });
       }
-      state.recover();
+      if (values.repo !== undefined && !state.get('sourceRepo') && state.task(number).state === 'running') {
+        throw new Error('Review the running claim in the original journal before publishing');
+      }
+      if (state.get('sourceRepo')) state.recover();
       const publisher = statusPublisher(state, sourceRepo);
       if (command === 'handoff') await recordHandoff(state, sourceRepo, number, Number(values.pr));
       if (argument === undefined) await publisher.all();

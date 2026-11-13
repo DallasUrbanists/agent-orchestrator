@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { HEARTBEAT_MS, observeProgress, statusPublisher } from '../src/issue-status.js';
+import { HEARTBEAT_MS, observeProgress, statusPublisher, statusRepository } from '../src/issue-status.js';
 import { State } from '../src/state.js';
+import { git } from '../src/worktrees.js';
 
 const repo = 'fixture/status';
 const origin = 'https://github.com/' + repo;
@@ -62,6 +63,23 @@ function fixture(t) {
     }
   };
 }
+
+test('single-issue status reconciliation validates the legacy origin without rebinding the journal', t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'orchestrator-status-legacy-')));
+  const target = join(root, 'target');
+  const stateDir = join(root, 'state');
+  mkdirSync(target);
+  mkdirSync(stateDir);
+  const state = new State(stateDir);
+  t.after(() => { state.close(); rmSync(root, { recursive: true, force: true }); });
+  git(target, ['init', '-b', 'main']);
+  git(target, ['remote', 'add', 'origin', origin + '.git']);
+  state.bind(target);
+  assert.equal(statusRepository(state, stateDir), undefined);
+  assert.equal(statusRepository(state, stateDir, 'Fixture/Status'), repo);
+  assert.throws(() => statusRepository(state, stateDir, 'fixture/other'), /saved checkout origin/);
+  assert.equal(state.get('sourceRepo'), undefined);
+});
 
 test('launch opens one comment and the five-minute update reports observed activity and quiet time', async t => {
   const f = fixture(t);

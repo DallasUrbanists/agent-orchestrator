@@ -207,7 +207,7 @@ node src/cli.js sync-status --state .\state\intake-demo
 node src/cli.js sync-status 12 --state .\state\intake-demo
 ```
 
-Reconciliation retries label and comment edits and looks for an existing comment by its attempt marker and publisher account. If GitHub rejects a create request, the controller can retry. If the response is lost and GitHub has yet to show the comment, the controller reports unconfirmed delivery and keeps looking on later polls. It does not blindly post a second comment. A missing local claim leaves the issue alone. Keep GitHub credentials in the controller's `gh` context.
+Reconciliation retries label and comment edits and looks for an existing comment by its attempt marker and publisher account. If GitHub rejects a create request, the controller can retry. If the response is lost and GitHub has yet to show the comment, the controller reports unconfirmed delivery and keeps looking on later polls. It does not blindly post a second comment. A missing local claim leaves the issue alone. To reconcile one issue from an older local queue, run `sync-status N --repo OWNER/REPO`. The controller verifies the saved checkout's GitHub origin and leaves the queue binding in place. Review a running claim through the original journal before using this mode. Keep GitHub credentials in the controller's `gh` context.
 
 ### Recover from technical blockers
 

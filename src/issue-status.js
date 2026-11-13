@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { githubRepo, githubStatus } from './github.js';
+import { githubOrigin, githubRepo, githubStatus } from './github.js';
+import { git, verifyTarget } from './worktrees.js';
 
 export const HEARTBEAT_MS = 5 * 60 * 1000;
 const owned = ['in-progress', 'in-review', 'blocked'];
@@ -157,6 +158,21 @@ export function statusPublisher(state, sourceRepo, { api = githubStatus, signal,
     }
   }
   return { sync, async all() { for (const row of state.list()) await sync(row.number); } };
+}
+
+export function statusRepository(state, stateDir, requestedRepo) {
+  const bound = state.get('sourceRepo');
+  if (requestedRepo === undefined) return bound;
+  const repo = githubRepo(requestedRepo);
+  if (bound) {
+    if (repo !== bound) throw new Error('Status repository does not match the journal');
+    return bound;
+  }
+  const target = state.get('repo');
+  const checkout = verifyTarget(target, [target], stateDir);
+  const origin = git(checkout, ['config', '--local', '--get-all', 'remote.origin.url']);
+  if (githubOrigin(origin) !== repo) throw new Error('Status repository does not match the saved checkout origin');
+  return repo;
 }
 
 export async function recordHandoff(state, sourceRepo, number, pull, api = githubStatus) {
