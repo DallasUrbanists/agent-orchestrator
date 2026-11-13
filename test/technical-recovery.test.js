@@ -345,3 +345,35 @@ test('resumes a pre-implementation environment blocker once in the original work
   assert.equal(read(state => state.task(8)), undefined);
   assert.deepEqual((await execute(queue, stateDir, options, () => assert.fail('duplicate work'))).results, []);
 });
+
+test('dispatches a Gate B fixture-loading blocker once after ordinary recovery is exhausted', async t => {
+  const { queue, stateDir, read } = fixture(t, [
+    "import { existsSync } from 'node:fs';",
+    "if (!existsSync('bridge-style.json')) { console.error('Gate B: bridge-style.json returned 404'); process.exit(10); }",
+    "console.log(JSON.stringify([{name:'fixture-load',measurements:{checks:1}}]));"
+  ].join('\n'));
+  const { verifier: runner } = queue.technicalRecovery;
+  queue.technicalRecovery = { limit: 1, hostVerification: {
+    runner, profiles: { gate: 'Gate B fixture loads.' }, issues: [{ number: 7, profile: 'gate' }]
+  } };
+  let original;
+  await execute(queue, stateDir, options, async ({ cwd, prompt }) => {
+    if (prompt.endsWith('Fixture #7')) original = cwd;
+    return { state: 'done' };
+  });
+  const afterAttempt = read(state => state.attempts().filter(row => row.number === 7).at(-1).id);
+  assert.equal(read(state => state.recoveryRows().find(row => row.number === 7).hold), 'recovery-budget-exhausted');
+  const assignment = { number: 7, afterAttempt, instruction: 'Restore only the missing Gate B bridge-style.json fixture.' };
+  queue.technicalRecovery.blockerTasks = [{ ...assignment, afterAttempt: afterAttempt - 1 }];
+  assert.deepEqual((await execute(queue, stateDir, options, () => assert.fail('stale assignment'))).results, []);
+  queue.technicalRecovery.blockerTasks = [assignment];
+  const result = await execute(queue, stateDir, options, async ({ cwd, prompt }) => {
+    assert.equal(cwd, original);
+    assert.match(prompt, /Restore only the missing Gate B/);
+    writeFileSync(join(cwd, 'bridge-style.json'), '{}');
+    return { state: 'done' };
+  });
+  assert.deepEqual(result.results.map(row => row.detail), ['verification-passed']);
+  assert.equal(read(state => state.task(8)), undefined);
+  assert.deepEqual((await execute(queue, stateDir, options, () => assert.fail('duplicate repair'))).results, []);
+});

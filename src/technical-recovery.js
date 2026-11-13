@@ -10,12 +10,18 @@ export const ACTIVE_BUDGET_MS = 60 * 60 * 1000;
 export function recoveryPolicy(value, repo, stateDir) {
   if (value === undefined) return null;
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid technical recovery configuration');
-  const { limit = 2, verifier, hostVerification, adopt = [] } = value;
+  const { limit = 2, verifier, hostVerification, adopt = [], blockerTasks = [] } = value;
   if (!Array.isArray(adopt) || adopt.some(row => !Number.isSafeInteger(row?.number) || row.number < 1 ||
       !['environment', 'code'].includes(row.kind)) || new Set(adopt.map(row => row.number)).size !== adopt.length) {
     throw new Error('Invalid technical recovery adoption list');
   }
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 2) throw new Error('Technical recovery requires a limit of one or two attempts');
+  if (!Array.isArray(blockerTasks) || blockerTasks.some(task =>
+    !Number.isSafeInteger(task?.number) || task.number < 1 ||
+    !Number.isSafeInteger(task.afterAttempt) || task.afterAttempt < 1 ||
+    typeof task.instruction !== 'string' || !task.instruction.trim() || task.instruction.length > 2000) ||
+    new Set(blockerTasks.map(task => task.number)).size !== blockerTasks.length ||
+    (blockerTasks.length && !hostVerification)) throw new Error('Invalid blocker task configuration');
   if (hostVerification !== undefined) {
     if (verifier !== undefined) throw new Error('Choose either a single verifier or project host verification profiles');
     const { runner, profiles, issues, toolchain = {} } = hostVerification ?? {};
@@ -40,7 +46,9 @@ export function recoveryPolicy(value, repo, stateDir) {
           ';\nconst orchestratorToolchain = ' + JSON.stringify(toolchain) + ';\n'), base()])
       });
     }
-    return { limit, adopt, verifierFor: issue => byIssue.get(issue)?.read,
+    if (blockerTasks.some(task => !byIssue.has(task.number))) throw new Error('Blocker task needs an approved host profile');
+    return { limit, adopt, blockerTasks: new Map(blockerTasks.map(task => [task.number, task])),
+      verifierFor: issue => byIssue.get(issue)?.read,
       profileEvidence: issue => byIssue.get(issue)?.evidence,
       resumeImplementation: issue => byIssue.get(issue)?.resumeImplementation };
   }

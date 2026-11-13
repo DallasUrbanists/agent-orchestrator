@@ -522,3 +522,12 @@ Its first environment recovery attempt resumes the worker in the saved
 worktree. The same attempt sends the result through the pinned verifier before
 recording success. The setting is scoped to the issue and uses the existing
 recovery budget.
+
+For a code blocker with a concrete repair after ordinary recovery is exhausted,
+add a coordinator-reviewed entry to `technicalRecovery.blockerTasks`, for example
+`{"number":9,"afterAttempt":16,"instruction":"Repair the Gate B fixture asset lookup."}`.
+Use the latest attempt ID from `attempts`. This assigns one repair in the saved
+worktree, with up to 30 minutes for the worker and pinned host verification
+combined. A configured host profile is required. The controller consumes the
+assignment durably before launch and keeps the original prerequisites and
+publication scope. Failed or interrupted repairs preserve the worktree for review.
