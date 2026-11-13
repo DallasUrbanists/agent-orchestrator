@@ -393,10 +393,11 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     let newDecision = false;
     const unavailable = new Set();
     let fatal, terminal;
-    while (results.length + active.size < limit || newDecision || active.size) {
+    let dispatched = 0;
+    while (dispatched < limit || newDecision || active.size) {
       if (fatal) throw fatal;
       if (terminal) return { reason: terminal, results };
-      if (active.size >= slots || (active.size && results.length + active.size >= limit)) {
+      if (active.size >= slots || (active.size && dispatched >= limit)) {
         await Promise.race(active.values());
         continue;
       }
@@ -495,7 +496,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           if (verified.has(row.id) && !unavailable.has(row.id)) answers.set(row.number, row);
         }
       }
-      if (results.length + active.size >= limit) break;
+      if (dispatched >= limit) break;
       const claimedIds = new Set(claims.map(claim => claim.issue_id));
       const dispatchable = issues.filter(issue => !claimedIds.has(issue.intake?.issueId) || answers.has(issue.number));
       const independent = finalHostVerification ? [] : runnable(dispatchable, previous, sourceRepo, new Set(answers.keys()), accepted);
@@ -643,6 +644,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
             : state.reserve({ number: issue.number, repo, worker: 'local-' + slot, model, location, log, base, intake: issue.intake }),
             approvedChoices: retry ? state.approvedChoices(issue.number) : [] };
         const { attempt, approvedChoices } = dispatch;
+        dispatched++;
         let logFile;
         try {
           logFile = openSync(log, 'ax');
