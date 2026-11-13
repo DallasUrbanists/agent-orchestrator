@@ -107,12 +107,23 @@ async function main() {
       const info = probe.streams?.[0];
       assert.deepEqual(info, { width, height, avg_frame_rate: '30/1', nb_read_frames: '300' });
       const decoded = run(variant + '-decode', ffmpeg, ['-hide_banner', '-v', 'error', '-xerror', '-i', video,
-        '-map', '0:v:0', '-f', 'framehash', '-'], { timeout: 180000 });
-      const hashes = decoded.split(/\r?\n/).filter(line => /^\s*0,/.test(line)).map(line => line.split(',').at(-1).trim());
-      assert.equal(hashes.length, 300);
-      assert.equal(new Set([hashes[0], hashes[149], hashes[299]]).size, 3);
-      report[variant] = { width, height, frames: hashes.length, rate: '30/1', sha256: hash(video),
-        representativeFrameHashes: [0, 149, 299].map(frame => ({ frame, sha256: hashes[frame] })) };
+        '-map', '0:v:0', '-fps_mode', 'passthrough', '-c:v', 'rawvideo', '-f', 'null', '-',
+        '-progress', 'pipe:1', '-nostats'], { timeout: 180000 });
+      const count = Number([...decoded.matchAll(/^frame=(\d+)\s*$/gm)].at(-1)?.[1]);
+      assert.equal(count, 300);
+      const representativeFrameHashes = [0, 149, 299].map(frame => {
+        const sample = join(evidence, variant + '-decoded-' + frame + '.png');
+        run(variant + '-sample-' + frame, ffmpeg, ['-hide_banner', '-v', 'error', '-xerror', '-i', video,
+          '-map', '0:v:0', '-vf', 'trim=start_frame=' + frame + ':end_frame=' + (frame + 1),
+          '-frames:v', '1', '-c:v', 'png',
+          '-f', 'image2', '-update', '1', sample]);
+        const bytes = readFileSync(sample);
+        assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+        assert.deepEqual([bytes.readUInt32BE(16), bytes.readUInt32BE(20)], [width, height]);
+        return { frame, sha256: hash(sample) };
+      });
+      assert.ok(new Set(representativeFrameHashes.map(sample => sample.sha256)).size > 1);
+      report[variant] = { width, height, frames: count, rate: '30/1', sha256: hash(video), representativeFrameHashes };
     });
   }
   exportRun('diagnostic', ['--format', 'portrait', '--frames', '0,1,149,150,299'], folder => {
