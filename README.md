@@ -31,6 +31,19 @@ The live worker also runs a synthetic filesystem probe that should return access
 
 Set `ORCHESTRATOR_TEST_CHROME` to the absolute path of an installed Chromium executable to also run the Windows browser probe through a real worker. The probe checks a Node child process, a fresh browser profile, loopback navigation, and scratch cleanup. A profile write alone does not establish Chromium readiness.
 
+To rerun only that probe after a host or Codex update, set the desired Windows sandbox implementation for the controller process. Supported values are `unelevated` (default), `elevated` (requires prior provisioning), and `mxc` (requires a compatible host and CLI). These modes all use workspace-write with network access disabled. Use a disposable target to validate your selected mode.
+
+```powershell
+$env:ORCHESTRATOR_LIVE_TEST = '1'
+$env:ORCHESTRATOR_TEST_CHROME = 'C:/path/to/chromium/chrome.exe'
+$env:ORCHESTRATOR_WINDOWS_SANDBOX = 'mxc'
+try {
+  node --test --test-name-pattern 'Chromium uses worktree-local scratch' integration/codex.test.js
+} finally {
+  Remove-Item Env:ORCHESTRATOR_LIVE_TEST, Env:ORCHESTRATOR_TEST_CHROME, Env:ORCHESTRATOR_WINDOWS_SANDBOX
+}
+```
+
 On November 11, 2026, the disposable suite passed on Windows with Codex CLI 0.163.0, Node.js 24.22.1, and Git 2.50.1. The in-worktree writes succeeded and the sibling Temp write returned EPERM. This observation applies to the worker configuration used by the test.
 
 ## Run a reviewed local queue

@@ -59,6 +59,18 @@ test('routes only Terra and Sol and builds an explicit sandboxed argument array'
   assert.throws(() => codexArgs('constructor', 'x'), /terra or sol/);
 });
 
+test('keeps workspace-write restrictions in each Windows sandbox mode', () => {
+  for (const mode of ['unelevated', 'elevated', 'mxc']) {
+    const args = codexArgs('terra', 'fixture', undefined, 'medium', mode);
+    assert.equal(args[args.indexOf('--sandbox') + 1], 'workspace-write');
+    assert.ok(args.includes('sandbox_workspace_write.network_access=false'));
+    assert.ok(args.includes('sandbox_workspace_write.exclude_tmpdir_env_var=true'));
+    assert.ok(args.includes('approval_policy="never"'));
+    if (process.platform === 'win32') assert.ok(args.includes('windows.sandbox="' + mode + '"'));
+  }
+  assert.throws(() => codexArgs('terra', 'fixture', undefined, 'medium', 'off'), /must be unelevated/);
+});
+
 test('parses split, malformed, oversized and unterminated JSONL records', () => {
   const events = [];
   let malformed = 0;

@@ -261,7 +261,11 @@ test('Chromium uses worktree-local scratch and loads a loopback page inside a Wi
   const result = await execute({ target: repo, allowedRepos: [repo], issues }, stateDir,
     { executable: findCodex(), limit: 1, timeoutMs: 120000 });
   const worktree = join(stateDir, 'worktrees', 'task-1');
-  const report = JSON.parse(readFileSync(join(worktree, 'chromium-result.json'), 'utf8'));
+  t.diagnostic(JSON.stringify({ windowsSandbox: process.env.ORCHESTRATOR_WINDOWS_SANDBOX ?? 'unelevated',
+    results: result.results }));
+  const reportPath = join(worktree, 'chromium-result.json');
+  assert.ok(existsSync(reportPath), 'Browser probe did not produce a report');
+  const report = JSON.parse(readFileSync(reportPath, 'utf8'));
   t.diagnostic(JSON.stringify(report));
   assert.deepEqual(result.results.map(item => item.state), ['done']);
   assert.equal(report.profileCreated, true);
