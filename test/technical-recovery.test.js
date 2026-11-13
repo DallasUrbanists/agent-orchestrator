@@ -10,6 +10,7 @@ import test from 'node:test';
 import { findCodex, runCodex } from '../src/codex.js';
 import { execute } from '../src/controller.js';
 import { State } from '../src/state.js';
+import { RECOVERY_COOLDOWN_MS } from '../src/technical-recovery.js';
 import { git } from '../src/worktrees.js';
 
 const blocker = technicalBlocker => ({ state: 'blocked', result: { technicalBlocker } });
@@ -313,6 +314,44 @@ test('durable recovery budget survives a restart and holds dependents after exha
   await execute(queue, stateDir, options, () => assert.fail('exhausted task relaunched'));
   assert.equal(read(state => state.recoveryRows()[0].hold), 'recovery-budget-exhausted');
   assert.equal(read(state => state.task(8)), undefined);
+});
+
+test('a four-attempt recovery budget renews after two hours across restarts', async t => {
+  const { queue, stateDir, read } = fixture(t);
+  delete queue.technicalRecovery.limit;
+  queue.issues = queue.issues.filter(issue => issue.number !== 9);
+  let worktree;
+  const worker = async ({ cwd }) => {
+    worktree ??= cwd;
+    assert.equal(cwd, worktree);
+    return blocker('code');
+  };
+  await execute(queue, stateDir, options, worker);
+  const before = read(state => state.attempts());
+  assert.equal(before.length, 5);
+  assert.equal(read(state => state.recoveryRows()[0].used), 4);
+  await execute(queue, stateDir, options, () => assert.fail('recovery resumed during cooldown'));
+
+  const state = new State(stateDir);
+  try {
+    const latest = before.at(-1);
+    const now = Date.parse(latest.completed) + RECOVERY_COOLDOWN_MS;
+    assert.equal(state.resetRecoveryBudget(7, RECOVERY_COOLDOWN_MS, now - 1), false);
+    state.db.prepare('UPDATE attempts SET started = ?, completed = ? WHERE id = ?')
+      .run(new Date(Date.now() - RECOVERY_COOLDOWN_MS - 61 * 60 * 1000).toISOString(),
+        new Date(Date.now() - RECOVERY_COOLDOWN_MS - 1000).toISOString(), latest.id);
+    state.set('blocker-task:7', String(latest.id));
+  } finally {
+    state.close();
+  }
+
+  await execute(queue, stateDir, options, worker);
+  assert.equal(read(state => state.attempts().length), 9);
+  assert.equal(read(state => state.recoveryRows()[0].used), 4);
+  assert.equal(read(state => state.task(7).retries), 8);
+  assert.equal(read(state => state.get('blocker-task:7')), String(before.at(-1).id));
+  assert.equal(read(state => state.task(8)), undefined);
+  await execute(queue, stateDir, options, () => assert.fail('second cooldown was skipped'));
 });
 
 test('resumes a pre-implementation environment blocker once in the original worktree and verifies it', async t => {

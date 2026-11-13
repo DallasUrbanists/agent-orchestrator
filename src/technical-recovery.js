@@ -6,16 +6,17 @@ import { terminateTree } from './codex.js';
 import { inside } from './worktrees.js';
 
 export const ACTIVE_BUDGET_MS = 60 * 60 * 1000;
+export const RECOVERY_COOLDOWN_MS = 2 * 60 * 60 * 1000;
 
 export function recoveryPolicy(value, repo, stateDir) {
   if (value === undefined) return null;
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid technical recovery configuration');
-  const { limit = 2, verifier, hostVerification, adopt = [], blockerTasks = [] } = value;
+  const { limit = 4, verifier, hostVerification, adopt = [], blockerTasks = [] } = value;
   if (!Array.isArray(adopt) || adopt.some(row => !Number.isSafeInteger(row?.number) || row.number < 1 ||
       !['environment', 'code'].includes(row.kind)) || new Set(adopt.map(row => row.number)).size !== adopt.length) {
     throw new Error('Invalid technical recovery adoption list');
   }
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 2) throw new Error('Technical recovery requires a limit of one or two attempts');
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 4) throw new Error('Technical recovery requires a limit of one to four attempts');
   if (!Array.isArray(blockerTasks) || blockerTasks.some(task =>
     !Number.isSafeInteger(task?.number) || task.number < 1 ||
     !Number.isSafeInteger(task.afterAttempt) || task.afterAttempt < 1 ||

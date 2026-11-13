@@ -333,8 +333,22 @@ export class State {
   holdRecovery(number, reason) {
     this.db.prepare('UPDATE technical_recovery SET hold = ? WHERE number = ?').run(reason, number);
   }
+  resetRecoveryBudget(number, cooldownMs, now = Date.now()) {
+    return this.transaction(() => {
+      const latest = this.db.prepare('SELECT completed FROM attempts WHERE number = ? ORDER BY id DESC LIMIT 1').get(number);
+      const completed = Date.parse(latest?.completed);
+      if (!Number.isFinite(completed) || now - completed < cooldownMs) return false;
+      const reset = this.db.prepare("UPDATE technical_recovery SET used = 0, hold = NULL" +
+        " WHERE number = ? AND hold = 'recovery-budget-exhausted'" +
+        " AND EXISTS (SELECT 1 FROM tasks WHERE number = ? AND state = 'blocked')")
+        .run(number, number);
+      if (reset.changes) this.set('recovery-budget-reset:' + number, new Date(now).toISOString());
+      return Boolean(reset.changes);
+    });
+  }
   activeMillis(number) {
-    return this.db.prepare('SELECT started, completed FROM attempts WHERE number = ? AND completed IS NOT NULL').all(number)
+    const since = this.get('recovery-budget-reset:' + number) ?? '';
+    return this.db.prepare('SELECT started, completed FROM attempts WHERE number = ? AND completed IS NOT NULL AND started >= ?').all(number, since)
       .reduce((total, row) => total + Math.max(0, Date.parse(row.completed) - Date.parse(row.started)), 0);
   }
   resumeRecovery(row, model, log, base, limit) {
