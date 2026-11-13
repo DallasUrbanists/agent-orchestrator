@@ -64,6 +64,7 @@ export async function repairPull({ state, stateDir, target, repo, task, receipt,
           !(await authorized()) || signal?.aborted) return;
       git(target, ['push', '--no-follow-tags', 'origin', candidate.commit + ':' + ref]);
     }
+    for (const thread of candidate.threads ?? []) state.set(key + ':published-thread:' + thread, candidate.commit);
     state.set(key, 'published:' + candidate.commit);
   }
   const pending = state.get(key);
@@ -74,9 +75,10 @@ export async function repairPull({ state, stateDir, target, repo, task, receipt,
   }
   const attemptsKey = key + ':rounds';
   const rounds = JSON.parse(state.get(attemptsKey) || '[]');
-  const attempted = new Set(rounds.flatMap(round => round.threads));
+  const attempted = new Set(rounds.flatMap(round =>
+    pending?.startsWith('published:') && !Object.hasOwn(round, 'head') ? round.threads : []));
   const inScope = path => permitted(path, entry.paths);
-  const notes = pull.reviewThreads.nodes.filter(thread => !thread.isResolved && !attempted.has(thread.id) && inScope(thread.path) &&
+  const notes = pull.reviewThreads.nodes.filter(thread => !thread.isResolved && !attempted.has(thread.id) && !state.get(key + ':published-thread:' + thread.id) && inScope(thread.path) &&
     reviewers.includes(thread.comments.nodes[0]?.author?.login));
   if (!notes.length && pull.mergeable !== 'CONFLICTING') return;
   if ((pending && !pending.startsWith('published:')) || rounds.length >= 2 || !(await authorized()) || signal?.aborted) return;
@@ -122,7 +124,7 @@ export async function repairPull({ state, stateDir, target, repo, task, receipt,
       if (!paths.length || paths.some(path => !path || !inScope(path))) throw error;
     }
   }
-  state.set(attemptsKey, JSON.stringify([...rounds, { threads: notes.map(thread => thread.id), conflict: conflictPair }]));
+  state.set(attemptsKey, JSON.stringify([...rounds, { head: pull.headRefOid, threads: notes.map(thread => thread.id), conflict: conflictPair }]));
   const outcome = await trackProcess(signal => worker({cwd,executable,model:issue.model,reasoning:issue.reasoning,signal,timeoutMs,onRecord:record,
     prompt: ['Repair this open PR within its approved paths: '+entry.paths.join(', '),
       'Preserve both sides of a conflict. Edit files only. Do not stage, commit, push, or modify Git metadata.',
@@ -150,7 +152,7 @@ export async function repairPull({ state, stateDir, target, repo, task, receipt,
   const parents = conflict ? ['-p',pull.headRefOid,'-p',pull.baseRefOid] : ['-p',pull.headRefOid];
   const commit = git(cwd,['-c','user.name=Agent Orchestrator','-c','user.email=orchestrator@users.noreply.github.com',
     'commit-tree',tree,...parents,'-m','Repair PR #'+receipt.pull,'-m',verification.evidence ?? 'Approved host checks passed.']);
-  const candidate = { commit, head: pull.headRefOid, base: pull.baseRefOid };
+  const candidate = { commit, head: pull.headRefOid, base: pull.baseRefOid, threads: notes.map(thread => thread.id) };
   state.set(key, 'verified:' + JSON.stringify(candidate));
   await publish(candidate);
 }
