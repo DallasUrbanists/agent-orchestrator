@@ -56,6 +56,9 @@ export class State {
       "  pid INTEGER, session TEXT, started TEXT NOT NULL, completed TEXT, detail TEXT, exit_code INTEGER," +
       "  retries INTEGER NOT NULL DEFAULT 0, acknowledged INTEGER NOT NULL DEFAULT 0," +
       "  cleaned INTEGER NOT NULL DEFAULT 0);" +
+      "CREATE TABLE IF NOT EXISTS verified_handoffs (" +
+      "  number INTEGER PRIMARY KEY REFERENCES tasks(number), repo TEXT NOT NULL, base TEXT NOT NULL," +
+      "  tree TEXT NOT NULL, evidence TEXT NOT NULL, commit_sha TEXT, pull INTEGER, linked INTEGER NOT NULL DEFAULT 0, error TEXT);" +
       "CREATE TABLE IF NOT EXISTS issue_status (" +
       "  number INTEGER PRIMARY KEY REFERENCES tasks(number), pull INTEGER, error TEXT);" +
       "CREATE TABLE IF NOT EXISTS technical_recovery (" +
@@ -126,6 +129,25 @@ export class State {
   }
   list() { return this.db.prepare('SELECT * FROM tasks ORDER BY number').all(); }
   task(number) { return this.db.prepare('SELECT * FROM tasks WHERE number = ?').get(number); }
+
+  handoffs() {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'verified_handoffs'").get()) return [];
+    return this.db.prepare('SELECT number, commit_sha, pull, linked, error FROM verified_handoffs ORDER BY number').all();
+  }
+
+  handoff(number) {
+    return this.db.prepare('SELECT * FROM verified_handoffs WHERE number = ?').get(number);
+  }
+
+  recordVerification(number, { repo, base, tree, evidence }) {
+    this.db.prepare('INSERT INTO verified_handoffs (number, repo, base, tree, evidence) VALUES (?, ?, ?, ?, ?)')
+      .run(number, repo, base, tree, evidence);
+  }
+
+  updateHandoff(number, { commit, pull, linked, error } = {}) {
+    this.db.prepare('UPDATE verified_handoffs SET commit_sha = coalesce(?, commit_sha), pull = coalesce(?, pull),' +
+      ' linked = coalesce(?, linked), error = ? WHERE number = ?').run(commit ?? null, pull ?? null, linked ?? null, error ?? null, number);
+  }
 
   githubStatusRows() {
     if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'issue_status'").get()) return [];
@@ -198,7 +220,7 @@ export class State {
         .run(pid ?? null, threadId ?? null, number);
     });
   }
-  finish(number, attempt, { state, detail, code }, decision = null, recovery = null) {
+  finish(number, attempt, { state, detail, code }, decision = null, recovery = null, verification = null) {
     const completed = new Date().toISOString();
     const values = [state, detail ?? null, code ?? null, completed];
     const update = ' SET state = ?, detail = ?, exit_code = ?, completed = ?';
@@ -208,6 +230,7 @@ export class State {
       ).run(...values, attempt, number);
       if (!result.changes) throw new Error('Worker attempt no longer owns the task');
       this.db.prepare("UPDATE tasks" + update + " WHERE number = ? AND state = 'running'").run(...values, number);
+      if (verification) this.recordVerification(number, verification);
       if (recovery) {
         this.db.prepare('INSERT INTO technical_recovery (number, kind, scope) VALUES (?, ?, ?)' +
           ' ON CONFLICT(number) DO UPDATE SET kind = excluded.kind, scope = excluded.scope, hold = NULL')
