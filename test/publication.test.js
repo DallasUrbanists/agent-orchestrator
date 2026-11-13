@@ -169,6 +169,33 @@ test('legacy handoff reopens finished recovery without resetting its budget', as
   } finally { state.close(); }
 });
 
+test('explicit adoption retries rejected host evidence without reimplementation', async t => {
+  const f = fixture(t);
+  const path = join(f.root, 'verifier.mjs');
+  const configure = evidence => {
+    const code = 'console.log(' + JSON.stringify(evidence) + ');';
+    writeFileSync(path, code);
+    f.queue.technicalRecovery = { limit: 4, adopt: [{ number: 7, kind: 'environment' }], hostVerification: {
+      runner: { path, sha256: createHash('sha256').update(code).digest('hex') },
+      profiles: { schema: 'Reviewed checks.' }, issues: [{ number: 7, profile: 'schema' }]
+    } };
+  };
+  f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'] }] };
+  configure('invalid');
+  await f.executeWith(async ({ cwd }) => {
+    writeFileSync(join(cwd, 'renderer.txt'), 'verified');
+    return { state: 'blocked', result: { technicalBlocker: 'environment' } };
+  }, { limit: 2 });
+  assert.equal(f.inspect(state => state.task(7).detail), 'invalid-verification-evidence');
+  await f.executeWith(workerForbidden);
+  await f.executeWith(workerForbidden);
+  assert.equal(f.inspect(state => state.attempts().length), 3);
+  configure(JSON.stringify([{ name: 'schema', measurements: { tests: 9 } }]));
+  await f.executeWith(workerForbidden);
+  assert.equal(f.inspect(state => state.handoff(7).linked), 1);
+  assert.equal(f.inspect(state => state.attempts().length), 4);
+});
+
 test('a verified attempt stays pending across restart until its PR link is recorded', async t => {
   const f = fixture(t);
   const path = join(f.root, 'verifier.mjs');
