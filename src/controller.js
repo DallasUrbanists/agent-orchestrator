@@ -249,7 +249,11 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const stateDir = resolveStatePath(statePath);
   const repo = verifyTarget(queue?.target, queue?.allowedRepos, stateDir);
   const { sourceRepo, coordinatorId, load } = prepareQueue(queue, repo, readIssues, decisionsEnabled, intakeApi);
-  if (publishStatus && !sourceRepo) throw new Error('GitHub status publishing requires a GitHub-backed queue');
+  const statusRepo = publishStatus && queue.statusRepo !== undefined ? githubRepo(queue.statusRepo) : sourceRepo;
+  if (publishStatus && (!statusRepo || (sourceRepo && statusRepo !== sourceRepo))) {
+    throw new Error('GitHub status publishing requires the queue repository or a matching statusRepo');
+  }
+  if (publishStatus && !sourceRepo) publicationOrigin(repo, statusRepo);
   if (coordinatorId && !readAcceptance) throw new Error('GitHub intake requires --watch-acceptance');
   if (continuous && ((!sourceRepo && !readAcceptance) || finalHostVerification)) {
     throw new Error('Continuous polling requires GitHub or watched acceptance and a regular execution run');
@@ -282,7 +286,14 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     state.bind(repo, sourceRepo, Object.hasOwn(queue, 'acceptedPrerequisites'), coordinatorId);
     if (state.get('restoreHold') === 'true') return { reason: 'restored-state-needs-reconciliation', results };
     state.recover();
-    const publisher = publishStatus ? statusPublisher(state, sourceRepo, { api: statusApi, signal }) : null;
+    if (publishStatus && !sourceRepo) {
+      const savedStatusRepo = state.get('statusRepo');
+      if (savedStatusRepo && savedStatusRepo !== statusRepo) throw new Error('This journal has a different statusRepo');
+      if (!savedStatusRepo) state.set('statusRepo', statusRepo);
+    }
+    const publisher = publishStatus ? statusPublisher(state, statusRepo, {
+      api: statusApi, signal, numbers: sourceRepo ? undefined : new Set(queue.issues.map(issue => issue.number))
+    }) : null;
     const refreshMain = coordinatorId ? () => {
       const origin = git(repo, ['config', '--local', '--get-all', 'remote.origin.url']);
       if (githubOrigin(origin) !== sourceRepo) throw new Error('The checkout origin changed during intake');

@@ -102,12 +102,12 @@ async function publishComment(state, api, repo, attempt, pull, options, now, rec
   state.updateProgress(attempt.id, { comment: posted.id, posting: 0 });
 }
 
-export function statusPublisher(state, sourceRepo, { api = githubStatus, signal, clock = () => new Date().toISOString() } = {}) {
+export function statusPublisher(state, sourceRepo, { api = githubStatus, signal, clock = () => new Date().toISOString(), numbers } = {}) {
   const repo = githubRepo(sourceRepo);
   const options = { signal };
   async function sync(number) {
     const task = state.task(number);
-    if (!task || signal?.aborted) return;
+    if (!task || signal?.aborted || (numbers && !numbers.has(number))) return;
     const attempts = state.githubProgress(number);
     const latest = attempts.at(-1);
     const status = state.githubStatusRows().find(row => row.number === number);

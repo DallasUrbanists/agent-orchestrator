@@ -224,7 +224,7 @@ Remove-Item Env:ORCHESTRATOR_LIVE_INTAKE
 
 ### Publish issue status and worker progress
 
-Use `--github-status` on a real run with a GitHub-backed queue to enable status updates. Sign in to `gh` as the publisher with issue write access and pull request read access. Create the `in-progress`, `in-review`, and `blocked` labels before enabling this option. The controller manages those three labels and preserves all others.
+Use `--github-status` on a real run to enable status updates. For a local queue, set `"statusRepo": "OWNER/REPO"` to the checkout's GitHub origin and include the issues to report in the queue. The controller keeps the existing local journal binding and records the reporting repository separately. Sign in to `gh` as the publisher with issue write access and pull request read access. Create the `in-progress`, `in-review`, and `blocked` labels before enabling this option. The controller manages those three labels and preserves all others.
 
 A confirmed worker launch sets `in-progress` and creates one comment for that attempt. The controller edits it every five minutes during the attempt and on exit. It includes elapsed time, the last event observed, and a short description of that event when available. Raw worker text, command output, and credentials stay out of the comment. A quiet update reports the lack of observed activity. If a decision resumes a task, the new worker attempt gets its own comment.
 

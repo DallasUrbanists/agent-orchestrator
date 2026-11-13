@@ -49,6 +49,53 @@ test('worktrees are isolated, reject duplicates, and only clean after all change
   assert.throws(() => createWorktree(repo, location, base), /already exists/);
 });
 
+test('local queues publish progress to their matching origin and reconcile the same comment on restart', async t => {
+  const { repo, queue, stateDir } = fixture(t);
+  const statusRepo = 'fixture/local-status';
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/' + statusRepo + '.git']);
+  queue.statusRepo = 'fixture/other';
+  const labels = new Set(['keep']);
+  let comment, posts = 0;
+  const api = {
+    async issue(name, number) {
+      assert.equal(name, statusRepo);
+      assert.equal(number, 1);
+      return { number, html_url: 'https://github.com/' + name + '/issues/' + number, state: 'open',
+        labels: [...labels].map(name => ({ name })) };
+    },
+    async add(_name, _number, label) { labels.add(label); },
+    async remove(_name, _number, label) { labels.delete(label); },
+    async viewer() { return 1; },
+    async comments() { return comment ? [comment] : []; },
+    async post(_name, _number, body) {
+      posts++;
+      comment = { id: 2, user: { id: 1 }, body };
+      return comment;
+    },
+    async edit(_name, _id, body) { comment.body = body; }
+  };
+  const config = { ...options, publishStatus: true, statusApi: api };
+  const never = () => assert.fail('unexpected worker');
+  await assert.rejects(execute(queue, stateDir, config, never), /matching GitHub origin/);
+  queue.statusRepo = statusRepo;
+  await execute(queue, stateDir, config, async ({ onRecord }) => {
+    onRecord({ type: 'worker-started', pid: 1234 });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.match(comment.body, /In progress/);
+    return { state: 'blocked' };
+  });
+  assert.match(comment.body, /Blocked/);
+  assert.deepEqual([...labels], ['keep', 'blocked']);
+  assert.deepEqual((await execute(queue, stateDir, config, never)).results, []);
+  assert.equal(posts, 1);
+  withState(stateDir, state => {
+    assert.equal(state.get('sourceRepo'), undefined);
+    assert.equal(state.get('statusRepo'), statusRepo);
+    assert.equal(state.task(1).branch, 'orchestrator/task-1');
+    assert.equal(state.githubProgress(1)[0].comment, 2);
+  });
+});
+
 test('continues after a blocked task, then releases dependent work after success', async t => {
   const { queue, stateDir } = fixture(t, [task(1), task(2, [1]), task(3, [], 'sol'), task(4, [3])]);
   const order = [];
