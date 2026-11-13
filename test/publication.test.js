@@ -102,6 +102,22 @@ test('publishes a saved verified task without reimplementation and reconciles lo
   assert.equal(f.pulls.length, 1);
 });
 
+test('adds a closing keyword only for coordinator-approved full delivery', async t => {
+  const f = fixture(t);
+  await f.executeWith(async ({ cwd }) => {
+    writeFileSync(join(cwd, 'renderer.txt'), 'verified');
+    return { state: 'done' };
+  });
+  const task = f.inspect(state => state.task(7));
+  const { tree } = captureVerifiedTree(f.target, f.stateDir, task, ['renderer.txt'], f.base);
+  f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'], closesIssue: true,
+    verified: { base: f.base, tree, summary: 'Full delivery verified.' } }] };
+  await f.executeWith(workerForbidden);
+  assert.match(f.pulls[0].body, /^Closes #7$/m);
+  assert.throws(() => publicationPolicy({ repo, issues: [{ number: 7, paths: ['renderer.txt'], closesIssue: 'true' }] }),
+    /closesIssue must be a boolean/);
+});
+
 test('checks the claimed approval before publication and again after a push', async t => {
   const f = fixture(t);
   await f.executeWith(async ({ cwd }) => {
