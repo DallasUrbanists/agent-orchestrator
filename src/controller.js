@@ -371,7 +371,9 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       state.list().filter(row => row.state !== 'running' || !active.has(row.number)), state.get('control'));
     const publishTask = number => {
       if (!pendingPublications.has(number)) {
-        const job = exclusive(() => publishTaskNow(number)).finally(() => pendingPublications.delete(number));
+        const job = exclusive(() => publishTaskNow(number)).then(async () => {
+          if (state.handoff(number)?.linked) await publisher?.sync(number);
+        }).catch(error => { fatal ??= error; }).finally(() => pendingPublications.delete(number));
         pendingPublications.set(number, job);
       }
       return pendingPublications.get(number);
