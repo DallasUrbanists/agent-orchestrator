@@ -58,7 +58,7 @@ function fixture(t) {
     }
   };
   const publishOptions = { api, push: async (_cwd, _branch, commit) => pushes.add(commit) };
-  const executeWith = worker => execute(queue, stateDir, { ...options, publishOptions }, worker);
+  const executeWith = (worker, overrides) => execute(queue, stateDir, { ...options, ...overrides, publishOptions }, worker);
   return { root, queue, stateDir, target, base, inspect, pulls, comments, pushes, executeWith, publishOptions,
     loseCreate() { loseCreate = true; }, loseComment() { loseComment = true; } };
 }
@@ -150,6 +150,40 @@ test('automatically verifies and publishes a recovered task, without releasing i
   assert.equal(f.inspect(state => state.task(8)), undefined);
   assert.equal(f.inspect(state => state.handoff(7).linked), 1);
   assert.match(f.pulls[0].body, /Approved verification runner exited successfully[\s\S]*Verifier SHA-256/);
+});
+
+test('one authorized verification after exhaustion preserves the claim and publishes without a worker', async t => {
+  const f = fixture(t);
+  const path = join(f.root, 'verifier.mjs');
+  const configure = (source, limit = 1) => {
+    writeFileSync(path, source);
+    f.queue.technicalRecovery = { limit, hostVerification: {
+      runner: { path, sha256: createHash('sha256').update(source).digest('hex') },
+      profiles: { render: 'Render and decode checks passed.' },
+      issues: [{ number: 7, profile: 'render' }]
+    } };
+  };
+  configure('process.exit(11);');
+  f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'] }] };
+  const initial = await f.executeWith(async ({ cwd }) => {
+    writeFileSync(join(cwd, 'renderer.txt'), 'reviewed content');
+    return { state: 'blocked', result: { technicalBlocker: 'environment' } };
+  });
+  assert.equal(initial.results.at(-1).detail, 'verification-environment-failure');
+  assert.equal(f.inspect(state => state.recoveryRows()[0].hold), 'recovery-budget-exhausted');
+
+  const latest = f.inspect(state => state.attempts().at(-1).id);
+  configure("if (orchestratorProfile !== 'render') process.exit(11);");
+  const authorization = afterAttempt => ({ limit: 1, finalHostVerification: { number: 7, afterAttempt } });
+  assert.deepEqual((await f.executeWith(workerForbidden, authorization(latest + 1))).results, []);
+  const result = await f.executeWith(workerForbidden, authorization(latest));
+  assert.deepEqual(result.results.map(row => [row.number, row.state]), [[7, 'done']]);
+  assert.equal(f.inspect(state => state.recoveryRows()[0].used), 2);
+  assert.equal(f.inspect(state => state.attempts().length), 3);
+  assert.equal(f.inspect(state => state.handoff(7).linked), 1);
+  assert.deepEqual((await f.executeWith(workerForbidden, authorization(latest))).results, []);
+  assert.equal(f.pulls.length, 1);
+  assert.equal(f.comments.length, 1);
 });
 
 test('publication holds if the approved verifier changes the verified source', async t => {

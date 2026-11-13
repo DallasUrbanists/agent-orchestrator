@@ -65,10 +65,29 @@ function prepareQueue(queue, repo, readIssues, decisionsEnabled = false, intakeA
   if (Object.hasOwn(queue, 'githubIntake')) {
     const { coordinatorId } = queue.githubIntake ?? {};
     if (!Number.isSafeInteger(coordinatorId) || coordinatorId < 1 || Object.hasOwn(queue, 'issues') ||
-        !Array.isArray(queue.acceptedPrerequisites) || decisionsEnabled) {
-      throw new Error('GitHub intake requires coordinatorId and acceptedPrerequisites, with no local issues or decision posting');
+        !Array.isArray(queue.acceptedPrerequisites)) {
+      throw new Error('GitHub intake requires coordinatorId and acceptedPrerequisites, with no local issues array');
     }
-    return { sourceRepo, coordinatorId, load: signal => readIssueIntake(sourceRepo, coordinatorId, { signal }, intakeApi) };
+    const templates = new Map();
+    if (decisionsEnabled) {
+      const bindings = queue.intakeDecisions;
+      if (!Array.isArray(bindings)) throw new Error('GitHub intake decisions require an intakeDecisions array');
+      for (const binding of bindings) {
+        if (!Number.isSafeInteger(binding?.number) || binding.number < 1 || templates.has(binding.number) ||
+            typeof binding.revision !== 'string' || !/^[0-9a-f]{64}$/.test(binding.revision) ||
+            !Array.isArray(binding.decisions) || !binding.decisions.length) {
+          throw new Error('Intake decision templates require a unique issue number and a reviewed revision hash');
+        }
+        templates.set(binding.number, { revision: binding.revision, decisions: reviewedDecisions(binding) });
+      }
+    }
+    return { sourceRepo, coordinatorId, async load(signal) {
+      const issues = await readIssueIntake(sourceRepo, coordinatorId, { signal }, intakeApi);
+      return issues.map(issue => {
+        const template = templates.get(issue.number);
+        return template && issue.intake?.hash === template.revision ? { ...issue, decisions: template.decisions } : issue;
+      });
+    } };
   }
   if (!Array.isArray(queue.issues)) throw new Error('GitHub queues need an issues array of reviewed prompts');
   const requireAcceptance = Object.hasOwn(queue, 'acceptedPrerequisites');
@@ -206,7 +225,8 @@ export async function preview(queue, statePath, { readIssues = readGithubIssues,
     }));
     return { mode: 'dry-run', ...(sourceRepo && { sourceRepo }),
       reason: hold ?? (eligible.length ? 'eligible-work' : 'no-eligible-work'), eligible,
-      ...(coordinatorId && { coordinatorId, admitted: unclaimed.filter(issue => issue.state === 'ready' &&
+      ...(coordinatorId && { coordinatorId, revisions: issues.filter(issue => issue.intake)
+        .map(issue => ({ number: issue.number, revision: issue.intake.hash })), admitted: unclaimed.filter(issue => issue.state === 'ready' &&
         !accepted.has(issue.number) && !rows.some(row => row.number === issue.number))
         .map(issue => issue.number), awaitingApproval: issues.filter(issue => issue.reason === 'needs-coordinator-approval')
         .map(issue => issue.number), held: issues.filter(issue => issue.reason === 'unsupported-task-metadata-or-revision')
@@ -220,7 +240,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const { executable, limit = 1, timeoutMs = 15 * 60 * 1000, signal,
     polls = 1, intervalMs = 15000, readIssues = readGithubIssues, decisionsEnabled = false,
     decisionApi = githubDecisions, readAcceptance, acceptancePath, intakeApi, publishStatus = false, statusApi,
-    waitForIssueRetry = wait, publishOptions } = options;
+    waitForIssueRetry = wait, publishOptions, finalHostVerification } = options;
   if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) {
     throw new Error('Specify a positive execution limit and a worker timeout up to one hour');
@@ -238,6 +258,12 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       throw new Error('Automatic publication requires matching repository and accepted prerequisite policy');
     }
     publicationOrigin(repo, handoff.repo);
+  }
+  if (finalHostVerification && (!Number.isSafeInteger(finalHostVerification.number) || finalHostVerification.number < 1 ||
+      !Number.isSafeInteger(finalHostVerification.afterAttempt) || finalHostVerification.afterAttempt < 1 ||
+      !technical?.profileEvidence?.(finalHostVerification.number) ||
+      !handoff?.issues.has(finalHostVerification.number) || limit !== 1)) {
+    throw new Error('Final host verification requires a reviewed profile, publication scope, and execution limit of one');
   }
   const responders = decisionsEnabled ? responderIds(queue) : null;
   if (acceptancePath && (inside(repo, acceptancePath) || inside(stateDir, acceptancePath))) {
@@ -329,17 +355,28 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       }
       if (handoff) {
         for (const number of handoff.issues.keys()) {
-          if (accepted.has(number) || state.handoff(number)?.linked) continue;
+          if ((finalHostVerification && finalHostVerification.number !== number) || accepted.has(number) || state.handoff(number)?.linked) continue;
           await publishTask(number);
           if (state.handoff(number)?.linked) await publisher?.sync(number);
         }
       }
 
+      const claims = state.intakeClaims();
+      const claimsByIssue = new Map(claims.map(claim => [claim.number, claim]));
       const answers = new Map();
       if (decisionsEnabled) {
         const ready = new Map(issues.filter(issue => issue.state === 'ready').map(issue => [issue.number, issue]));
-        const approved = row => !accepted?.has(row.number) &&
-          ready.get(row.number)?.decisions.some(item => item.key === row.decision_key);
+        const approved = row => {
+          if (accepted?.has(row.number)) return false;
+          const issue = ready.get(row.number);
+          const template = issue?.decisions?.find(item => item.key === row.decision_key);
+          if (!coordinatorId) return Boolean(template);
+          const claim = claimsByIssue.get(row.number);
+          if (claim?.issue_id === issue?.intake?.issueId && claim?.revision === issue?.intake?.hash &&
+              template && JSON.stringify(template) === row.template) return true;
+          state.decisionError(row.id, 'intake-decision-scope-no-longer-approved');
+          return false;
+        };
         const canContinue = () => !signal?.aborted && !dispatchHold(previous, state.get('control'));
         const pending = state.pendingDecisions().filter(approved);
         const verified = await syncDecisions(state, sourceRepo, pending, {
@@ -353,9 +390,9 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         }
       }
       if (results.length >= limit) break;
-      const claimedIds = new Set(state.intakeClaims().map(claim => claim.issue_id));
-      const unclaimed = issues.filter(issue => !claimedIds.has(issue.intake?.issueId));
-      const independent = runnable(unclaimed, previous, sourceRepo, new Set(answers.keys()), accepted);
+      const claimedIds = new Set(claims.map(claim => claim.issue_id));
+      const dispatchable = issues.filter(issue => !claimedIds.has(issue.intake?.issueId) || answers.has(issue.number));
+      const independent = finalHostVerification ? [] : runnable(dispatchable, previous, sourceRepo, new Set(answers.keys()), accepted);
       const recovery = new Map();
       if (technical && !independent.length) {
         const candidates = new Map(issues.filter(issue => issue.state === 'ready').map(issue => [issue.number, issue]));
@@ -366,13 +403,17 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         for (const row of state.recoveryRows()) {
           const verifier = technical.verifierFor(row.number);
           const retryableHold = row.hold === 'verification-runner-required' || row.hold === 'verification-runner-unavailable';
-          if ((row.hold && !retryableHold) ||
+          const final = finalHostVerification && row.number === finalHostVerification.number &&
+            row.kind === 'environment' && row.hold === 'recovery-budget-exhausted' &&
+            state.attempts().filter(attempt => attempt.number === row.number).at(-1)?.id === finalHostVerification.afterAttempt &&
+            !state.get('final-host-verification:' + row.number);
+          if ((finalHostVerification && !final) || (row.hold && !retryableHold && !final) ||
               state.task(row.number)?.state !== 'blocked') continue;
           const candidate = candidates.get(row.number);
           if (!candidate) continue;
           if (recoveryScope(candidate) !== row.scope) {
             state.holdRecovery(row.number, 'task-scope-changed');
-          } else if (row.used >= technical.limit || state.activeMillis(row.number) >= ACTIVE_BUDGET_MS) {
+          } else if ((!final && row.used >= technical.limit) || state.activeMillis(row.number) >= ACTIVE_BUDGET_MS) {
             state.holdRecovery(row.number, 'recovery-budget-exhausted');
           } else if (row.kind === 'environment' && !verifier) {
             state.holdRecovery(row.number, 'verification-runner-required');
@@ -385,8 +426,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
                 continue;
               }
             }
-            if (row.hold) state.holdRecovery(row.number, null);
-            recovery.set(row.number, { ...row, verifierCode });
+            if (row.hold && !final) state.holdRecovery(row.number, null);
+            recovery.set(row.number, { ...row, verifierCode, final });
           }
         }
       }
@@ -436,7 +477,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         ? state.resumeDecision(answer.id, issue.number, model, log, git(location.path, ['rev-parse', 'HEAD']))
         : { attempt: retry
           ? state.resumeRecovery(retry, verifying ? 'verification-runner' : model, log,
-            git(location.path, ['rev-parse', 'HEAD']), technical.limit)
+            git(location.path, ['rev-parse', 'HEAD']), retry.final ? retry.used + 1 : technical.limit)
           : state.reserve({ number: issue.number, repo, worker: 'local-1', model, location, log, base, intake: issue.intake }),
           approvedChoices: retry ? state.approvedChoices(issue.number) : [] };
       const { attempt, approvedChoices } = dispatch;
@@ -488,7 +529,11 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         const publicationEntry = handoff?.issues.get(issue.number);
         result = verifying ? null : await worker({ ...execution, executable, model: issue.model, reasoning: issue.reasoning,
           prompt: workerPrompt(issue, templates, approvedChoices, Boolean(retry), Boolean(technical)) });
-        if (verifying || (result.state === 'done' && (publicationEntry || (retry?.kind === 'code' && verifierCode)))) {
+        const profileEvidence = technical?.profileEvidence?.(issue.number);
+        const repairedButNeedsHost = profileEvidence && retry?.kind === 'code' && result?.state === 'blocked' &&
+          result.result?.technicalBlocker === 'environment' && !result.result?.decisionKey;
+        if (verifying || repairedButNeedsHost || (result.state === 'done' && (publicationEntry || profileEvidence ||
+            (retry?.kind === 'code' && verifierCode)))) {
           let bytes = verifierCode;
           if (!bytes) {
             try { bytes = technical?.verifierFor(issue.number)?.(); }
@@ -515,7 +560,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
                 verification = { repo: handoff.repo, ...before,
                   evidence: 'Approved verification runner exited successfully. Journal attempt ' + attempt + '.\n' +
                     'Verifier SHA-256: ' + createHash('sha256').update(bytes).digest('hex') + '.\n' +
-                    'Verified tree: ' + before.tree + '.' };
+                    'Verified tree: ' + before.tree + '.' + (profileEvidence ? '\n\n' + profileEvidence : '') };
               } else result = { state: 'blocked', detail: 'verified-worktree-changed-during-verification' };
             }
           }

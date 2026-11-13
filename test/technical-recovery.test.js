@@ -41,6 +41,46 @@ function fixture(t, verifier) {
   return { repo, queue, stateDir, identity, read };
 }
 
+test('project host profiles pick reviewed checks across restarts and distinguish setup from code failures', async t => {
+  const { queue, stateDir, read } = fixture(t, [
+    "import { readFileSync, writeFileSync } from 'node:fs';",
+    "const input = readFileSync('check.txt', 'utf8');",
+    "if (orchestratorProfile === 'setup' && input !== 'ready') process.exit(11);",
+    "if (orchestratorProfile === 'render' && input !== 'ready') process.exit(10);",
+    "writeFileSync('evidence.txt', orchestratorProfile);"
+  ].join('\n'));
+  const { verifier } = queue.technicalRecovery;
+  queue.technicalRecovery = { limit: 2, hostVerification: {
+    runner: { path: verifier.path, sha256: verifier.sha256 },
+    profiles: { render: 'Render and decode.', setup: 'Verify the pinned host.' },
+    issues: [{ number: 7, profile: 'render' }, { number: 9, profile: 'setup' }]
+  } };
+  const first = await execute(queue, stateDir, { ...options, limit: 1 }, async ({ cwd }) => {
+    writeFileSync(join(cwd, 'check.txt'), 'broken');
+    return blocker('environment');
+  });
+  assert.equal(first.results[0].state, 'blocked');
+  const repaired = [];
+  const next = await execute(queue, stateDir, options, async ({ cwd, prompt }) => {
+    if (prompt.endsWith('Fixture #9')) {
+      writeFileSync(join(cwd, 'check.txt'), 'not installed');
+      return { state: 'done' };
+    }
+    assert.match(prompt, /bounded repair/);
+    assert.equal(readFileSync(join(cwd, 'check.txt'), 'utf8'), 'broken');
+    repaired.push(cwd);
+    writeFileSync(join(cwd, 'check.txt'), 'ready');
+    return blocker('environment');
+  });
+  assert.deepEqual(next.results.filter(row => row.number === 7).map(row => row.detail),
+    ['verification-code-failure', 'verification-passed']);
+  assert.ok(next.results.filter(row => row.number === 9).every(row => row.detail === 'verification-environment-failure'));
+  assert.equal(repaired.length, 1);
+  assert.equal(readFileSync(join(repaired[0], 'evidence.txt'), 'utf8'), 'render');
+  assert.equal(read(state => state.task(8)), undefined);
+  assert.deepEqual((await execute(queue, stateDir, options, () => assert.fail('duplicate work'))).results, []);
+});
+
 test('automatically verifies D1-07 environment blockers and repairs a bundler code failure in the saved worktree', async t => {
   const { repo, queue, stateDir, identity, read } = fixture(t, [
     "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",

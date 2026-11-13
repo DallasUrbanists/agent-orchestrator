@@ -32,15 +32,24 @@ async function main() {
       execute: { type: 'boolean' }, 'github-decisions': { type: 'boolean' },
       'github-status': { type: 'boolean' }, pr: { type: 'string' }, 'merge-evidence': { type: 'string' },
       limit: { type: 'string', default: '1' },
-      'timeout-seconds': { type: 'string', default: '900' },
+      'timeout-seconds': { type: 'string', default: '900' }, 'final-host-verification': { type: 'string' },
       'confirm-process-exited': { type: 'boolean' }, 'confirm-reconciled': { type: 'boolean' }, help: { type: 'boolean' }
     }
   });
   const [command = 'run', argument, ...extra] = positionals;
+  let finalHostVerification;
+  if (values['final-host-verification'] !== undefined) {
+    const match = /^([1-9]\d*):([1-9]\d*)$/.exec(values['final-host-verification']);
+    if (command !== 'run' || !values.execute || !match) {
+      throw new Error('Final host verification requires run --execute --final-host-verification ISSUE:ATTEMPT');
+    }
+    finalHostVerification = { number: Number(match[1]), afterAttempt: Number(match[2]) };
+  }
   if (values.help) {
     console.log('Commands: run | poll | doctor | status | attempts | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID | backup | restore FILE | sync-status [N] [--repo OWNER/REPO] | handoff N --pr N | check-merge N --merge-evidence FILE');
     console.log('Opt in to status labels and progress comments with run --execute --github-status.');
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
+    console.log('Authorize one host-only verification after exhaustion with --final-host-verification ISSUE:ATTEMPT.');
     console.log('For GitHub intake, configure githubIntake.coordinatorId in the queue file.');
     console.log('Watch supervised merges with run --execute --queue FILE --watch-acceptance FILE --polls N.');
     console.log('Poll GitHub read-only with poll --repo OWNER/REPO --polls N --interval-seconds N.');
@@ -117,7 +126,7 @@ async function main() {
       const result = await execute(data, resolve(values.state), {
         executable, limit: Number(values.limit), timeoutMs: 1000 * Number(values['timeout-seconds']),
         signal: abort.signal, decisionsEnabled: values['github-decisions'], publishStatus: values['github-status'],
-        readAcceptance, acceptancePath, ...polling
+        readAcceptance, acceptancePath, finalHostVerification, ...polling
       });
       print(result);
       if (['interrupted-worker-needs-review', 'restored-state-needs-reconciliation'].includes(result.reason) ||

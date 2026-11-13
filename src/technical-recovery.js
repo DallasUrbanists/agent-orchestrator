@@ -10,12 +10,39 @@ export const ACTIVE_BUDGET_MS = 60 * 60 * 1000;
 export function recoveryPolicy(value, repo, stateDir) {
   if (value === undefined) return null;
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid technical recovery configuration');
-  const { limit = 2, verifier, adopt = [] } = value;
+  const { limit = 2, verifier, hostVerification, adopt = [] } = value;
   if (!Array.isArray(adopt) || adopt.some(row => !Number.isSafeInteger(row?.number) || row.number < 1 ||
       !['environment', 'code'].includes(row.kind)) || new Set(adopt.map(row => row.number)).size !== adopt.length) {
     throw new Error('Invalid technical recovery adoption list');
   }
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 2) throw new Error('Technical recovery requires a limit of one or two attempts');
+  if (hostVerification !== undefined) {
+    if (verifier !== undefined) throw new Error('Choose either a single verifier or project host verification profiles');
+    const { runner, profiles, issues, toolchain = {} } = hostVerification ?? {};
+    if (!runner || !profiles || typeof profiles !== 'object' || Array.isArray(profiles) ||
+        !Array.isArray(issues) || !issues.length || !toolchain || typeof toolchain !== 'object' ||
+        Array.isArray(toolchain) || Object.entries(toolchain).some(([key, entry]) =>
+          !/^[a-z][a-zA-Z0-9]{0,39}$/.test(key) || typeof entry !== 'string' || !entry || entry.length > 4096
+        )) throw new Error('Host verification requires a runner, profiles and issue bindings');
+    const base = recoveryPolicy({ verifier: { ...runner, number: 1 } }, repo, stateDir).verifierFor(1);
+    const byIssue = new Map();
+    for (const row of issues) {
+      const profile = row?.profile;
+      const evidence = typeof profile === 'string' && Object.hasOwn(profiles, profile) ? profiles[profile] : null;
+      if (!Number.isSafeInteger(row?.number) || row.number < 1 || byIssue.has(row.number) ||
+          !/^[a-z][a-z0-9-]{0,63}$/.test(profile ?? '') ||
+          typeof evidence !== 'string' || !evidence.trim() || evidence.length > 2000) {
+        throw new Error('Host verification issue bindings require a unique issue and reviewed profile');
+      }
+      byIssue.set(row.number, {
+        evidence,
+        read: () => Buffer.concat([Buffer.from('const orchestratorProfile = ' + JSON.stringify(profile) +
+          ';\nconst orchestratorToolchain = ' + JSON.stringify(toolchain) + ';\n'), base()])
+      });
+    }
+    return { limit, adopt, verifierFor: issue => byIssue.get(issue)?.read,
+      profileEvidence: issue => byIssue.get(issue)?.evidence };
+  }
   if (verifier === undefined) return { limit, adopt, verifierFor: () => null };
   if (!Number.isSafeInteger(verifier?.number) || verifier.number < 1 ||
       typeof verifier.path !== 'string' || !isAbsolute(verifier.path) ||

@@ -193,7 +193,20 @@ npm run start -- --queue intake.local.json --state .\state\intake-demo --execute
 npm run status -- --state .\state\intake-demo
 ```
 
-The SQLite claim records the issue ID, the approved revision hash, the coordinator ID, the approval comment ID when applicable, and the dispatch base. The same journal prevents a claimed issue from running again across polls and restarts, even after a fresh approval. Keep the journal and worktree paths when restarting. The controller also keeps the last verified base and receipts and rejects a rewind or removed receipt. Intake reads GitHub with GraphQL queries. It does not post comments, push changes, or merge. The `--github-decisions` option still requires a separate queue with reviewed decision templates.
+The SQLite claim records the issue ID, the approved revision hash, the coordinator ID, the approval comment ID when applicable, and the dispatch base. The same journal prevents a claimed issue from running again across polls and restarts, even after a fresh approval. Keep the journal and worktree paths when restarting. The controller also keeps the last verified base and receipts and rejects a rewind or removed receipt. Intake reads GitHub with GraphQL queries. With no write options enabled, it
+only reads. To enable authorized decision replies in the same run, add
+`--github-decisions`, set `authorizedResponders` to the approved numeric IDs,
+and add an `intakeDecisions` array in the trusted queue configuration. Each
+entry has a GitHub issue `number`, its reviewed `revision` from the dry-run
+output, and a `decisions` array using the decision template format below.
+This configuration supplies decision options. Issue discovery and approval
+still come from GitHub.
+
+An intake decision resumes the claim in its existing worktree only while
+the issue is approved at the original revision and the saved template still
+matches the local configuration. An edit or a replacement template holds
+that claim even if an authorized reply already exists. A newly approved
+revision does not rerun an existing claim.
 
 Run the intake loop against a disposable bare Git origin with fixture GitHub responses and real Codex workers on Windows.
 
@@ -281,6 +294,39 @@ current base. It reads the PR and base again before reporting. GitHub can
 change after the final read. The coordinator still owns the merge, and
 unattended merges require server-side branch protections.
 
+### Verify browser-dependent issues on the Windows host
+
+Configure a hash-pinned, coordinator-owned script outside the target checkout
+and state directory. The script checks its toolchain and uses exit 0 for a pass,
+10 for a code failure, and 11 for unavailable host tooling. Keep it under a
+trusted path and pass only coordinator-reviewed profiles to it.
+
+```json
+"technicalRecovery": {
+  "limit": 2,
+  "hostVerification": {
+    "runner": { "path": "C:/reviewed/project-checks.mjs", "sha256": "<SHA-256>" },
+    "toolchain": { "node": "C:/pinned/node.exe", "npm": "C:/pinned/npm-cli.js", "chrome": "C:/pinned/chrome.exe" },
+    "profiles": { "full-render-decode": "Rendered and decoded both approved formats." },
+    "issues": [{ "number": 8, "profile": "full-render-decode" }]
+  }
+}
+```
+
+The script receives `orchestratorProfile` and `orchestratorToolchain` as constants. The example in
+`fixtures/host-verifiers/storytelling-render.mjs` checks the pinned Storytelling
+Studio toolchain. The export command retains media and per-run receipts under
+`out/verification/`. The verifier keeps decode logs and its summary under
+`.local/`. Exclude these output paths locally before enabling publication. Each profile description
+is reviewed evidence text for the handoff. Issue text and worker output cannot
+supply a command or choose a host profile. A bound issue gets host verification
+after a worker reports completion or after an environment blocker is recovered.
+If a code repair leaves browser verification to the host, the controller runs
+that check within the repair attempt's remaining time and records its outcome.
+Enable publication for the issue to bind the verification to the scoped Git tree
+and include the verification in the review PR. The original worktree and retry
+budget survive restart.
+
 ### Recover from technical blockers
 
 Add `"technicalRecovery": { "limit": 2 }` to the reviewed queue to let the
@@ -306,7 +352,12 @@ Exit zero means verification passed. Exit 10 means the verifier found a code
 failure that a Codex repair can address. Other exits mean the verification
 environment failed. If a repair reports success and a verifier is configured for that issue,
 the controller runs the verifier again before marking that attempt complete.
-Status shows held recoveries and their reasons.
+Status shows held recoveries and their reasons. After the owner authorizes a
+final host-only verification of an exhausted environment blocker, use
+`--execute --limit 1 --final-host-verification ISSUE:ATTEMPT` with the same
+queue and journal. Find the latest attempt ID with `attempts`. The controller
+requires a reviewed host profile and publication scope, records the extra
+attempt once, and preserves the existing retry history and time budget.
 
 Run the disposable D1-07-inspired acceptance test on Windows:
 
@@ -332,7 +383,7 @@ pending human decisions, and never resets the recovery counter.
 
 Enable issue comments explicitly with `--github-decisions` on a real run. Use a GitHub-backed queue, a signed-in `gh` account with permission to comment on the target issues, and a local list of authorized GitHub account IDs. To find an account ID, run `gh api users/LOGIN --jq .id` and verify the account before adding it.
 
-Add `authorizedResponders` to the queue and add reviewed decisions to the relevant issue entries. The worker can select each reviewed key once. GitHub receives the question, choice labels, and exact reply commands. Choice instructions stay local until the controller sends the chosen instruction to Codex.
+Add `authorizedResponders` to the queue. For a queue with reviewed issue entries, add decisions as shown below. For GitHub issue intake, put the same decision templates in the revision-bound `intakeDecisions` entries. The worker can select each reviewed key once. GitHub receives the question, choice labels, and exact reply commands. Choice instructions stay local until the controller sends the chosen instruction to Codex.
 
 ```json
 {
@@ -364,7 +415,7 @@ npm run start -- --queue queue.local.json --state .\state\github-demo --execute 
 npm run status -- --state .\state\github-demo
 ```
 
-The controller saves the blocked claim and request together, then posts the reviewed question on the issue. Independent tasks can run while the controller waits. From GitHub on mobile or desktop, add a new comment containing exactly one command from the request. The controller records the first matching, unedited reply from an authorized account. Before resuming, it checks the request and reply again against GitHub and the current account allowlist. If the saved reply was deleted, edited, or lost authorization, a newer valid reply can replace it. If GitHub comments are unavailable, the task stays blocked while unrelated eligible work can continue. Each resumption starts a fresh Codex session in the original worktree with all approved choice instructions saved for that task, in request order. The issue must remain ready, approved locally, and eligible under its dependencies. A successful resumption counts toward `--limit`. When the run reaches its poll limit, use the same command and state directory to check for replies again.
+The controller saves the blocked claim and request together, then posts the reviewed question on the issue. Independent tasks can run while the controller waits. From GitHub on mobile or desktop, add a new comment containing exactly one command from the request. The controller records the first matching, unedited reply from an authorized account. Before resuming, it checks the request and reply again against GitHub and the current account allowlist. If the saved reply was deleted, edited, or lost authorization, a newer valid reply can replace it. If GitHub comments are unavailable, the task stays blocked while unrelated eligible work can continue. Each resumption starts a fresh Codex session in the original worktree with all approved choice instructions saved for that task, in request order. The issue must remain ready, retain its applicable approval, and satisfy its dependencies. A successful resumption counts toward `--limit`. When the run reaches its poll limit, use the same command and state directory to check for replies again.
 
 If a comment request times out, the controller checks later polls for the original message from the publishing account. Status shows `delivery-unconfirmed` when that check cannot confirm delivery. If you have inspected the issue and verified that the request was never posted, rearm that request with `node src/cli.js retry-decision REQUEST-ID --state .\state\github-demo`, then run the controller again. It checks for the original comment before posting. Keep the same signed-in publishing account during recovery.
 
