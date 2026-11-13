@@ -110,6 +110,18 @@ The GitHub-backed controller refreshes issue metadata before each dispatch. It u
 
 The controller binds the state directory to the checkout and `sourceRepo`. It records each issue claim in SQLite before creating the worktree or launching Codex. Keep using the same state directory on this machine. A task stays claimed across polls and restarts even if GitHub still shows it as ready. Local claims coordinate controllers that share this state directory. With the default options, GitHub operations are issue-list GET requests.
 
+### Require accepted, integrated prerequisites
+
+For a supervised queue that requires accepted work on the integration branch, add an `acceptedPrerequisites` array. Use an empty array when no prerequisites have been accepted yet. After verifying a prerequisite's checks and integration, record its issue number and the full commit SHA from the integration branch.
+
+```json
+"acceptedPrerequisites": [
+  { "number": 5, "commit": "0123456789abcdef0123456789abcdef01234567" }
+]
+```
+
+Start the controller from a checkout of the reviewed integration branch. The runner verifies that each listed commit is in the exact history used to create new worktrees. Each approved issue in a GitHub-backed queue must specify a reviewed `dependencies` array in this mode. Use `[]` for an issue with no prerequisites. The controller uses this array even when the GitHub issue body has no numeric dependency list. A GitHub issue state or a worker's local result cannot release dependent work in this mode. A receipt also prevents the accepted issue from dispatching again. The coordinator supplies the receipts and is responsible for matching the issue to the correct integrated change. Restart the run after updating the checkout and receipts. A blocked worktree must already contain the accepted prerequisite commits before it can resume. Use a new state directory when first switching an existing queue to this prerequisite policy.
+
 ## Ask for a decision on GitHub
 
 Enable issue comments explicitly with `--github-decisions` on a real run. Use a GitHub-backed queue, a signed-in `gh` account with permission to comment on the target issues, and a local list of authorized GitHub account IDs. To find an account ID, run `gh api users/LOGIN --jq .id` and verify the account before adding it.
