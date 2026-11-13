@@ -598,8 +598,10 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           const task = state.task(number);
           const candidate = issues.find(row => row.number === number && row.state === 'ready');
           const claim = claimsByIssue.get(number);
+          const scope = handoff.issues.get(number);
+          const verifier = technical?.verifierFor(number) ?? technical?.selectProfile?.(number, 'code', scope?.paths)?.read;
           if (!receipt?.linked || !candidate || task?.state !== 'done' || accepted.has(number) ||
-              !handoff.issues.has(number) || !technical?.verifierFor(number) ||
+              !scope || !verifier ||
               (coordinatorId && (!claim || claim.issue_id !== candidate.intake?.issueId ||
                 claim.revision !== candidate.intake?.hash))) continue;
           const authorized = async () => {
@@ -612,7 +614,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           try {
             await repairPull({ state, stateDir, target: repo, repo: handoff.repo, task, receipt,
               entry: handoff.issues.get(number), issue: candidate, reviewers: queue.pullRepair.reviewers ?? [],
-              verifier: technical.verifierFor(number)(), worker, executable, signal, timeoutMs, authorized });
+              verifier: verifier(), worker, executable, signal, timeoutMs, authorized });
           } catch {
             state.set('pullRepairError:' + receipt.pull, 'repair-held');
           }

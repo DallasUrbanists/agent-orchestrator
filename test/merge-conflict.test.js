@@ -79,4 +79,28 @@ test('repairs and verifies a conflict before pushing the same task branch', asyn
   assert.equal(state.get('pullRepair:1'), 'published:'+repaired);
   await repairPull(opts);
   assert.equal(launches,1);
+
+  // A legacy round may have recorded a thread before its worker blocked.
+  const review = { id: 'review-1', path: 'fixture.txt', isResolved: false,
+    comments: { nodes: [{ author: { login: 'reviewer' }, body: 'Correct the fixture.' }] } };
+  pull.headRefOid = repaired;
+  pull.mergeable = 'MERGEABLE';
+  pull.reviewThreads.nodes = [review];
+  git(repo, ['push', 'origin', repaired + ':refs/pull/1/head']);
+  state.clear();
+  state.set('pullRepair:1:rounds', JSON.stringify([{ threads: [review.id], conflict: null }]));
+  let followups = 0;
+  const retry = { ...opts, reviewers: ['reviewer'], verifier: Buffer.from('process.exit(0)'),
+    worker: async ({ cwd, prompt }) => {
+      followups++;
+      assert.match(prompt, /Correct the fixture/);
+      writeFileSync(join(cwd, 'fixture.txt'), 'reviewed fix');
+      return { state: 'done' };
+    } };
+  await repairPull(retry);
+  const reviewed = git(remote, ['rev-parse', 'refs/heads/task']);
+  assert.notEqual(reviewed, repaired);
+  assert.equal(state.get('pullRepair:1:published-thread:' + review.id), reviewed);
+  await repairPull(retry);
+  assert.equal(followups, 1);
 });
