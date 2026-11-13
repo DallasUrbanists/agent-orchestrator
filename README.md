@@ -191,6 +191,29 @@ node src/cli.js acknowledge 1 --state .\state\demo --confirm-process-exited
 
 Worktrees remain available for inspection by default. Use `node src/cli.js cleanup 1 --state .\state\demo` to remove a completed, clean worktree after review. The command refuses modified, untracked, or ignored files and keeps the task branch.
 
+## Back up and recover the journal
+
+Take a snapshot from the existing state directory while the controller is stopped. The command checks SQLite integrity and prints the snapshot path under the state's `backups` directory. Store a separate copy alongside the worktrees and sanitized logs.
+
+```powershell
+node src/cli.js backup --state .\state\github-demo
+```
+
+For recovery, stop the controller and confirm that all its worker processes have exited. Archive the damaged `tasks.sqlite` and any `-wal`, `-shm`, or `-journal` sidecars before restoring. Keep the original state and checkout paths. Backup and restore require a local filesystem that supports hard links, such as NTFS. The restore command refuses to overwrite a journal or its sidecars. A run also refuses to initialize a missing journal when worktrees, logs, or backups already exist.
+
+```powershell
+node src/cli.js restore tasks-<snapshot-id>.sqlite --state .\state\github-demo
+node src/cli.js status --state .\state\github-demo
+```
+
+Restore holds dispatch. Compare the saved claims and decisions with the worktrees, branches, logs, and GitHub state. Reconcile any work or external action that happened after the snapshot, or keep the controller paused if ownership is uncertain. When reconciliation is complete, clear the hold and start the controller.
+
+```powershell
+node src/cli.js unpause --state .\state\github-demo --confirm-reconciled
+```
+
+The snapshot contains the SQLite journal. Preserve worktrees and logs separately. The snapshot does not contain the controller lock or GitHub credentials.
+
 ## Architecture
 
 ```mermaid
