@@ -27,21 +27,22 @@ export function recoveryPolicy(value, repo, stateDir) {
     const base = recoveryPolicy({ verifier: { ...runner, number: 1 } }, repo, stateDir).verifierFor(1);
     const byIssue = new Map();
     for (const row of issues) {
-      const profile = row?.profile;
+      const { profile, resumeImplementation = false } = row ?? {};
       const evidence = typeof profile === 'string' && Object.hasOwn(profiles, profile) ? profiles[profile] : null;
-      if (!Number.isSafeInteger(row?.number) || row.number < 1 || byIssue.has(row.number) ||
+      if (!Number.isSafeInteger(row?.number) || row.number < 1 || byIssue.has(row.number) || typeof resumeImplementation !== 'boolean' ||
           !/^[a-z][a-z0-9-]{0,63}$/.test(profile ?? '') ||
           typeof evidence !== 'string' || !evidence.trim() || evidence.length > 2000) {
         throw new Error('Host verification issue bindings require a unique issue and reviewed profile');
       }
       byIssue.set(row.number, {
-        evidence,
+        evidence, resumeImplementation,
         read: () => Buffer.concat([Buffer.from('const orchestratorProfile = ' + JSON.stringify(profile) +
           ';\nconst orchestratorToolchain = ' + JSON.stringify(toolchain) + ';\n'), base()])
       });
     }
     return { limit, adopt, verifierFor: issue => byIssue.get(issue)?.read,
-      profileEvidence: issue => byIssue.get(issue)?.evidence };
+      profileEvidence: issue => byIssue.get(issue)?.evidence,
+      resumeImplementation: issue => byIssue.get(issue)?.resumeImplementation };
   }
   if (verifier === undefined) return { limit, adopt, verifierFor: () => null };
   if (!Number.isSafeInteger(verifier?.number) || verifier.number < 1 ||

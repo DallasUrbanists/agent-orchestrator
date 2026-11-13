@@ -314,3 +314,34 @@ test('durable recovery budget survives a restart and holds dependents after exha
   assert.equal(read(state => state.recoveryRows()[0].hold), 'recovery-budget-exhausted');
   assert.equal(read(state => state.task(8)), undefined);
 });
+
+test('resumes a pre-implementation environment blocker once in the original worktree and verifies it', async t => {
+  const { queue, stateDir, read } = fixture(t, [
+    "import { readFileSync } from 'node:fs';",
+    "if (readFileSync('implementation.txt', 'utf8') !== 'ready') process.exit(10);",
+    "console.log(JSON.stringify([{name:'fixture-check',measurements:{tests:1}}]));"
+  ].join('\n'));
+  let original;
+  await execute(queue, stateDir, { ...options, limit: 1 }, async ({ cwd }) => {
+    original = cwd;
+    writeFileSync(join(cwd, 'receipt.txt'), 'sandbox tool unavailable');
+    return blocker('environment');
+  });
+  const { verifier: runner } = queue.technicalRecovery;
+  queue.technicalRecovery = { limit: 2, hostVerification: {
+    runner, profiles: { render: 'Verify fixture.' },
+    issues: [{ number: 7, profile: 'render', resumeImplementation: true }]
+  } };
+  const resumed = await execute(queue, stateDir, options, async ({ cwd, prompt }) => {
+    if (prompt.endsWith('Fixture #9')) return { state: 'done' };
+    assert.match(prompt, /Resume implementation/);
+    assert.equal(cwd, original);
+    assert.equal(readFileSync(join(cwd, 'receipt.txt'), 'utf8'), 'sandbox tool unavailable');
+    writeFileSync(join(cwd, 'implementation.txt'), 'ready');
+    return blocker('environment');
+  });
+  assert.deepEqual(resumed.results.map(({ number, detail }) => [number, detail]),
+    [[9, undefined], [7, 'verification-passed']]);
+  assert.equal(read(state => state.task(8)), undefined);
+  assert.deepEqual((await execute(queue, stateDir, options, () => assert.fail('duplicate work'))).results, []);
+});
