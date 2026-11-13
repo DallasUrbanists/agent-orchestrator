@@ -534,3 +534,9 @@ repair worktree and writes events to `state/logs/pull-<number>-repair.jsonl`.
 The journal fences one automatic attempt per PR. A successful repair advances
 the existing branch and includes verification evidence in the commit message.
 Merge approval stays with the coordinator.
+
+For GitHub intake, set `"autoAcceptMerged": true` to let the controller record
+acceptance in its journal after the configured coordinator merges a tracked PR.
+The fetched main history must contain the merge, and the merge tree must match
+the previously verified PR tree exactly. Keep the watched acceptance file for
+existing receipts and for merges that need separate verification.

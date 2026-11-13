@@ -1,3 +1,4 @@
+import { acceptedMerge } from './merged-acceptance.js';
 import { repairPull } from './merge-conflict.js';
 import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, mkdirSync, openSync, realpathSync } from 'node:fs';
@@ -308,7 +309,12 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       return git(repo, ['rev-parse', '--verify', ref + '^{commit}']);
     } : undefined;
     const saved = JSON.parse(state.get('intakeAcceptance') ?? '{}');
-    const loadAcceptance = readAcceptance && watchAcceptance(queue, repo, readAcceptance, refreshMain, saved);
+    const automatic = JSON.parse(state.get('automaticAcceptance') ?? '[]');
+    const receipts = readAcceptance && (() => {
+      const manual = readAcceptance();
+      return [...manual, ...automatic.filter(row => !manual.some(entry => entry.number === row.number))];
+    });
+    const loadAcceptance = receipts && watchAcceptance(queue, repo, receipts, refreshMain, saved);
     if (adoptLocalIntake && state.get('repo') && !state.get('sourceRepo')) {
       if (dispatchHold(state.list(), null)) throw new Error('Stop or reconcile active work before adopting its journal');
       const observation = loadAcceptance();
@@ -389,6 +395,27 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const afterPoll = dispatchHold(previous, state.get('control'));
       if (afterPoll) return { reason: afterPoll, results };
       const { base, accepted } = loadAcceptance ? loadAcceptance() : initial;
+      if (queue.autoAcceptMerged === true && coordinatorId && handoff) {
+        for (const number of handoff.issues.keys()) {
+          if (accepted.has(number) || signal?.aborted) continue;
+          const receipt = state.handoff(number);
+          const task = state.task(number);
+          if (!receipt?.linked || !task) continue;
+          const repair = state.get('pullRepair:' + receipt.pull);
+          const head = repair?.startsWith('published:') ? repair.slice(10) : receipt.commit_sha;
+          try {
+            const commit = acceptedMerge({ target: repo, repo: handoff.repo, base,
+              pull: receipt.pull, head, branch: task.branch, coordinatorId });
+            if (!commit) continue;
+            const updated = [...automatic, { number, commit }];
+            state.set('automaticAcceptance', JSON.stringify(updated));
+            automatic.push({ number, commit });
+            accepted.set(number, commit);
+          } catch {
+            // A missing ref or transient read can be retried on a later poll.
+          }
+        }
+      }
       if (loadAcceptance || saved.base) {
         const observed = JSON.stringify({ base, accepted: [...accepted] });
         if (state.get('intakeAcceptance') !== observed) state.set('intakeAcceptance', observed);
