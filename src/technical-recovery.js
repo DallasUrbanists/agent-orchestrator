@@ -69,15 +69,38 @@ export function recoveryScope(issue) {
   ])).digest('hex');
 }
 
-export async function verifyTechnical({ verifierCode, cwd, signal, timeoutMs, onRecord }) {
+const MAX_EVIDENCE_BYTES = 16 * 1024;
+
+function measuredChecks(output) {
+  const report = JSON.parse(output);
+  if (!Array.isArray(report) || !report.length || report.length > 30 || report.some(check =>
+    typeof check?.name !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(check.name) ||
+    !Object.hasOwn(check, 'measurements') || !check.measurements || typeof check.measurements !== 'object' ||
+    Array.isArray(check.measurements) || !Object.keys(check.measurements).length ||
+    Object.keys(check.measurements).length > 12 ||
+    Object.entries(check.measurements).some(([key, value]) => !/^[a-z][a-z0-9-]{0,39}$/.test(key) ||
+      !(Number.isSafeInteger(value) || (typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)))))) {
+    throw new Error('Invalid measured checks');
+  }
+  if (new Set(report.map(check => check.name)).size !== report.length) throw new Error('Duplicate measured check');
+  return report.map(({ name, measurements }) => '- ' + name + ' — ' +
+    Object.entries(measurements).map(([key, value]) => key + ' ' + value).join(', ')).join('\n');
+}
+
+export async function verifyTechnical({ verifierCode, cwd, signal, timeoutMs, onRecord, collectEvidence = false }) {
   if (signal?.aborted) return { state: 'stopped', detail: 'cancelled-before-launch' };
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
     /^(path|pathext|systemroot|windir|systemdrive|comspec|temp|tmp|tmpdir|home|userprofile|homedrive|homepath|username|userdomain|programdata|appdata|localappdata|lang|lc_all)$/i.test(key)));
   const child = spawn(process.execPath, ['--input-type=module', '-'], {
-    cwd, env, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', 'ignore', 'ignore']
+    cwd, env, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', collectEvidence ? 'pipe' : 'ignore', 'ignore']
   });
   return new Promise(resolve => {
     let stopping, termination, spawnFailed, exited = false;
+    let output = Buffer.alloc(0), oversized = false;
+    child.stdout?.on('data', chunk => {
+      oversized ||= output.length + chunk.length > MAX_EVIDENCE_BYTES;
+      if (!oversized) output = Buffer.concat([output, chunk]);
+    });
     function stop(reason) {
       if (stopping || exited) return;
       stopping = reason;
@@ -106,7 +129,17 @@ export async function verifyTechnical({ verifierCode, cwd, signal, timeoutMs, on
           return resolve({ state: stopping === 'cancelled' ? 'stopped' : 'failed', detail: stopping });
         }
       }
-      if (!stopping && !spawnFailed && code === 0) return resolve({ state: 'done', detail: 'verification-passed' });
+      if (!stopping && !spawnFailed && code === 0) {
+        let evidence;
+        try {
+          if (oversized) throw new Error('Measured checks exceed the output limit');
+          const report = output.toString('utf8').trim();
+          if (report) evidence = measuredChecks(report);
+        } catch {
+          return resolve({ state: 'blocked', detail: 'invalid-verification-evidence' });
+        }
+        return resolve({ state: 'done', detail: 'verification-passed', ...(evidence && { evidence }) });
+      }
       const technicalBlocker = !stopping && !spawnFailed && code === 10 ? 'code' : 'environment';
       resolve({ state: 'blocked', detail: 'verification-' + technicalBlocker + '-failure', code, result: { technicalBlocker } });
     });

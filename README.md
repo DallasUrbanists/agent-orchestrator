@@ -315,7 +315,12 @@ The script receives `orchestratorProfile` and `orchestratorToolchain` as constan
 Studio toolchain. The export command retains media and per-run receipts under
 `out/verification/`. The verifier keeps decode logs and its summary under
 `.local/`. Exclude these output paths locally before enabling publication. Each profile description
-is reviewed evidence text for the handoff. Issue text and worker output cannot
+is reviewed evidence text for the handoff. After a pass, a profile can also write
+one JSON array of measured checks to standard output. Each check has a
+`name` and a `measurements` object containing integers or SHA-256 values.
+Keep human-readable diagnostics in local files. The controller validates this
+array before adding the measured checks to the verified-tree receipt and PR.
+Issue text and worker output cannot
 supply a command or choose a host profile. A bound issue gets host verification
 after a worker reports completion or after an environment blocker is recovered.
 If a code repair leaves browser verification to the host, the controller runs

@@ -533,7 +533,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
             };
             const before = snapshot();
             result = publicationEntry && !before ? { state: 'blocked', detail: 'publication-scope-not-verified' }
-              : await verifyTechnical({ ...execution, verifierCode: bytes,
+              : await verifyTechnical({ ...execution, verifierCode: bytes, collectEvidence: Boolean(profileEvidence),
                 timeoutMs: Math.max(1, execution.timeoutMs - (Date.now() - Date.parse(state.task(issue.number).started))) });
             if (result.state === 'done' && before) {
               const after = snapshot();
@@ -541,7 +541,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
                 verification = { repo: handoff.repo, ...before,
                   evidence: 'Approved verification runner exited successfully. Journal attempt ' + attempt + '.\n' +
                     'Verifier SHA-256: ' + createHash('sha256').update(bytes).digest('hex') + '.\n' +
-                    'Verified tree: ' + before.tree + '.' + (profileEvidence ? '\n\n' + profileEvidence : '') };
+                    'Verified tree: ' + before.tree + '.' + (profileEvidence ? '\n\n' + profileEvidence : '') +
+                    (result.evidence ? '\n\n### Measured checks\n\n' + result.evidence : '') };
               } else result = { state: 'blocked', detail: 'verified-worktree-changed-during-verification' };
             }
           }

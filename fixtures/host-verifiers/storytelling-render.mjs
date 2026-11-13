@@ -137,7 +137,21 @@ async function main() {
 
 try {
   await main();
+  const measurements = [];
+  for (const variant of ['portrait', 'landscape']) {
+    const { width, height, frames, sha256, representativeFrameHashes } = report[variant];
+    measurements.push({ name: variant, measurements: { width, height, frames, fps: 30, sha256 } });
+    measurements.push({ name: variant + '-decoded-samples', measurements: Object.fromEntries(
+      representativeFrameHashes.map(frame => ['frame-' + frame.frame, frame.sha256])
+    ) });
+  }
+  measurements.push({ name: 'diagnostic-pngs', measurements: { frames: 5 } });
+  measurements.push({ name: 'invalid-frame-rejected', measurements: { frame: 300 } });
+  measurements.push({ name: 'local-receipts', measurements: Object.fromEntries(
+    report.runs.map(run => [run.name, run.receiptSha256])
+  ) });
   report.outcome = 'passed';
+  process.stdout.write(JSON.stringify(measurements));
 } catch (error) {
   report.outcome = phase === 'environment' || error.environment ? 'environment-failure' : 'code-failure';
   report.detail = error.message;
