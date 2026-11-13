@@ -361,8 +361,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     const logDir = join(stateDir, 'logs');
     mkdirSync(logDir, { recursive: true });
     if (relative(realpathSync(logDir), logDir) !== '') throw new Error('Log directory redirects elsewhere');
-    const holdDispatch = (rows = state.list()) => dispatchHold(
-      rows.filter(row => row.state !== 'running' || !active.has(row.number)), state.get('control'));
+    const holdDispatch = () => dispatchHold(
+      state.list().filter(row => row.state !== 'running' || !active.has(row.number)), state.get('control'));
     const publishTask = number => exclusive(() => publishTaskNow(number));
     async function publishTaskNow(number) {
       if (!handoff?.issues.has(number) || state.task(number)?.state !== 'done' ||
@@ -404,7 +404,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       if (idlePolls) await publisher?.all();
       if (signal?.aborted) return { reason: 'stopped', results };
       const previous = state.list();
-      const hold = holdDispatch(previous);
+      const hold = holdDispatch();
       if (hold) return { reason: hold, results };
       let issues;
       try {
@@ -413,13 +413,13 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       } catch (error) {
         if (!sourceRepo || error.transient !== true || pollFailures >= issueRetryDelays.length) throw error;
         if (signal?.aborted) return { reason: 'stopped', results };
-        const retryHold = holdDispatch(previous);
+        const retryHold = holdDispatch();
         if (retryHold) return { reason: retryHold, results };
         await waitForIssueRetry(issueRetryDelays[pollFailures++], undefined, { signal });
         continue;
       }
       if (signal?.aborted) return { reason: 'stopped', results };
-      const afterPoll = holdDispatch(previous);
+      const afterPoll = holdDispatch();
       if (afterPoll) return { reason: afterPoll, results };
       const { base, accepted } = loadAcceptance ? loadAcceptance() : initial;
       if (queue.autoAcceptMerged === true && coordinatorId && handoff) {
@@ -483,13 +483,13 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           state.decisionError(row.id, 'intake-decision-scope-no-longer-approved');
           return false;
         };
-        const canContinue = () => !signal?.aborted && !holdDispatch(previous);
+        const canContinue = () => !signal?.aborted && !holdDispatch();
         const pending = state.pendingDecisions().filter(approved);
         const verified = await syncDecisions(state, sourceRepo, pending, {
           api: decisionApi, responders, signal, canContinue
         });
         if (signal?.aborted) return { reason: 'stopped', results };
-        const afterDecisions = holdDispatch(previous);
+        const afterDecisions = holdDispatch();
         if (afterDecisions) return { reason: afterDecisions, results };
         for (const row of state.pendingDecisions().filter(approved)) {
           if (verified.has(row.id) && !unavailable.has(row.id)) answers.set(row.number, row);
