@@ -18,6 +18,9 @@ export function publicationPolicy(config) {
     if (!id(entry?.number) || issues.has(entry.number) || !Array.isArray(entry.paths) || !entry.paths.length ||
         entry.paths.some(path => typeof path !== 'string' || !scopePath.test(path) || reserved.test(path) ||
           path.split('/').some(part => part === '.' || part === '..'))) throw new Error('Invalid publication issue scope');
+    if (entry.closesIssue !== undefined && typeof entry.closesIssue !== 'boolean') {
+      throw new Error('Publication closesIssue must be a boolean');
+    }
     if (entry.verified !== undefined && (!oid(entry.verified?.base) || !oid(entry.verified?.tree) ||
         typeof entry.verified.summary !== 'string' || !entry.verified.summary.trim() || entry.verified.summary.length > 3000)) {
       throw new Error('Saved verification requires a base, tree, and reviewed summary');
@@ -190,7 +193,7 @@ export async function publishVerified({ state, stateDir, target, policy, number,
 
   if (signal?.aborted || ['pause', 'stop'].includes(state.get('control'))) return null;
   const notice = marker(number, commit);
-  const evidenceBody = [notice, 'Related issue: #' + number, '', 'Verified commit: ' + commit, '',
+  const evidenceBody = [notice, (entry.closesIssue === true ? 'Closes #' : 'Related issue: #') + number, '', 'Verified commit: ' + commit, '',
     '## Verification evidence', '', evidence].join('\n');
   const matches = (await api.pulls(repo, task.branch, options)).filter(pull =>
     pull.head?.ref === task.branch && pull.head?.repo?.full_name?.toLowerCase() === repo &&
