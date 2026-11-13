@@ -265,6 +265,9 @@ add `verified` to its reviewed scope with `base` (the original commit),
 journal. The `captureVerifiedTree` helper calculates the candidate tree ID
 from the recorded worktree claim and base using a temporary Git index.
 Compare the captured tree with the work you verified before authorizing publication.
+For GitHub intake, the issue must still be approved at the revision recorded in
+its claim. An issue edit or removed approval holds publication, including after
+restart. A fresh approval for a different revision leaves the original claim held.
 
 The controller saves the verified tree and commit before pushing the task
 branch. It looks up the matching PR before creating one and records the issue

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { execute } from '../src/controller.js';
-import { captureVerifiedTree } from '../src/publication.js';
+import { captureVerifiedTree, publicationPolicy, publishVerified } from '../src/publication.js';
 import { State } from '../src/state.js';
 import { git } from '../src/worktrees.js';
 
@@ -57,9 +57,9 @@ function fixture(t) {
       return posted;
     }
   };
-  const executeWith = (worker, overrides) => execute(queue, stateDir, { ...options, ...overrides,
-    publishOptions: { api, push: async (_cwd, _branch, commit) => pushes.add(commit) } }, worker);
-  return { root, queue, stateDir, target, base, inspect, pulls, comments, pushes, executeWith,
+  const publishOptions = { api, push: async (_cwd, _branch, commit) => pushes.add(commit) };
+  const executeWith = (worker, overrides) => execute(queue, stateDir, { ...options, ...overrides, publishOptions }, worker);
+  return { root, queue, stateDir, target, base, inspect, pulls, comments, pushes, executeWith, publishOptions,
     loseCreate() { loseCreate = true; }, loseComment() { loseComment = true; } };
 }
 
@@ -100,6 +100,39 @@ test('publishes a saved verified task without reimplementation and reconciles lo
   });
   assert.deepEqual(resumed.results.map(row => row.number), [8]);
   assert.equal(f.pulls.length, 1);
+});
+
+test('checks the claimed approval before publication and again after a push', async t => {
+  const f = fixture(t);
+  await f.executeWith(async ({ cwd }) => {
+    writeFileSync(join(cwd, 'renderer.txt'), 'verified');
+    return { state: 'done' };
+  });
+  const task = f.inspect(state => state.task(7));
+  const { tree } = captureVerifiedTree(f.target, f.stateDir, task, ['renderer.txt'], f.base);
+  const policy = publicationPolicy({ repo, issues: [{ number: 7, paths: ['renderer.txt'],
+    verified: { base: f.base, tree, summary: 'Verified disposable task.' } }] });
+  const state = new State(f.stateDir);
+  const publish = authorize => publishVerified({ state, stateDir: f.stateDir, target: f.target, policy,
+    number: 7, ...f.publishOptions, authorize });
+
+  try {
+    await assert.rejects(publish(async () => false), /original approved intake revision/);
+    assert.equal(state.handoff(7), undefined);
+    assert.equal(f.pushes.size, 0);
+
+    await assert.rejects(publish(async () => f.pushes.size === 0), /original approved intake revision/);
+    assert.equal(f.pushes.size, 1);
+    assert.equal(f.pulls.length, 0);
+    assert.equal(f.comments.length, 0);
+    const commit = state.handoff(7).commit_sha;
+
+    await publish(async () => true);
+    assert.equal(state.handoff(7).linked, 1);
+    assert.deepEqual([...f.pushes], [commit]);
+    assert.equal(f.pulls.length, 1);
+    assert.equal(f.comments.length, 1);
+  } finally { state.close(); }
 });
 
 test('automatically verifies and publishes a recovered task, without releasing its dependent', async t => {
