@@ -222,7 +222,8 @@ For environment blockers, also add `verifier` inside `technicalRecovery`.
 Set `number` to the issue the runner verifies. Set `path` to an absolute path to an operator-reviewed standalone Node module
 outside the target and state directories. Set `sha256` to the lowercase hash
 returned by `Get-FileHash -Algorithm SHA256`. The controller verifies the bytes
-and supplies them directly to Node. The verifier runs on the controller host
+and supplies them directly to Node. A missing, unreadable, or changed runner
+holds its issue before spending a recovery attempt. Other eligible work continues. The verifier runs on the controller host
 with the preserved worktree as its working directory and a filtered
 environment. It has the host account's filesystem permissions, so approve only
 trusted verification code and the tools it invokes. Keep worker-provided

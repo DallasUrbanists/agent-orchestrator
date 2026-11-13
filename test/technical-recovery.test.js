@@ -120,10 +120,31 @@ test('an issue-specific verifier cannot complete another issue with the same blo
   assert.equal(read(state => state.task(8)), undefined);
 });
 
-test('a changed verifier fails closed before dispatch', async t => {
-  const { queue, stateDir } = fixture(t, 'process.exit(0);');
-  writeFileSync(queue.technicalRecovery.verifier.path, 'process.exit(10);');
-  await assert.rejects(execute(queue, stateDir, options, () => assert.fail('worker launched')), /changed after approval/);
+test('a missing or changed verifier holds one issue without spending its retry or stopping the queue', async t => {
+  const approved = 'process.exit(0);';
+  const { queue, stateDir, read } = fixture(t, approved);
+  const { path } = queue.technicalRecovery.verifier;
+  rmSync(path);
+  const runs = [];
+  const first = await execute(queue, stateDir, options, async ({ prompt }) => {
+    const number = Number(/Fixture #(\d+)/.exec(prompt)[1]);
+    runs.push(number);
+    return number === 7 ? blocker('environment') : { state: 'done' };
+  });
+  assert.deepEqual(first.results.map(row => row.number), [7, 9]);
+  assert.deepEqual(runs, [7, 9]);
+  const hold = () => read(state => state.recoveryRows()[0]);
+  assert.equal(hold().used, 0);
+  assert.equal(hold().hold, 'verification-runner-unavailable');
+  writeFileSync(path, 'process.exit(10);');
+  await execute(queue, stateDir, options, () => assert.fail('unexpected worker'));
+  assert.equal(hold().used, 0);
+  assert.equal(hold().hold, 'verification-runner-unavailable');
+  writeFileSync(path, approved);
+  const recovery = await execute(queue, stateDir, options, () => assert.fail('environment blocker used Codex'));
+  assert.deepEqual(recovery.results.map(row => [row.number, row.state]), [[7, 'done']]);
+  assert.equal(hold().used, 1);
+  assert.equal(read(state => state.task(8)), undefined);
 });
 
 test('recovery retains a prerequisite completed in the issue snapshot', async t => {

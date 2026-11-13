@@ -20,17 +20,20 @@ export function recoveryPolicy(value, repo, stateDir) {
   if (!Number.isSafeInteger(verifier?.number) || verifier.number < 1 ||
       typeof verifier.path !== 'string' || !isAbsolute(verifier.path) ||
       !/^[a-f0-9]{64}$/.test(verifier.sha256 ?? '')) throw new Error('Verification runner requires an issue number, absolute path, and SHA-256');
-  const path = realpathSync(verifier.path);
+  const { number, path, sha256 } = verifier;
   if (inside(repo, path) || inside(stateDir, path)) throw new Error('Keep the approved verifier outside the target and state');
   const read = () => {
-    const code = readFileSync(path);
-    if (createHash('sha256').update(code).digest('hex') !== verifier.sha256) {
+    const resolved = realpathSync(path);
+    if (inside(repo, resolved) || inside(stateDir, resolved)) {
+      throw new Error('Approved verification runner redirects into the target or state');
+    }
+    const code = readFileSync(resolved);
+    if (createHash('sha256').update(code).digest('hex') !== sha256) {
       throw new Error('Verification runner changed after approval');
     }
     return code;
   };
-  read();
-  return { limit, adopt, verifierFor: number => number === verifier.number ? read : null };
+  return { limit, adopt, verifierFor: issue => issue === number ? read : null };
 }
 
 export function recoveryScope(issue) {
@@ -39,9 +42,8 @@ export function recoveryScope(issue) {
   ])).digest('hex');
 }
 
-export async function verifyTechnical({ readVerifier, cwd, signal, timeoutMs, onRecord }) {
+export async function verifyTechnical({ verifierCode, cwd, signal, timeoutMs, onRecord }) {
   if (signal?.aborted) return { state: 'stopped', detail: 'cancelled-before-launch' };
-  const code = readVerifier();
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
     /^(path|pathext|systemroot|windir|systemdrive|comspec|temp|tmp|tmpdir|home|userprofile|homedrive|homepath|username|userdomain|programdata|appdata|localappdata|lang|lc_all)$/i.test(key)));
   const child = spawn(process.execPath, ['--input-type=module', '-'], {
@@ -65,7 +67,7 @@ export async function verifyTechnical({ readVerifier, cwd, signal, timeoutMs, on
       try {
         if (stopping) return child.stdin.end();
         onRecord({ type: 'worker-started', pid: child.pid });
-        child.stdin.end(code);
+        child.stdin.end(verifierCode);
       } catch { stop('recording-failed'); }
     });
     child.once('close', async code => {

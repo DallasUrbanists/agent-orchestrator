@@ -57,7 +57,8 @@ function commentBody(attempt, marker, repo, pull, now, recoveryHold) {
   return ['<!-- agent-orchestrator-progress:' + marker + ' -->', '**Agent Orchestrator · attempt ' + attempt.id + '**',
     '', outcome,
     recoveryHold === 'recovery-budget-exhausted' ? 'Automatic recovery budget exhausted.' :
-      recoveryHold === 'verification-runner-required' ? 'An approved verification runner is required.' : null,
+      recoveryHold === 'verification-runner-required' ? 'An approved verification runner is required.' :
+      recoveryHold === 'verification-runner-unavailable' ? 'The approved verification runner is unavailable or has changed.' : null,
     '', 'Elapsed: ' + Math.floor(duration / 60) + 'm ' + duration % 60 + 's.',
     last, quiet, attempt.summary, pull && 'Pull request: ' + pullUrl(repo, pull)].filter(line => line != null).join('\n');
 }

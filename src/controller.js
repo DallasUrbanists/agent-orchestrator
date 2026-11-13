@@ -312,9 +312,9 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         }
         for (const row of state.recoveryRows()) {
           const verifier = technical.verifierFor(row.number);
-          if ((row.hold && !(row.hold === 'verification-runner-required' && verifier)) ||
+          const retryableHold = row.hold === 'verification-runner-required' || row.hold === 'verification-runner-unavailable';
+          if ((row.hold && !retryableHold) ||
               state.task(row.number)?.state !== 'blocked') continue;
-          if (row.hold) state.holdRecovery(row.number, null);
           const candidate = candidates.get(row.number);
           if (!candidate) continue;
           if (recoveryScope(candidate) !== row.scope) {
@@ -324,7 +324,16 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           } else if (row.kind === 'environment' && !verifier) {
             state.holdRecovery(row.number, 'verification-runner-required');
           } else {
-            recovery.set(row.number, row);
+            let verifierCode;
+            if (verifier) {
+              try { verifierCode = verifier(); }
+              catch {
+                state.holdRecovery(row.number, 'verification-runner-unavailable');
+                continue;
+              }
+            }
+            if (row.hold) state.holdRecovery(row.number, null);
+            recovery.set(row.number, { ...row, verifierCode });
           }
         }
       }
@@ -344,7 +353,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const answer = answers.get(issue.number);
       const retry = recovery.get(issue.number);
       const verifying = retry?.kind === 'environment';
-      const readVerifier = technical?.verifierFor(issue.number);
+      const verifierCode = retry?.verifierCode;
       const continuing = answer || retry;
       const claim = continuing && state.task(issue.number);
       if (continuing) {
@@ -423,11 +432,11 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         if (signal?.aborted || state.get('control') === 'stop') abort();
         const remaining = technical ? Math.max(1, ACTIVE_BUDGET_MS - state.activeMillis(issue.number)) : timeoutMs;
         const execution = { cwd: location.path, timeoutMs: Math.min(timeoutMs, remaining), signal: cancel.signal, onRecord: record };
-        result = verifying ? await verifyTechnical({ ...execution, readVerifier })
+        result = verifying ? await verifyTechnical({ ...execution, verifierCode })
           : await worker({ ...execution, executable, model: issue.model, reasoning: issue.reasoning,
             prompt: workerPrompt(issue, templates, approvedChoices, Boolean(retry), Boolean(technical)) });
-        if (retry?.kind === 'code' && result.state === 'done' && readVerifier) {
-          result = await verifyTechnical({ ...execution, readVerifier,
+        if (retry?.kind === 'code' && result.state === 'done' && verifierCode) {
+          result = await verifyTechnical({ ...execution, verifierCode,
             timeoutMs: Math.max(1, execution.timeoutMs - (Date.now() - Date.parse(state.task(issue.number).started))) });
         }
       } catch {
@@ -455,7 +464,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       state.finish(issue.number, attempt, result, request, nextRecovery);
       if (nextRecovery && ((retry ? retry.used + 1 : 0) >= technical.limit || state.activeMillis(issue.number) >= ACTIVE_BUDGET_MS)) {
         state.holdRecovery(issue.number, 'recovery-budget-exhausted');
-      } else if (nextRecovery?.kind === 'environment' && !readVerifier) {
+      } else if (nextRecovery?.kind === 'environment' && !technical.verifierFor(issue.number)) {
         state.holdRecovery(issue.number, 'verification-runner-required');
       }
       await publication;
