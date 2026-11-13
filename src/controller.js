@@ -498,7 +498,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       if (dispatched >= limit) break;
       const previous = state.list();
       const claimedIds = new Set(claims.map(claim => claim.issue_id));
-      const dispatchable = issues.filter(issue => !claimedIds.has(issue.intake?.issueId) || answers.has(issue.number));
+      const dispatchable = issues.filter(issue => !active.has(issue.number) && (!claimedIds.has(issue.intake?.issueId) || answers.has(issue.number)));
       const independent = finalHostVerification ? [] : runnable(dispatchable, previous, sourceRepo, new Set(answers.keys()), accepted);
       const recovery = new Map();
       if (technical && !independent.length) {
@@ -520,7 +520,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
             state.attempts().filter(attempt => attempt.number === row.number).at(-1)?.id === assignment.afterAttempt &&
             !state.get('blocker-task:' + row.number) ? assignment : null;
           if ((finalHostVerification && !final) || (row.hold && !retryableHold && !final && !blocker) ||
-              state.task(row.number)?.state !== 'blocked') continue;
+              (active.has(row.number) || state.task(row.number)?.state !== 'blocked')) continue;
           const candidate = candidates.get(row.number);
           if (!candidate) continue;
           if (coordinatorId && !claimsByIssue.has(row.number)) continue;
