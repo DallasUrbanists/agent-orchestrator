@@ -47,13 +47,13 @@ function assertWorktree(target, stateDir, task) {
   return path;
 }
 
-function permitted(path, scope) {
+export function permitted(path, scope) {
   return !reserved.test(path) && !/[\0-\x1f\x7f\\:]/.test(path) &&
     path.split('/').every(part => part && part !== '.' && part !== '..') &&
     scope.some(entry => entry.endsWith('/') ? path.startsWith(entry) : path === entry);
 }
 
-function assertRegularPath(cwd, path) {
+export function assertRegularPath(cwd, path) {
   const file = join(cwd, path);
   try {
     if (!lstatSync(file).isFile() || relative(file, realpathSync(file))) {

@@ -224,6 +224,12 @@ async function main() {
       if (!values['confirm-process-exited']) throw new Error('Verify the process tree exited and pass --confirm-process-exited');
       state.recover();
       const number = Number(argument);
+      const repair = JSON.parse(state.get('activePullRepair') || 'null');
+      if (repair?.pull === number) {
+        assertWorkerPidAbsent(repair.pid ?? null);
+        state.set('activePullRepair', '');
+        return print({ acknowledgedRepair: number });
+      }
       const task = state.task(number);
       if (task?.state === 'interrupted') assertWorkerPidAbsent(task.pid);
       state.acknowledge(number);
