@@ -9,6 +9,7 @@ import { pollGithubIssues } from './github.js';
 import { plan } from './scheduler.js';
 import { lease, State, stateDirectory } from './state.js';
 import { removeCleanWorktree } from './worktrees.js';
+import { assertWorkerPidAbsent } from './recovery.js';
 
 function print(value) { console.log(JSON.stringify(value, null, 2)); }
 
@@ -119,7 +120,10 @@ async function main() {
     if (command === 'acknowledge') {
       if (!values['confirm-process-exited']) throw new Error('Verify the process tree exited and pass --confirm-process-exited');
       state.recover();
-      state.acknowledge(Number(argument));
+      const number = Number(argument);
+      const task = state.task(number);
+      if (task?.state === 'interrupted') assertWorkerPidAbsent(task.pid);
+      state.acknowledge(number);
       return print({ acknowledged: Number(argument) });
     }
     if (command === 'cleanup') {
