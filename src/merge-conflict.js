@@ -72,16 +72,20 @@ export async function repairPull({ state, stateDir, target, repo, task, receipt,
     await publish(JSON.parse(pending.slice(9)));
     return;
   }
+  const attemptsKey = key + ':rounds';
+  const rounds = JSON.parse(state.get(attemptsKey) || '[]');
+  const attempted = new Set(rounds.flatMap(round => round.threads));
   const inScope = path => permitted(path, entry.paths);
-  const notes = pull.reviewThreads.nodes.filter(thread => !thread.isResolved && inScope(thread.path) &&
+  const notes = pull.reviewThreads.nodes.filter(thread => !thread.isResolved && !attempted.has(thread.id) && inScope(thread.path) &&
     reviewers.includes(thread.comments.nodes[0]?.author?.login));
   if (!notes.length && pull.mergeable !== 'CONFLICTING') return;
-  if (pending || !(await authorized()) || signal?.aborted) return;
+  if ((pending && !pending.startsWith('published:')) || rounds.length >= 2 || !(await authorized()) || signal?.aborted) return;
   checkOrigin(target, repo);
   git(target, ['fetch','--no-tags','origin','refs/heads/main','refs/pull/'+receipt.pull+'/head']);
   git(target, ['merge-base','--is-ancestor',receipt.commit_sha,pull.headRefOid]);
   const conflict = hasMergeConflict(target, pull.headRefOid, pull.baseRefOid);
-  if (!conflict && !notes.length) return;
+  const conflictPair = conflict ? pull.headRefOid + ':' + pull.baseRefOid : null;
+  if (!notes.length && (!conflict || rounds.some(round => round.conflict === conflictPair))) return;
   const cwd = mkdtempSync(join(stateDir, 'pull-repair-'));
   async function trackProcess(run) {
     state.set('activePullRepair', JSON.stringify({ pull: receipt.pull, cwd }));
@@ -118,7 +122,7 @@ export async function repairPull({ state, stateDir, target, repo, task, receipt,
       if (!paths.length || paths.some(path => !path || !inScope(path))) throw error;
     }
   }
-  state.set(key, 'started:' + pull.headRefOid);
+  state.set(attemptsKey, JSON.stringify([...rounds, { threads: notes.map(thread => thread.id), conflict: conflictPair }]));
   const outcome = await trackProcess(signal => worker({cwd,executable,model:issue.model,reasoning:issue.reasoning,signal,timeoutMs,onRecord:record,
     prompt: ['Repair this open PR within its approved paths: '+entry.paths.join(', '),
       'Preserve both sides of a conflict. Edit files only. Do not stage, commit, push, or modify Git metadata.',
