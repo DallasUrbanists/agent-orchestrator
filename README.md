@@ -188,6 +188,27 @@ node --test test/intake.test.js
 Remove-Item Env:ORCHESTRATOR_LIVE_INTAKE
 ```
 
+### Publish issue status and worker progress
+
+Use `--github-status` on a real run with a GitHub-backed queue to enable status updates. Sign in to `gh` as the publisher with issue write access and pull request read access. Create the `in-progress`, `in-review`, and `blocked` labels before enabling this option. The controller manages those three labels and preserves all others.
+
+A confirmed worker launch sets `in-progress` and creates one comment for that attempt. The controller edits it every five minutes during the attempt and on exit. It includes elapsed time, the last event observed, and a short description of that event when available. Raw worker text, command output, and credentials stay out of the comment. A quiet update reports the lack of observed activity. If a decision resumes a task, the new worker attempt gets its own comment.
+
+A task that needs intervention gets `blocked`. Local completion clears `in-progress` and records that a PR handoff is pending. The controller discovers a matching open PR from the recorded worktree branch into the same repository's `main` on the next reconciliation. It sets `in-review` and edits the last attempt comment to link the PR. To record the handoff immediately with the controller stopped, run:
+
+```powershell
+node src/cli.js handoff 12 --pr 34 --state .\state\intake-demo
+```
+
+The same state directory preserves progress comment IDs across restarts. Start with `--github-status` again or reconcile existing claims without dispatch:
+
+```powershell
+node src/cli.js sync-status --state .\state\intake-demo
+node src/cli.js sync-status 12 --state .\state\intake-demo
+```
+
+Reconciliation retries label and comment edits and looks for an existing comment by its attempt marker and publisher account. If GitHub rejects a create request, the controller can retry. If the response is lost and GitHub has yet to show the comment, the controller reports unconfirmed delivery and keeps looking on later polls. It does not blindly post a second comment. A missing local claim leaves the issue alone. Keep GitHub credentials in the controller's `gh` context.
+
 ## Ask for a decision on GitHub
 
 Enable issue comments explicitly with `--github-decisions` on a real run. Use a GitHub-backed queue, a signed-in `gh` account with permission to comment on the target issues, and a local list of authorized GitHub account IDs. To find an account ID, run `gh api users/LOGIN --jq .id` and verify the account before adding it.

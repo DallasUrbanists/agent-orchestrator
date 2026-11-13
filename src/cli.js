@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { findCodex, MODELS } from './codex.js';
 import { execute, preview } from './controller.js';
+import { recordHandoff, statusPublisher } from './issue-status.js';
 import { pollGithubIssues } from './github.js';
 import { plan } from './scheduler.js';
 import { hasJournal, lease, State, stateDirectory } from './state.js';
@@ -28,6 +29,7 @@ async function main() {
       repo: { type: 'string' }, polls: { type: 'string', default: '1' },
       'interval-seconds': { type: 'string', default: '15' },
       execute: { type: 'boolean' }, 'github-decisions': { type: 'boolean' },
+      'github-status': { type: 'boolean' }, pr: { type: 'string' },
       limit: { type: 'string', default: '1' },
       'timeout-seconds': { type: 'string', default: '900' },
       'confirm-process-exited': { type: 'boolean' }, 'confirm-reconciled': { type: 'boolean' }, help: { type: 'boolean' }
@@ -35,7 +37,8 @@ async function main() {
   });
   const [command = 'run', argument, ...extra] = positionals;
   if (values.help) {
-    console.log('Commands: run | poll | doctor | status | attempts | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID | backup | restore FILE');
+    console.log('Commands: run | poll | doctor | status | attempts | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID | backup | restore FILE | sync-status [N] | handoff N --pr N');
+    console.log('Opt in to status labels and progress comments with run --execute --github-status.');
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
     console.log('For GitHub intake, configure githubIntake.coordinatorId in the queue file.');
     console.log('Watch supervised merges with run --execute --queue FILE --watch-acceptance FILE --polls N.');
@@ -43,7 +46,9 @@ async function main() {
     console.log('Opt in to decision comments with run --execute --github-decisions and a reviewed GitHub queue.');
     return;
   }
-  const withNumber = ['acknowledge', 'cleanup'].includes(command);
+  const publish = command === 'sync-status' || command === 'handoff';
+  const withNumber = ['acknowledge', 'cleanup', 'handoff'].includes(command) ||
+    (command === 'sync-status' && argument !== undefined);
   const retryDecision = command === 'retry-decision';
   const validArgument = withNumber ? /^[1-9]\d*$/.test(argument ?? '') && Number.isSafeInteger(Number(argument))
     : retryDecision ? /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(argument ?? '')
@@ -52,6 +57,12 @@ async function main() {
     throw new Error('Unexpected command arguments. Use --help');
   }
 
+  if (values['github-status'] && (command !== 'run' || !values.execute)) {
+    throw new Error('--github-status requires a real run with --execute');
+  }
+  if (command === 'handoff' ? !/^[1-9]\d*$/.test(values.pr ?? '') || !Number.isSafeInteger(Number(values.pr)) : values.pr !== undefined) {
+    throw new Error('Only handoff accepts and requires --pr N');
+  }
   if (values['github-decisions'] && (command !== 'run' || !values.execute)) {
     throw new Error('--github-decisions requires a real run with --execute');
   }
@@ -91,7 +102,8 @@ async function main() {
     try {
       const result = await execute(data, resolve(values.state), {
         executable, limit: Number(values.limit), timeoutMs: 1000 * Number(values['timeout-seconds']),
-        signal: abort.signal, decisionsEnabled: values['github-decisions'], readAcceptance, acceptancePath, ...polling
+        signal: abort.signal, decisionsEnabled: values['github-decisions'], publishStatus: values['github-status'],
+        readAcceptance, acceptancePath, ...polling
       });
       print(result);
       if (['interrupted-worker-needs-review', 'restored-state-needs-reconciliation'].includes(result.reason) ||
@@ -110,7 +122,7 @@ async function main() {
       : { restored: restoreJournal(stateDir, argument), control: 'pause', reconciliationRequired: true });
   }
 
-  if (!['status', 'attempts', 'pause', 'stop', 'unpause', 'acknowledge', 'cleanup', 'retry-decision'].includes(command)) {
+  if (!['status', 'attempts', 'pause', 'stop', 'unpause', 'acknowledge', 'cleanup', 'retry-decision', 'sync-status', 'handoff'].includes(command)) {
     throw new Error('Unknown command. Use --help');
   }
   const path = resolve(values.state);
@@ -118,21 +130,50 @@ async function main() {
   if (command === 'status' && !hasJournal(path)) {
     return print({ control: 'running', tasks: [] });
   }
+  if (publish && !hasJournal(path)) throw new Error('Status publishing requires an existing state journal');
   const stateDir = stateDirectory(path);
-  const release = withNumber || retryDecision || (command === 'unpause' && values['confirm-reconciled'])
+  const release = withNumber || retryDecision || publish || (command === 'unpause' && values['confirm-reconciled'])
     ? lease(stateDir) : () => {};
   let state;
   try {
     state = new State(stateDir);
+    if (publish) {
+      const sourceRepo = state.get('sourceRepo');
+      if (!sourceRepo || state.get('restoreHold') === 'true') {
+        throw new Error('Status publishing requires reconciled GitHub-backed state');
+      }
+      const number = Number(argument);
+      if (argument !== undefined && !state.task(number)) {
+        if (command === 'handoff') throw new Error('Handoff requires an existing task');
+        return print({ number, status: 'unclaimed' });
+      }
+      state.recover();
+      const publisher = statusPublisher(state, sourceRepo);
+      if (command === 'handoff') await recordHandoff(state, sourceRepo, number, Number(values.pr));
+      if (argument === undefined) await publisher.all();
+      else await publisher.sync(number);
+      const updates = state.githubStatusRows().filter(row => argument === undefined || row.number === number);
+      const progress = state.list().filter(row => argument === undefined || row.number === number)
+        .flatMap(row => state.githubProgress(row.number).map(({ id, comment, publication_error }) =>
+          ({ attempt: id, comment, error: publication_error })));
+      if (updates.some(row => row.error) || progress.some(row => row.error)) process.exitCode = 1;
+      return print({ updates, progress });
+    }
     if (command === 'status') {
       const sourceRepo = state.get('sourceRepo');
       const decisions = state.decisionStatus();
       const intakeClaims = state.intakeClaims();
+      const githubUpdates = state.githubStatusRows();
       return print({ control: state.get('control') ?? 'running', ...(sourceRepo && { sourceRepo }),
-        tasks: state.list(), ...(decisions.length && { decisions }), ...(intakeClaims.length && { intakeClaims }),
+        tasks: state.list(), ...(decisions.length && { decisions }), ...(intakeClaims.length && { intakeClaims }), ...(githubUpdates.length && { githubUpdates }),
         ...(state.get('restoreHold') === 'true' && { reconciliationRequired: true }) });
     }
-    if (command === 'attempts') return print({ attempts: state.attempts() });
+    if (command === 'attempts') {
+      const progress = state.list().flatMap(row => state.githubProgress(row.number)
+        .filter(attempt => attempt.comment || attempt.publication_error)
+        .map(({ id, comment, publication_error }) => ({ attempt: id, comment, error: publication_error })));
+      return print({ attempts: state.attempts(), ...(progress.length && { progress }) });
+    }
     if (retryDecision) {
       state.retryDecision(argument);
       return print({ decision: argument, delivery: 'queued-for-reconciliation' });
