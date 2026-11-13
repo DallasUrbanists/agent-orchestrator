@@ -494,14 +494,19 @@ export async function execute(queue, statePath, options, worker = runCodex) {
             row.kind === 'environment' && row.hold === 'recovery-budget-exhausted' &&
             state.attempts().filter(attempt => attempt.number === row.number).at(-1)?.id === finalHostVerification.afterAttempt &&
             !state.get('final-host-verification:' + row.number);
-          if ((finalHostVerification && !final) || (row.hold && !retryableHold && !final) ||
+          const assignment = technical.blockerTasks?.get(row.number);
+          const blocker = !finalHostVerification && assignment && row.kind === 'code' &&
+            row.hold === 'recovery-budget-exhausted' &&
+            state.attempts().filter(attempt => attempt.number === row.number).at(-1)?.id === assignment.afterAttempt &&
+            !state.get('blocker-task:' + row.number) ? assignment : null;
+          if ((finalHostVerification && !final) || (row.hold && !retryableHold && !final && !blocker) ||
               state.task(row.number)?.state !== 'blocked') continue;
           const candidate = candidates.get(row.number);
           if (!candidate) continue;
           if (coordinatorId && !claimsByIssue.has(row.number)) continue;
           if (recoveryScope(candidate) !== row.scope) {
             state.holdRecovery(row.number, 'task-scope-changed');
-          } else if ((!final && row.used >= technical.limit) || state.activeMillis(row.number) >= ACTIVE_BUDGET_MS) {
+          } else if (!blocker && ((!final && row.used >= technical.limit) || state.activeMillis(row.number) >= ACTIVE_BUDGET_MS)) {
             state.holdRecovery(row.number, 'recovery-budget-exhausted');
           } else if (row.kind === 'environment' && !verifier) {
             state.holdRecovery(row.number, 'verification-runner-required');
@@ -514,8 +519,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
                 continue;
               }
             }
-            if (row.hold && !final) state.holdRecovery(row.number, null);
-            recovery.set(row.number, { ...row, verifierCode, final });
+            if (row.hold && !final && !blocker) state.holdRecovery(row.number, null);
+            recovery.set(row.number, { ...row, verifierCode, final, blocker });
           }
         }
       }
@@ -597,7 +602,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         ? state.resumeDecision(answer.id, issue.number, model, log, git(location.path, ['rev-parse', 'HEAD']))
         : { attempt: retry
           ? state.resumeRecovery(retry, verifying ? 'verification-runner' : model, log,
-            git(location.path, ['rev-parse', 'HEAD']), retry.final ? retry.used + 1 : technical.limit)
+            git(location.path, ['rev-parse', 'HEAD']), retry.final || retry.blocker ? retry.used + 1 : technical.limit)
           : state.reserve({ number: issue.number, repo, worker: 'local-1', model, location, log, base, intake: issue.intake }),
           approvedChoices: retry ? state.approvedChoices(issue.number) : [] };
       const { attempt, approvedChoices } = dispatch;
@@ -644,11 +649,13 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       try {
         if (!continuing) createWorktree(repo, location, base);
         if (signal?.aborted || state.get('control') === 'stop') abort();
-        const remaining = technical ? Math.max(1, ACTIVE_BUDGET_MS - state.activeMillis(issue.number)) : timeoutMs;
+        const remaining = retry?.blocker ? 30 * 60 * 1000 : technical ? Math.max(1, ACTIVE_BUDGET_MS - state.activeMillis(issue.number)) : timeoutMs;
         const execution = { cwd: location.path, timeoutMs: Math.min(timeoutMs, remaining), signal: cancel.signal, onRecord: record };
         const publicationEntry = handoff?.issues.get(issue.number);
         result = verifying ? null : await worker({ ...execution, executable, model: issue.model, reasoning: issue.reasoning,
-          prompt: workerPrompt(issue, templates, approvedChoices, resumingImplementation ? 'implementation' : retry?.kind, Boolean(technical)) });
+          prompt: workerPrompt(issue, templates, approvedChoices, resumingImplementation ? 'implementation' : retry?.kind, Boolean(technical)) +
+            (retry?.blocker ? '\nCoordinator-approved blocker assignment. Limit edits to resolving this blocker:\n' +
+              retry.blocker.instruction : '') });
         const profileEvidence = technical?.profileEvidence?.(issue.number);
         const repairedButNeedsHost = profileEvidence && (resumingImplementation || retry?.kind === 'code') && result?.state === 'blocked' &&
           result.result?.technicalBlocker === 'environment' && !result.result?.decisionKey;

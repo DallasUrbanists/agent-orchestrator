@@ -343,9 +343,17 @@ export class State {
       if (row.final && (model !== 'verification-runner' || this.get('final-host-verification:' + row.number))) {
         throw new Error('Final host verification already consumed or invalid');
       }
+      if (row.blocker) {
+        const latest = this.db.prepare('SELECT id FROM attempts WHERE number = ? ORDER BY id DESC LIMIT 1').get(row.number);
+        if (row.kind !== 'code' || row.hold !== 'recovery-budget-exhausted' ||
+            latest?.id !== row.blocker.afterAttempt || this.get('blocker-task:' + row.number)) {
+          throw new Error('Blocker assignment already consumed or stale');
+        }
+        this.set('blocker-task:' + row.number, String(latest.id));
+      }
       const budget = this.db.prepare('UPDATE technical_recovery SET used = used + 1, hold = NULL' +
         ' WHERE number = ? AND kind = ? AND scope = ? AND hold IS ? AND used < ?')
-        .run(row.number, row.kind, row.scope, row.final ? 'recovery-budget-exhausted' : null, limit);
+        .run(row.number, row.kind, row.scope, row.final || row.blocker ? 'recovery-budget-exhausted' : null, limit);
       if (row.final) this.set('final-host-verification:' + row.number, now);
       const task = this.db.prepare(
         "UPDATE tasks SET state = 'running', model = ?, log = ?, started = ?, retries = retries + 1," +
