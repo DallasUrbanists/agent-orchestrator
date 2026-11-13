@@ -197,6 +197,28 @@ test('a verified attempt stays pending across restart until its PR link is recor
   assert.equal(f.comments.length, 1);
 });
 
+test('dispatches independent work while GitHub publication is pending', async t => {
+  const f = fixture(t);
+  const path = join(f.root, 'verifier.mjs');
+  const body = 'process.exit(0);';
+  writeFileSync(path, body);
+  f.queue.technicalRecovery = { verifier: { number: 7, path, sha256: createHash('sha256').update(body).digest('hex') } };
+  f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'] }] };
+  f.queue.issues.push({ number: 9, model: 'sol', state: 'ready', dependencies: [], prompt: 'Independent fixture' });
+  f.publishOptions.api.pulls = async () => { throw new Error('GitHub unavailable'); };
+  const result = await f.executeWith(async ({ cwd, prompt }) => {
+    if (prompt.includes('Independent fixture')) {
+      assert.equal(f.inspect(state => state.task(7).state), 'awaiting-handoff');
+      assert.equal(f.inspect(state => state.handoff(7).linked), 0);
+      return { state: 'done' };
+    }
+    writeFileSync(join(cwd, 'renderer.txt'), 'verified');
+    return { state: 'done' };
+  });
+  assert.deepEqual(result.results.map(({ number, state }) => [number, state]), [[7, 'awaiting-handoff'], [9, 'done']]);
+  assert.equal(f.inspect(state => state.task(8)), undefined);
+});
+
 test('publishes measured profile checks and holds malformed verifier evidence', async t => {
   for (const valid of [true, false]) {
     const f = fixture(t);
