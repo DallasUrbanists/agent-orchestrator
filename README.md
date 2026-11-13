@@ -209,6 +209,52 @@ node src/cli.js sync-status 12 --state .\state\intake-demo
 
 Reconciliation retries label and comment edits and looks for an existing comment by its attempt marker and publisher account. If GitHub rejects a create request, the controller can retry. If the response is lost and GitHub has yet to show the comment, the controller reports unconfirmed delivery and keeps looking on later polls. It does not blindly post a second comment. A missing local claim leaves the issue alone. Keep GitHub credentials in the controller's `gh` context.
 
+### Recover from technical blockers
+
+Add `"technicalRecovery": { "limit": 2 }` to the reviewed queue to let the
+controller start bounded repairs in the original worktree. The controller runs
+independent eligible work first. It saves the number of recovery attempts and
+uses a 60-minute cumulative worker budget. A changed task scope, an unavailable
+worktree, or exhausted budget holds the task. Dependencies still require the
+configured acceptance receipts from merged history.
+
+For environment blockers, also add `verifier` inside `technicalRecovery`.
+Set `number` to the issue the runner verifies. Set `path` to an absolute path to an operator-reviewed standalone Node module
+outside the target and state directories. Set `sha256` to the lowercase hash
+returned by `Get-FileHash -Algorithm SHA256`. The controller verifies the bytes
+and supplies them directly to Node. The verifier runs on the controller host
+with the preserved worktree as its working directory and a filtered
+environment. It has the host account's filesystem permissions, so approve only
+trusted verification code and the tools it invokes. Keep worker-provided
+commands, repository code that has yet to be reviewed, and credentials out of
+that runner.
+
+Exit zero means verification passed. Exit 10 means the verifier found a code
+failure that a Codex repair can address. Other exits mean the verification
+environment failed. If a repair reports success and a verifier is configured for that issue,
+the controller runs the verifier again before marking that attempt complete.
+Status shows held recoveries and their reasons.
+
+Run the disposable D1-07-inspired acceptance test on Windows:
+
+```powershell
+$env:ORCHESTRATOR_LIVE_RECOVERY = '1'
+node --test test/technical-recovery.test.js
+Remove-Item Env:ORCHESTRATOR_LIVE_RECOVERY
+```
+
+This test models the Chromium `spawn EPERM` and missing Remotion bundler
+`4.0.542` reported in the receipt. The fixture verifier simulates the approved
+runner's result. The gated run launches a real Codex repair in that same fixture
+worktree, without requiring another session from the operator. The test holds
+issue #8 until #7 is merged and accepted. Running this test leaves the real
+Storytelling Studio worktree and journal untouched.
+
+For a pre-existing blocked claim, the coordinator can explicitly classify it
+with `"adopt": [{ "number": 7, "kind": "environment" }]` inside
+`technicalRecovery`. Adoption uses the original journal and worktree, excludes
+pending human decisions, and never resets the recovery counter.
+
 ## Ask for a decision on GitHub
 
 Enable issue comments explicitly with `--github-decisions` on a real run. Use a GitHub-backed queue, a signed-in `gh` account with permission to comment on the target issues, and a local list of authorized GitHub account IDs. To find an account ID, run `gh api users/LOGIN --jq .id` and verify the account before adding it.

@@ -3,8 +3,9 @@
   "properties": {
     "outcome": { "type": "string", "enum": ["done", "blocked"] },
     "summary": { "type": "string" },
-    "decisionKey": { "type": ["string", "null"] }
+    "decisionKey": { "type": ["string", "null"] },
+    "technicalBlocker": { "enum": ["environment", "code", null] }
   },
-  "required": ["outcome", "summary", "decisionKey"],
+  "required": ["outcome", "summary", "decisionKey", "technicalBlocker"],
   "additionalProperties": false
 }

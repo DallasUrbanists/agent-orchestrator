@@ -44,7 +44,7 @@ function matchesHandoff(candidate, task, repo) {
     candidate.base?.ref === 'main' && candidate.base?.repo?.full_name?.toLowerCase() === repo;
 }
 
-function commentBody(attempt, marker, repo, pull, now) {
+function commentBody(attempt, marker, repo, pull, now, recoveryHold) {
   const launched = launchTime(attempt);
   const duration = Math.max(0, Math.floor((Date.parse(attempt.completed ?? now) - Date.parse(launched)) / 1000));
   const outcome = { running: 'In progress', done: pull ? 'Ready for review' : 'Completed locally. Awaiting PR handoff.',
@@ -54,13 +54,16 @@ function commentBody(attempt, marker, repo, pull, now) {
   const quiet = attempt.state === 'running' && attempt.activity &&
     Date.parse(now) - Date.parse(attempt.activity) >= HEARTBEAT_MS ? 'No new activity observed in the last five minutes.' : null;
   return ['<!-- agent-orchestrator-progress:' + marker + ' -->', '**Agent Orchestrator · attempt ' + attempt.id + '**',
-    '', outcome, '', 'Elapsed: ' + Math.floor(duration / 60) + 'm ' + duration % 60 + 's.',
+    '', outcome,
+    recoveryHold === 'recovery-budget-exhausted' ? 'Automatic recovery budget exhausted.' :
+      recoveryHold === 'verification-runner-required' ? 'An approved verification runner is required.' : null,
+    '', 'Elapsed: ' + Math.floor(duration / 60) + 'm ' + duration % 60 + 's.',
     last, quiet, attempt.summary, pull && 'Pull request: ' + pullUrl(repo, pull)].filter(line => line != null).join('\n');
 }
 
-async function publishComment(state, api, repo, attempt, pull, options, now) {
+async function publishComment(state, api, repo, attempt, pull, options, now, recoveryHold) {
   const marker = attempt.marker ?? randomUUID();
-  const body = commentBody(attempt, marker, repo, pull, now);
+  const body = commentBody(attempt, marker, repo, pull, now, recoveryHold);
   const actor = await api.viewer(options);
   if (!validId(actor)) throw new Error('Invalid GitHub publisher account');
   if (attempt.actor && attempt.actor !== actor) {
@@ -143,10 +146,11 @@ export function statusPublisher(state, sourceRepo, { api = githubStatus, signal,
     } catch {
       state.updateGithubStatus(number, { error: 'label-update-failed' });
     }
+    const recoveryHold = state.recoveryRows().find(row => row.number === number)?.hold;
     for (const attempt of attempts) {
       if (!launchTime(attempt)) continue;
       try {
-        await publishComment(state, api, repo, attempt, attempt.id === latest.id ? handoff : null, options, clock());
+        await publishComment(state, api, repo, attempt, attempt.id === latest.id ? handoff : null, options, clock(), attempt.id === latest.id ? recoveryHold : null);
       } catch {
         state.updateProgress(attempt.id, { error: 'progress-update-failed' });
       }
