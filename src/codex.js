@@ -31,21 +31,24 @@ export function findCodex() {
   throw new Error('Codex executable missing. Install Codex CLI or set ORCHESTRATOR_CODEX');
 }
 
-export function sandboxConfigArgs() {
+export function sandboxConfigArgs(mode = 'unelevated') {
+  if (!['unelevated', 'elevated', 'mxc'].includes(mode)) {
+    throw new Error('ORCHESTRATOR_WINDOWS_SANDBOX must be unelevated, elevated, or mxc');
+  }
   return ['-c', 'sandbox_workspace_write.network_access=false',
     '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true',
     '-c', 'sandbox_workspace_write.exclude_slash_tmp=true',
-    ...(windows ? ['-c', 'windows.sandbox="unelevated"'] : [])];
+    ...(windows ? ['-c', 'windows.sandbox=' + JSON.stringify(mode)] : [])];
 }
 
-export function codexArgs(model, cwd, scratch, reasoning = model === 'sol' ? 'high' : 'medium') {
+export function codexArgs(model, cwd, scratch, reasoning = model === 'sol' ? 'high' : 'medium', sandboxMode) {
   if (!Object.hasOwn(MODELS, model)) throw new Error('Worker model must be terra or sol');
   if (!(reasoning === 'high' || (model === 'terra' && reasoning === 'medium'))) {
     throw new Error('Unsupported worker reasoning effort');
   }
   return ['exec', '--ignore-user-config', '--model', MODELS[model], '--cd', cwd,
     '--json', '--color', 'never', '--sandbox', 'workspace-write',
-    '-c', 'approval_policy="never"', ...sandboxConfigArgs(),
+    '-c', 'approval_policy="never"', ...sandboxConfigArgs(sandboxMode),
     '-c', 'web_search="disabled"', '-c', 'shell_environment_policy.inherit="core"',
     '-c', 'model_reasoning_effort=' + JSON.stringify(reasoning),
     ...(scratch ? ['TEMP', 'TMP', 'TMPDIR', 'ORCHESTRATOR_WORKER_TEMP'].flatMap(key =>
@@ -121,6 +124,8 @@ export function runCodex({ executable, cwd, model, reasoning, prompt, timeoutMs,
   onRecord = () => {} }, spawnChild = spawn, killTree = terminateTree) {
   if (signal?.aborted) return Promise.resolve({ state: 'stopped', detail: 'cancelled-before-launch' });
   if (!Object.hasOwn(MODELS, model)) throw new Error('Worker model must be terra or sol');
+  const sandboxMode = windows ? process.env.ORCHESTRATOR_WINDOWS_SANDBOX ?? 'unelevated' : 'unelevated';
+  sandboxConfigArgs(sandboxMode);
   let scratch;
   let worktree;
   try {
@@ -138,7 +143,7 @@ export function runCodex({ executable, cwd, model, reasoning, prompt, timeoutMs,
       rmSync(scratch, { recursive: true, force: true });
     }
   }
-  const args = codexArgs(model, cwd, scratch, reasoning);
+  const args = codexArgs(model, cwd, scratch, reasoning, sandboxMode);
   return new Promise(resolve => {
     let child;
     try {
