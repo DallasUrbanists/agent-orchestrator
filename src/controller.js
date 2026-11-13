@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, mkdirSync, openSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
-import { captureVerifiedTree, publicationOrigin, publicationPolicy, publishVerified } from './publication.js';
+import { captureVerifiedTree, publicationOrigin, publicationPolicy, publishVerified, requestCodexReview } from './publication.js';
 import { MODELS, runCodex } from './codex.js';
 import { githubDecisions, githubOrigin, githubRepo, readGithubIssues, validatePolling } from './github.js';
 import { ACTIVE_BUDGET_MS, recoveryPolicy, recoveryScope, verifyTechnical } from './technical-recovery.js';
@@ -430,6 +430,18 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       }
       if (handoff) {
         for (const number of handoff.issues.keys()) {
+          const receipt = state.handoff(number);
+          const task = state.task(number);
+          if (receipt?.linked && task && !accepted.has(number)) {
+            const repair = state.get('pullRepair:' + receipt.pull);
+            const head = repair?.startsWith('published:') ? repair.slice(10) : receipt.commit_sha;
+            try {
+              await requestCodexReview(state, handoff.repo, receipt.pull, task.branch, head,
+                { signal }, publishOptions?.api);
+            } catch {
+              // The durable comment intent is reconciled on the next poll.
+            }
+          }
           if ((finalHostVerification && finalHostVerification.number !== number) || accepted.has(number) || state.handoff(number)?.linked) continue;
           await publishTask(number);
           if (state.handoff(number)?.linked) await publisher?.sync(number);

@@ -212,7 +212,7 @@ test('one authorized verification after exhaustion preserves the claim and publi
   assert.equal(f.inspect(state => state.handoff(7).linked), 1);
   assert.deepEqual((await f.executeWith(workerForbidden, authorization(latest))).results, []);
   assert.equal(f.pulls.length, 1);
-  assert.equal(f.comments.length, 1);
+  assert.equal(f.comments.length, 2);
 });
 
 test('publication holds if the approved verifier changes the verified source', async t => {
@@ -249,4 +249,35 @@ test('rejects out-of-scope edits and a saved tree that has changed', async t => 
   await f.executeWith(workerForbidden);
   assert.equal(f.pulls.length, 0);
   assert.equal(f.pushes.size, 0);
+});
+
+test('review request reconciles an ambiguous delivery and requests the next head once', async () => {
+  const { requestCodexReview } = await import('../src/publication.js');
+  const state = new Map(), comments = [];
+  const repo = 'fixture/repo', branch = 'task';
+  let head = 'a'.repeat(40);
+  const api = {
+    viewer: async () => 1,
+    pulls: async () => [{number:1,state:'open',head:{ref:branch,sha:head,repo:{full_name:repo}},
+      base:{ref:'main',repo:{full_name:repo}}}],
+    comments: async () => comments,
+    post: async (_repo, _number, body) => {
+      const comment = {id:comments.length+1,user:{id:1},body};
+      comments.push(comment);
+      if (comment.id === 1) throw new Error('response lost');
+      return comment;
+    }
+  };
+  const request = journal => requestCodexReview(journal, repo, 1, branch, head, {}, api);
+  await assert.rejects(request(state), /response lost/);
+  const restarted = new Map(state);
+  await request(restarted);
+  await request(restarted);
+  assert.equal(comments.length, 1);
+  head = 'b'.repeat(40);
+  await request(restarted);
+  await request(restarted);
+  assert.equal(comments.length, 2);
+  assert.match(comments[1].body, /^@codex review\n/);
+  assert.ok(comments[1].body.includes(head));
 });
