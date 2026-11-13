@@ -1,8 +1,10 @@
+import { acceptedMerge } from './merged-acceptance.js';
+import { repairPull } from './merge-conflict.js';
 import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, mkdirSync, openSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
-import { captureVerifiedTree, publicationOrigin, publicationPolicy, publishVerified } from './publication.js';
+import { captureVerifiedTree, publicationOrigin, publicationPolicy, publishVerified, requestCodexReview } from './publication.js';
 import { MODELS, runCodex } from './codex.js';
 import { githubDecisions, githubOrigin, githubRepo, readGithubIssues, validatePolling } from './github.js';
 import { ACTIVE_BUDGET_MS, recoveryPolicy, recoveryScope, verifyTechnical } from './technical-recovery.js';
@@ -307,7 +309,19 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       return git(repo, ['rev-parse', '--verify', ref + '^{commit}']);
     } : undefined;
     const saved = JSON.parse(state.get('intakeAcceptance') ?? '{}');
-    const loadAcceptance = readAcceptance && watchAcceptance(queue, repo, readAcceptance, refreshMain, saved);
+    const automatic = JSON.parse(state.get('automaticAcceptance') ?? '[]');
+    const receipts = readAcceptance && (() => {
+      const manual = readAcceptance();
+      if (!Array.isArray(manual)) throw new Error('The watched acceptance file must contain a JSON array');
+      for (const row of automatic) {
+        const entry = manual.find(item => item?.number === row.number);
+        if (entry && entry.commit !== row.commit) {
+          throw new Error('Watched receipt disagrees with automatic acceptance for #' + row.number);
+        }
+      }
+      return [...manual, ...automatic.filter(row => !manual.some(entry => entry?.number === row.number))];
+    });
+    const loadAcceptance = receipts && watchAcceptance(queue, repo, receipts, refreshMain, saved);
     if (adoptLocalIntake && state.get('repo') && !state.get('sourceRepo')) {
       if (dispatchHold(state.list(), null)) throw new Error('Stop or reconcile active work before adopting its journal');
       const observation = loadAcceptance();
@@ -317,6 +331,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     }
     state.bind(repo, sourceRepo, Object.hasOwn(queue, 'acceptedPrerequisites'), coordinatorId);
     state.recover();
+    if (state.get('activePullRepair')) return { reason: 'pull-repair-interrupted', results };
     const statusNumbers = publishStatus && !sourceRepo ? new Set(queue.issues.map(issue => issue.number)) : undefined;
     if (statusNumbers) {
       const savedStatusRepo = state.get('statusRepo');
@@ -388,12 +403,45 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const afterPoll = dispatchHold(previous, state.get('control'));
       if (afterPoll) return { reason: afterPoll, results };
       const { base, accepted } = loadAcceptance ? loadAcceptance() : initial;
+      if (queue.autoAcceptMerged === true && coordinatorId && handoff) {
+        for (const number of handoff.issues.keys()) {
+          if (accepted.has(number) || signal?.aborted) continue;
+          const receipt = state.handoff(number);
+          const task = state.task(number);
+          if (!receipt?.linked || !task) continue;
+          const repair = state.get('pullRepair:' + receipt.pull);
+          const head = repair?.startsWith('published:') ? repair.slice(10) : receipt.commit_sha;
+          try {
+            const commit = acceptedMerge({ target: repo, repo: handoff.repo, base,
+              pull: receipt.pull, head, branch: task.branch, coordinatorId });
+            if (!commit) continue;
+            const updated = [...automatic, { number, commit }];
+            state.set('automaticAcceptance', JSON.stringify(updated));
+            automatic.push({ number, commit });
+            accepted.set(number, commit);
+          } catch {
+            // A missing ref or transient read can be retried on a later poll.
+          }
+        }
+      }
       if (loadAcceptance || saved.base) {
         const observed = JSON.stringify({ base, accepted: [...accepted] });
         if (state.get('intakeAcceptance') !== observed) state.set('intakeAcceptance', observed);
       }
       if (handoff) {
         for (const number of handoff.issues.keys()) {
+          const receipt = state.handoff(number);
+          const task = state.task(number);
+          if (receipt?.linked && task && !accepted.has(number)) {
+            const repair = state.get('pullRepair:' + receipt.pull);
+            const head = repair?.startsWith('published:') ? repair.slice(10) : receipt.commit_sha;
+            try {
+              await requestCodexReview(state, handoff.repo, receipt.pull, task.branch, head,
+                { signal }, publishOptions?.api);
+            } catch {
+              // The durable comment intent is reconciled on the next poll.
+            }
+          }
           if ((finalHostVerification && finalHostVerification.number !== number) || accepted.has(number) || state.handoff(number)?.linked) continue;
           await publishTask(number);
           if (state.handoff(number)?.linked) await publisher?.sync(number);
@@ -478,6 +526,33 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       }
       const [issue] = independent.length ? independent
         : runnable(issues, previous, sourceRepo, new Set(recovery.keys()), accepted).filter(issue => recovery.has(issue.number));
+      if (!issue && !finalHostVerification && queue.pullRepair && !signal?.aborted && handoff) {
+        for (const number of queue.pullRepair.issues ?? []) {
+          const receipt = state.handoff(number);
+          const task = state.task(number);
+          const candidate = issues.find(row => row.number === number && row.state === 'ready');
+          const claim = claimsByIssue.get(number);
+          if (!receipt?.linked || !candidate || task?.state !== 'done' || accepted.has(number) ||
+              !handoff.issues.has(number) || !technical?.verifierFor(number) ||
+              (coordinatorId && (!claim || claim.issue_id !== candidate.intake?.issueId ||
+                claim.revision !== candidate.intake?.hash))) continue;
+          const authorized = async () => {
+            if (signal?.aborted || dispatchHold(state.list(), state.get('control'))) return false;
+            if (!coordinatorId) return true;
+            const current = (await load(signal)).find(row => row.number === number);
+            return current?.state === 'ready' && current.intake?.issueId === claim.issue_id &&
+              current.intake.hash === claim.revision && !dispatchHold(state.list(), state.get('control'));
+          };
+          try {
+            await repairPull({ state, stateDir, target: repo, repo: handoff.repo, task, receipt,
+              entry: handoff.issues.get(number), issue: candidate, reviewers: queue.pullRepair.reviewers ?? [],
+              verifier: technical.verifierFor(number)(), worker, executable, signal, timeoutMs, authorized });
+          } catch {
+            state.set('pullRepairError:' + receipt.pull, 'repair-held');
+          }
+          if (state.get('activePullRepair')) return { reason: 'pull-repair-interrupted', results };
+        }
+      }
       const beforeClaim = dispatchHold(previous, state.get('control'));
       if (beforeClaim) return { reason: beforeClaim, results };
       if (signal?.aborted) return { reason: 'stopped', results };
