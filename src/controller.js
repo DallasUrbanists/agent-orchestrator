@@ -238,12 +238,16 @@ export async function preview(queue, statePath, { readIssues = readGithubIssues,
     const eligible = runnable(unclaimed, rows, sourceRepo, undefined, accepted).map(issue => ({
       number: issue.number, model: MODELS[issue.model], title: issue.title
     }));
+    const admitted = coordinatorId ? unclaimed.filter(issue => issue.state === 'ready' &&
+      !accepted.has(issue.number) && !rows.some(row => row.number === issue.number)) : [];
+    const waiting = admitted.map(issue => ({
+      number: issue.number,
+      unacceptedPrerequisites: issue.dependencies.filter(number => !accepted.has(number))
+    })).filter(issue => issue.unacceptedPrerequisites.length);
     return { mode: 'dry-run', ...(sourceRepo && { sourceRepo }),
       reason: hold ?? (eligible.length ? 'eligible-work' : 'no-eligible-work'), eligible,
       ...(coordinatorId && { coordinatorId, revisions: issues.filter(issue => issue.intake)
-        .map(issue => ({ number: issue.number, revision: issue.intake.hash })), admitted: unclaimed.filter(issue => issue.state === 'ready' &&
-        !accepted.has(issue.number) && !rows.some(row => row.number === issue.number))
-        .map(issue => issue.number), awaitingApproval: issues.filter(issue => issue.reason === 'needs-coordinator-approval')
+        .map(issue => ({ number: issue.number, revision: issue.intake.hash })), admitted: admitted.map(issue => issue.number), waiting, awaitingApproval: issues.filter(issue => issue.reason === 'needs-coordinator-approval')
         .map(issue => issue.number), held: issues.filter(issue => issue.reason === 'unsupported-task-metadata-or-revision')
         .map(issue => issue.number) }) };
   } finally {
@@ -499,6 +503,16 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const previous = state.list();
       const claimedIds = new Set(claims.map(claim => claim.issue_id));
       const dispatchable = issues.filter(issue => !active.has(issue.number) && (!claimedIds.has(issue.intake?.issueId) || answers.has(issue.number)));
+      if (coordinatorId && !finalHostVerification) {
+        const recorded = new Set(previous.map(row => row.number));
+        const waiting = dispatchable.filter(issue => issue.state === 'ready' &&
+          !recorded.has(issue.number) && !accepted.has(issue.number)).map(issue => ({
+          number: issue.number,
+          unacceptedPrerequisites: issue.dependencies.filter(number => !accepted.has(number))
+        })).filter(issue => issue.unacceptedPrerequisites.length);
+        const report = JSON.stringify({ base, waiting });
+        if (state.get('intakeWaiting') !== report) state.set('intakeWaiting', report);
+      }
       const independent = finalHostVerification ? [] : runnable(dispatchable, previous, sourceRepo, new Set(answers.keys()), accepted);
       const recovery = new Map();
       if (technical && !independent.length) {
