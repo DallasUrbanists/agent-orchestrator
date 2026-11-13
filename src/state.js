@@ -141,11 +141,12 @@ export class State {
     this.db.prepare('UPDATE decisions SET posting = 0, request_comment = ?, last_error = NULL WHERE id = ?')
       .run(comment, id);
   }
-  answerDecision(id, { comment, author, choice }) {
-    this.db.prepare(
+  answerDecision(id, { comment, author, choice }, previous = null) {
+    const result = this.db.prepare(
       'UPDATE decisions SET reply_comment = ?, responder_id = ?, choice = ?, answered = ?, last_error = NULL' +
-      ' WHERE id = ? AND reply_comment IS NULL'
-    ).run(comment, author, choice, new Date().toISOString(), id);
+      ' WHERE id = ? AND reply_comment IS ? AND consumed IS NULL'
+    ).run(comment, author, choice, new Date().toISOString(), id, previous);
+    if (!result.changes) throw new Error('Decision reply changed before it could be saved');
   }
   retryDecision(id) {
     const result = this.db.prepare(
