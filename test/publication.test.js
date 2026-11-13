@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -224,6 +224,36 @@ test('a verified attempt stays pending across restart until its PR link is recor
   assert.equal(f.comments.length, 1);
 });
 
+test('reuses one model slot while the first task waits for host verification', async t => {
+  const f = fixture(t);
+  const ready = join(f.root, 'verifying');
+  const release = join(f.root, 'release');
+  const path = join(f.root, 'verifier.mjs');
+  const body = "import {existsSync,writeFileSync} from 'node:fs'; import {setTimeout as delay} from 'node:timers/promises'; " +
+    'writeFileSync(' + JSON.stringify(ready) + ', "started"); ' +
+    'for (let i = 0; i < 200 && !existsSync(' + JSON.stringify(release) + '); i++) await delay(25); ' +
+    'if (!existsSync(' + JSON.stringify(release) + ')) process.exit(10);';
+  writeFileSync(path, body);
+  f.queue.technicalRecovery = { verifier: { number: 7, path, sha256: createHash('sha256').update(body).digest('hex') } };
+  f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'] }] };
+  f.queue.issues.push({ number: 9, model: 'sol', state: 'ready', dependencies: [], prompt: 'Independent fixture' });
+  let observed = false;
+  await f.executeWith(async ({ cwd, prompt }) => {
+    if (prompt.includes('Independent fixture')) {
+      const { setTimeout: delay } = await import('node:timers/promises');
+      for (let i = 0; i < 80 && !existsSync(ready); i++) await delay(25);
+      observed = existsSync(ready) && f.inspect(state => state.task(7).state) === 'running';
+      writeFileSync(release, 'continue');
+    } else {
+      writeFileSync(join(cwd, 'renderer.txt'), 'verified');
+    }
+    return { state: 'done' };
+  });
+  assert.equal(observed, true);
+  assert.equal(f.inspect(state => state.handoff(7).linked), 1);
+  assert.equal(f.inspect(state => state.task(8)), undefined);
+});
+
 test('dispatches independent work while GitHub publication is pending', async t => {
   const f = fixture(t);
   const path = join(f.root, 'verifier.mjs');
@@ -233,16 +263,17 @@ test('dispatches independent work while GitHub publication is pending', async t 
   f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'] }] };
   f.queue.issues.push({ number: 9, model: 'sol', state: 'ready', dependencies: [], prompt: 'Independent fixture' });
   f.publishOptions.api.pulls = async () => { throw new Error('GitHub unavailable'); };
-  const result = await f.executeWith(async ({ cwd, prompt }) => {
-    if (prompt.includes('Independent fixture')) {
-      assert.equal(f.inspect(state => state.task(7).state), 'awaiting-handoff');
-      assert.equal(f.inspect(state => state.handoff(7).linked), 0);
-      return { state: 'done' };
-    }
+  await f.executeWith(async ({ cwd }) => {
     writeFileSync(join(cwd, 'renderer.txt'), 'verified');
     return { state: 'done' };
+  }, { limit: 1 });
+  const result = await f.executeWith(async ({ prompt }) => {
+    assert.match(prompt, /Independent fixture/);
+    assert.equal(f.inspect(state => state.task(7).state), 'awaiting-handoff');
+    assert.equal(f.inspect(state => state.handoff(7).linked), 0);
+    return { state: 'done' };
   });
-  assert.deepEqual(result.results.map(({ number, state }) => [number, state]), [[7, 'awaiting-handoff'], [9, 'done']]);
+  assert.deepEqual(result.results.map(({ number, state }) => [number, state]), [[9, 'done']]);
   assert.equal(f.inspect(state => state.task(8)), undefined);
 });
 
