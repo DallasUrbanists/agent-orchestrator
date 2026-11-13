@@ -230,6 +230,8 @@ test('one controller discovers, approves, waits for supervised acceptance, and d
   try {
     assert.deepEqual(state.intakeClaims().map(row => [row.issue_id, row.coordinator_id, row.comment_id, row.base]),
       [[first.id, coordinatorId, null, seed], [second.id, coordinatorId, 'reapproved', merged]]);
+    assert.deepEqual(state.attempts().map(row => [row.number, row.state, row.base]),
+      [[1, 'done', seed], [2, 'done', merged]]);
   } finally { state.close(); }
 
   rows = [first, edit(rows[1], 5, 111, 'Depends on: #1\nEdited again after dispatch.')];
