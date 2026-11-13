@@ -509,6 +509,38 @@ test('watched acceptance holds if a recorded receipt disappears between dispatch
   assert.equal(withState(stateDir, store => store.task(2)), undefined);
 });
 
+test('local watched receipts cannot be dropped by restarting or disabling the watcher', async t => {
+  const { queue, repo, stateDir } = fixture(t, [task(1), task(2)]);
+  const receipt = { number: 3, commit: git(repo, ['rev-parse', 'HEAD']) };
+  queue.acceptedPrerequisites = [];
+  const run = await execute(queue, stateDir, { ...options, limit: 1, readAcceptance: () => [receipt] }, done);
+  assert.deepEqual(run.results.map(row => row.number), [1]);
+  const noWorker = () => assert.fail('dispatch after losing saved receipt');
+  await assert.rejects(execute(queue, stateDir, { ...options, readAcceptance: () => [] }, noWorker),
+    /Acceptance receipt changed or disappeared for #3/);
+  await assert.rejects(execute(queue, stateDir, options, noWorker), /Acceptance receipt changed or disappeared for #3/);
+  await assert.rejects(preview(queue, stateDir), /Acceptance receipt changed or disappeared for #3/);
+  assert.equal(withState(stateDir, store => store.task(2)), undefined);
+  queue.acceptedPrerequisites = [receipt];
+  const continued = await execute(queue, stateDir, { ...options, readAcceptance: () => [receipt] }, done);
+  assert.deepEqual(continued.results.map(row => row.number), [2]);
+});
+
+test('local watched main cannot rewind across a restart even with unchanged receipts', async t => {
+  const { queue, repo, stateDir } = fixture(t, [task(1), task(2)]);
+  const receipt = { number: 3, commit: git(repo, ['rev-parse', 'HEAD']) };
+  queue.acceptedPrerequisites = [receipt];
+  git(repo, ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false',
+    'commit', '--allow-empty', '-m', 'Advance disposable main']);
+  const watch = { ...options, limit: 1, readAcceptance: () => [receipt] };
+  await execute(queue, stateDir, watch, done);
+  git(repo, ['reset', '--keep', receipt.commit]);
+  const noWorker = () => assert.fail('dispatch after main rewind');
+  await assert.rejects(execute(queue, stateDir, watch, noWorker), /non-fast-forward/);
+  await assert.rejects(execute(queue, stateDir, options, noWorker), /non-fast-forward/);
+  assert.equal(withState(stateDir, store => store.task(2)), undefined);
+});
+
 test('watched acceptance rejects a receipt file in the worker state directory', async t => {
   const { queue, stateDir } = fixture(t);
   queue.acceptedPrerequisites = [];

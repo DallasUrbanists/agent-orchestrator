@@ -128,6 +128,16 @@ function verifyAcceptedPrerequisites(queue, repo, base) {
   return accepted;
 }
 
+function assertSavedAcceptance(repo, base, accepted, saved) {
+  for (const [number, commit] of saved.accepted ?? []) {
+    if (accepted?.get(number) !== commit) throw new Error('Acceptance receipt changed or disappeared for #' + number);
+  }
+  if (saved.base && saved.base !== base) {
+    try { git(repo, ['merge-base', '--is-ancestor', saved.base, base]); }
+    catch { throw new Error('Dispatch base changed non-fast-forward since the last watched run'); }
+  }
+}
+
 function watchAcceptance(queue, repo, readAcceptance, refreshMain, saved = {}) {
   if (!Object.hasOwn(queue, 'acceptedPrerequisites')) {
     throw new Error('Watching acceptance requires an explicit acceptedPrerequisites array in the queue');
@@ -173,13 +183,15 @@ export async function preview(queue, statePath, { readIssues = readGithubIssues,
   const stateDir = resolveStatePath(statePath);
   const repo = verifyTarget(queue?.target, queue?.allowedRepos, stateDir);
   const { sourceRepo, coordinatorId, load } = prepareQueue(queue, repo, readIssues, false, intakeApi);
-  const accepted = Object.hasOwn(queue, 'acceptedPrerequisites')
-    ? verifyAcceptedPrerequisites(queue, repo, git(repo, ['rev-parse', '--verify', 'HEAD^{commit}'])) : null;
+  const base = Object.hasOwn(queue, 'acceptedPrerequisites')
+    ? git(repo, ['rev-parse', '--verify', 'HEAD^{commit}']) : null;
+  const accepted = verifyAcceptedPrerequisites(queue, repo, base);
   let state;
   try {
     if (hasJournal(stateDir)) {
       state = new State(stateDir, { readOnly: true });
       state.assertBinding(repo, sourceRepo, accepted !== null, coordinatorId);
+      if (!coordinatorId) assertSavedAcceptance(repo, base, accepted, JSON.parse(state.get('intakeAcceptance') ?? '{}'));
     }
     const rows = state?.list() ?? [];
     const hold = state?.get('restoreHold') === 'true'
@@ -246,6 +258,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     const initial = loadAcceptance ? null : {
       base: startupBase, accepted: verifyAcceptedPrerequisites(queue, repo, startupBase)
     };
+    if (initial) assertSavedAcceptance(repo, initial.base, initial.accepted, saved);
     const logDir = join(stateDir, 'logs');
     mkdirSync(logDir, { recursive: true });
     if (relative(realpathSync(logDir), logDir) !== '') throw new Error('Log directory redirects elsewhere');
@@ -265,7 +278,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const afterPoll = dispatchHold(previous, state.get('control'));
       if (afterPoll) return { reason: afterPoll, results };
       const { base, accepted } = loadAcceptance ? loadAcceptance() : initial;
-      if (coordinatorId) {
+      if (loadAcceptance || saved.base) {
         const observed = JSON.stringify({ base, accepted: [...accepted] });
         if (state.get('intakeAcceptance') !== observed) state.set('intakeAcceptance', observed);
       }
