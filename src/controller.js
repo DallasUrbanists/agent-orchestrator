@@ -7,7 +7,7 @@ import { setTimeout as wait } from 'node:timers/promises';
 import { captureVerifiedTree, publicationOrigin, publicationPolicy, publishVerified, requestCodexReview } from './publication.js';
 import { MODELS, runCodex } from './codex.js';
 import { githubDecisions, githubOrigin, githubRepo, readGithubIssues, validatePolling } from './github.js';
-import { ACTIVE_BUDGET_MS, recoveryPolicy, recoveryScope, verifyTechnical } from './technical-recovery.js';
+import { ACTIVE_BUDGET_MS, RECOVERY_COOLDOWN_MS, recoveryPolicy, recoveryScope, verifyTechnical } from './technical-recovery.js';
 import { HEARTBEAT_MS, observeProgress, statusPublisher } from './issue-status.js';
 import { readIssueIntake } from './intake.js';
 import { approvedInstruction, decisionRequest, responderIds, reviewedDecisions, syncDecisions } from './decisions.js';
@@ -521,7 +521,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           const candidate = candidates.get(number);
           if (candidate) state.adoptRecovery(number, kind, recoveryScope(candidate));
         }
-        for (const row of state.recoveryRows()) {
+        for (let row of state.recoveryRows()) {
           const verifier = technical.verifierFor(row.number);
           const retryableHold = row.hold === 'verification-runner-required' || row.hold === 'verification-runner-unavailable';
           const final = finalHostVerification && row.number === finalHostVerification.number &&
@@ -533,14 +533,21 @@ export async function execute(queue, statePath, options, worker = runCodex) {
             row.hold === 'recovery-budget-exhausted' &&
             state.attempts().filter(attempt => attempt.number === row.number).at(-1)?.id === assignment.afterAttempt &&
             !state.get('blocker-task:' + row.number) ? assignment : null;
-          if ((finalHostVerification && !final) || (row.hold && !retryableHold && !final && !blocker) ||
+          const coolingDown = row.hold === 'recovery-budget-exhausted' && !final && !blocker;
+          if ((finalHostVerification && !final) || (row.hold && !retryableHold && !final && !blocker && !coolingDown) ||
               (active.has(row.number) || state.task(row.number)?.state !== 'blocked')) continue;
           const candidate = candidates.get(row.number);
           if (!candidate) continue;
           if (coordinatorId && !claimsByIssue.has(row.number)) continue;
           if (recoveryScope(candidate) !== row.scope) {
             state.holdRecovery(row.number, 'task-scope-changed');
-          } else if (!blocker && ((!final && row.used >= technical.limit) || state.activeMillis(row.number) >= ACTIVE_BUDGET_MS)) {
+            continue;
+          }
+          if (coolingDown) {
+            if (!state.resetRecoveryBudget(row.number, RECOVERY_COOLDOWN_MS)) continue;
+            row = { ...row, used: 0, hold: null };
+          }
+          if (!blocker && ((!final && row.used >= technical.limit) || state.activeMillis(row.number) >= ACTIVE_BUDGET_MS)) {
             state.holdRecovery(row.number, 'recovery-budget-exhausted');
           } else if (row.kind === 'environment' && !verifier) {
             state.holdRecovery(row.number, 'verification-runner-required');
@@ -622,7 +629,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         const answer = answers.get(issue.number);
         const retry = recovery.get(issue.number);
         const resumingImplementation = retry?.kind === 'environment' && !retry.final && retry.used === 0 &&
-          technical.resumeImplementation?.(issue.number);
+          !state.get('recovery-budget-reset:' + issue.number) && technical.resumeImplementation?.(issue.number);
         const verifying = retry?.kind === 'environment' && !resumingImplementation;
         const verifierCode = retry?.verifierCode;
         const continuing = answer || retry;

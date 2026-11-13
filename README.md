@@ -350,12 +350,18 @@ budget survive restart.
 
 ### Recover from technical blockers
 
-Add `"technicalRecovery": { "limit": 2 }` to the reviewed queue to let the
+Add `"technicalRecovery": { "limit": 4 }` to the reviewed queue to let the
 controller start bounded repairs in the original worktree. The controller runs
 independent eligible work first. It saves the number of recovery attempts and
 uses a 60-minute cumulative worker budget. A changed task scope, an unavailable
 worktree, or exhausted budget holds the task. Dependencies still require the
 configured acceptance receipts from merged history.
+
+The default is four attempts. Explicit limits from one to four still apply.
+After exhausting the attempts or active time, the issue waits two hours from
+its latest attempt completion. The next eligible poll renews both budgets in
+the same worktree. The journal retains the claim, attempt history, and used
+one-time authorizations. Use continuous polling to resume while the queue is idle.
 
 For environment blockers, also add `verifier` inside `technicalRecovery`.
 Set `number` to the issue the runner verifies. Set `path` to an absolute path to an operator-reviewed standalone Node module
