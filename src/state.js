@@ -58,12 +58,15 @@ export class State {
   set(name, value) {
     this.db.prepare('INSERT OR REPLACE INTO settings VALUES (?, ?)').run(name, value);
   }
-  assertBinding(repo, sourceRepo = null) {
+  assertBinding(repo, sourceRepo = null, requireAcceptance = false) {
     const bound = this.get('repo');
     if (bound === undefined) return;
     if (bound !== repo) throw new Error('This state directory belongs to a different checkout');
     if ((this.get('sourceRepo') ?? null) !== sourceRepo) {
       throw new Error('This state directory belongs to a different task source');
+    }
+    if ((this.get('requireAcceptance') === 'true') !== requireAcceptance) {
+      throw new Error('This state directory uses a different prerequisite policy');
     }
   }
   transaction(update) {
@@ -77,12 +80,13 @@ export class State {
       throw error;
     }
   }
-  bind(repo, sourceRepo = null) {
+  bind(repo, sourceRepo = null, requireAcceptance = false) {
     this.transaction(() => {
-      this.assertBinding(repo, sourceRepo);
+      this.assertBinding(repo, sourceRepo, requireAcceptance);
       if (this.get('repo') === undefined) {
         this.set('repo', repo);
         if (sourceRepo) this.set('sourceRepo', sourceRepo);
+        if (requireAcceptance) this.set('requireAcceptance', 'true');
       }
     });
   }

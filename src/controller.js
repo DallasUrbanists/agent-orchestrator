@@ -52,13 +52,19 @@ function prepareQueue(queue, repo, readIssues, decisionsEnabled = false) {
     throw new Error('The checkout origin must match sourceRepo on github.com');
   }
   if (!Array.isArray(queue.issues)) throw new Error('GitHub queues need an issues array of reviewed prompts');
+  const requireAcceptance = Object.hasOwn(queue, 'acceptedPrerequisites');
   const prompts = new Map();
   for (const issue of queue.issues) {
     if (!Number.isSafeInteger(issue?.number) || issue.number < 1 || prompts.has(issue.number)) {
       throw new Error('Reviewed GitHub issue numbers must be unique positive integers');
     }
     validatePrompt(issue);
+    if (requireAcceptance && (!Array.isArray(issue.dependencies) || issue.dependencies.some(number =>
+      !Number.isSafeInteger(number) || number < 1 || number === issue.number))) {
+      throw new Error('An explicit reviewed dependencies array is required for task #' + issue.number);
+    }
     prompts.set(issue.number, { prompt: issue.prompt,
+      ...(requireAcceptance && { dependencies: issue.dependencies }),
       decisions: decisionsEnabled ? reviewedDecisions(issue) : [] });
   }
   return {
@@ -83,9 +89,31 @@ function dispatchHold(rows, control) {
   return null;
 }
 
-function runnable(issues, rows, sourceRepo, resumable) {
+function verifyAcceptedPrerequisites(queue, repo, base) {
+  if (!Object.hasOwn(queue, 'acceptedPrerequisites')) return null;
+  const receipts = queue.acceptedPrerequisites;
+  if (!Array.isArray(receipts)) throw new Error('acceptedPrerequisites must be an array of acceptance receipts');
+  const accepted = new Map();
+  for (const receipt of receipts) {
+    const { number, commit } = receipt ?? {};
+    if (!Number.isSafeInteger(number) || number < 1 || accepted.has(number) ||
+        typeof commit !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit)) {
+      throw new Error('Acceptance receipts require unique issue numbers and full Git commit IDs');
+    }
+    try {
+      if (git(repo, ['cat-file', '-t', commit]) !== 'commit') throw new Error('Expected commit');
+      git(repo, ['merge-base', '--is-ancestor', commit, base]);
+    } catch {
+      throw new Error('Accepted prerequisite #' + number + ' is not a commit in the dispatch base history');
+    }
+    accepted.set(number, commit);
+  }
+  return accepted;
+}
+
+function runnable(issues, rows, sourceRepo, resumable, acceptedPrerequisites) {
   return eligibleIssues(issues, new Map(rows.map(row => [row.number, row.state])), {
-    acceptSourceCompletion: Boolean(sourceRepo), resumable
+    acceptSourceCompletion: Boolean(sourceRepo), resumable, acceptedPrerequisites
   });
 }
 
@@ -93,16 +121,18 @@ export async function preview(queue, statePath, { readIssues = readGithubIssues,
   const stateDir = resolveStatePath(statePath);
   const repo = verifyTarget(queue?.target, queue?.allowedRepos, stateDir);
   const { sourceRepo, load } = prepareQueue(queue, repo, readIssues);
+  const accepted = Object.hasOwn(queue, 'acceptedPrerequisites')
+    ? verifyAcceptedPrerequisites(queue, repo, git(repo, ['rev-parse', '--verify', 'HEAD^{commit}'])) : null;
   let state;
   try {
     if (existsSync(join(stateDir, 'tasks.sqlite'))) {
       state = new State(stateDir, { readOnly: true });
-      state.assertBinding(repo, sourceRepo);
+      state.assertBinding(repo, sourceRepo, accepted !== null);
     }
     const rows = state?.list() ?? [];
     const hold = dispatchHold(rows, state?.get('control'));
     const issues = hold ? [] : await load(signal);
-    const eligible = runnable(issues, rows, sourceRepo).map(issue => ({
+    const eligible = runnable(issues, rows, sourceRepo, undefined, accepted).map(issue => ({
       number: issue.number, model: MODELS[issue.model], title: issue.title
     }));
     return { mode: 'dry-run', ...(sourceRepo && { sourceRepo }),
@@ -126,13 +156,14 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const { sourceRepo, load } = prepareQueue(queue, repo, readIssues, decisionsEnabled);
   const responders = decisionsEnabled ? responderIds(queue) : null;
   const base = git(repo, ['rev-parse', '--verify', 'HEAD^{commit}']);
+  const accepted = verifyAcceptedPrerequisites(queue, repo, base);
   if (relative(stateDirectory(stateDir), stateDir) !== '') throw new Error('State directory redirected during setup');
   const release = lease(stateDir);
   const results = [];
   let state;
   try {
     state = new State(stateDir);
-    state.bind(repo, sourceRepo);
+    state.bind(repo, sourceRepo, accepted !== null);
     state.recover();
     const logDir = join(stateDir, 'logs');
     mkdirSync(logDir, { recursive: true });
@@ -152,7 +183,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const answers = new Map();
       if (decisionsEnabled) {
         const ready = new Map(issues.filter(issue => issue.state === 'ready').map(issue => [issue.number, issue]));
-        const approved = row => ready.get(row.number)?.decisions.some(item => item.key === row.decision_key);
+        const approved = row => !accepted?.has(row.number) &&
+          ready.get(row.number)?.decisions.some(item => item.key === row.decision_key);
         const canContinue = () => !signal?.aborted && !dispatchHold(previous, state.get('control'));
         const pending = state.pendingDecisions().filter(approved);
         await syncDecisions(state, sourceRepo, pending.filter(row => !row.reply_comment), {
@@ -166,7 +198,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         }
       }
       if (results.length >= limit) break;
-      const [issue] = runnable(issues, previous, sourceRepo, new Set(answers.keys()));
+      const [issue] = runnable(issues, previous, sourceRepo, new Set(answers.keys()), accepted);
       if (!issue) {
         if (!sourceRepo || ++idlePolls >= polls) return { reason: 'no-eligible-work', results };
         await wait(intervalMs, undefined, { signal });
@@ -178,7 +210,14 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const answer = answers.get(issue.number);
       const claim = answer && state.task(issue.number);
       if (answer) {
-        try { verifyResumeWorktree(repo, location, claim); }
+        try {
+          verifyResumeWorktree(repo, location, claim);
+          if (accepted) {
+            for (const number of issue.dependencies) {
+              git(location.path, ['merge-base', '--is-ancestor', accepted.get(number), 'HEAD']);
+            }
+          }
+        }
         catch {
           state.decisionError(answer.id, 'worktree-unavailable');
           unavailable.add(answer.id);

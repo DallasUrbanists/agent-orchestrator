@@ -412,6 +412,42 @@ test('resuming a second decision preserves every approved instruction for that t
 });
 
 
+test('strict scheduling waits for a reviewed prerequisite in the actual worktree base', async t => {
+  const { queue, stateDir, repo } = fixture(t, [task(1), task(2, [1])]);
+  queue.sourceRepo = 'fixture/issue-queue';
+  queue.acceptedPrerequisites = [];
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/issue-queue.git']);
+  const readIssues = async () => [{ ...remoteReady(1), state: 'done' }, remoteReady(2)];
+  const configured = { ...options, readIssues };
+
+  // An issue closed as completed is insufficient.
+  assert.deepEqual((await preview(queue, stateDir, { readIssues })).eligible, []);
+  // A worker's local completion is insufficient too.
+  const first = await execute(queue, stateDir, { ...options, readIssues: async () => [remoteReady(1)] }, done);
+  assert.deepEqual(first.results.map(row => row.number), [1]);
+  assert.deepEqual((await preview(queue, stateDir, { readIssues })).eligible, []);
+  assert.deepEqual((await execute(queue, stateDir, configured, () => assert.fail('unaccepted prerequisite'))).results, []);
+
+  const candidate = worktreeLocation(stateDir, 1, queue.sourceRepo).path;
+  writeFileSync(join(candidate, 'accepted.txt'), 'reviewed content');
+  git(candidate, ['add', 'accepted.txt']);
+  git(candidate, ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c',
+    'commit.gpgsign=false', 'commit', '-m', 'Candidate']);
+  queue.acceptedPrerequisites = [{ number: 1, commit: git(candidate, ['rev-parse', 'HEAD']) }];
+  await assert.rejects(preview(queue, stateDir, { readIssues }), /not a commit in the dispatch base history/);
+  await assert.rejects(execute(queue, stateDir, configured, done), /not a commit in the dispatch base history/);
+  git(repo, ['merge', '--ff-only', queue.acceptedPrerequisites[0].commit]);
+
+  assert.deepEqual((await preview(queue, stateDir, { readIssues })).eligible.map(row => row.number), [2]);
+  const result = await execute(queue, stateDir, configured, async ({ cwd }) => {
+    assert.equal(readFileSync(join(cwd, 'accepted.txt'), 'utf8'), 'reviewed content');
+    return done();
+  });
+  assert.deepEqual(result.results.map(row => row.number), [2]);
+  delete queue.acceptedPrerequisites;
+  await assert.rejects(preview(queue, stateDir, { readIssues }), /different prerequisite policy/);
+});
+
 test('preserves earlier claims when a later GitHub poll fails', async t => {
   const { queue, stateDir, repo } = fixture(t, [task(1), task(2)]);
   queue.sourceRepo = 'fixture/issue-queue';
