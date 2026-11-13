@@ -164,8 +164,9 @@ async function main() {
       const decisions = state.decisionStatus();
       const intakeClaims = state.intakeClaims();
       const githubUpdates = state.githubStatusRows();
+      const recovery = state.recoveryRows().map(({ scope, ...row }) => row);
       return print({ control: state.get('control') ?? 'running', ...(sourceRepo && { sourceRepo }),
-        tasks: state.list(), ...(decisions.length && { decisions }), ...(intakeClaims.length && { intakeClaims }), ...(githubUpdates.length && { githubUpdates }),
+        tasks: state.list(), ...(decisions.length && { decisions }), ...(intakeClaims.length && { intakeClaims }), ...(githubUpdates.length && { githubUpdates }), ...(recovery.length && { recovery }),
         ...(state.get('restoreHold') === 'true' && { reconciliationRequired: true }) });
     }
     if (command === 'attempts') {

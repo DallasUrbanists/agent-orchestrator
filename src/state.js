@@ -58,6 +58,9 @@ export class State {
       "  cleaned INTEGER NOT NULL DEFAULT 0);" +
       "CREATE TABLE IF NOT EXISTS issue_status (" +
       "  number INTEGER PRIMARY KEY REFERENCES tasks(number), pull INTEGER, error TEXT);" +
+      "CREATE TABLE IF NOT EXISTS technical_recovery (" +
+      "  number INTEGER PRIMARY KEY REFERENCES tasks(number), kind TEXT NOT NULL, scope TEXT NOT NULL," +
+      "  used INTEGER NOT NULL DEFAULT 0, hold TEXT);" +
       "CREATE TABLE IF NOT EXISTS attempt_progress (" +
       "  attempt INTEGER PRIMARY KEY REFERENCES attempts(id), launched TEXT, activity TEXT, summary TEXT," +
       "  marker TEXT UNIQUE, actor INTEGER, comment INTEGER, posting INTEGER NOT NULL DEFAULT 0, error TEXT);" +
@@ -195,7 +198,7 @@ export class State {
         .run(pid ?? null, threadId ?? null, number);
     });
   }
-  finish(number, attempt, { state, detail, code }, decision = null) {
+  finish(number, attempt, { state, detail, code }, decision = null, recovery = null) {
     const completed = new Date().toISOString();
     const values = [state, detail ?? null, code ?? null, completed];
     const update = ' SET state = ?, detail = ?, exit_code = ?, completed = ?';
@@ -205,6 +208,13 @@ export class State {
       ).run(...values, attempt, number);
       if (!result.changes) throw new Error('Worker attempt no longer owns the task');
       this.db.prepare("UPDATE tasks" + update + " WHERE number = ? AND state = 'running'").run(...values, number);
+      if (recovery) {
+        this.db.prepare('INSERT INTO technical_recovery (number, kind, scope) VALUES (?, ?, ?)' +
+          ' ON CONFLICT(number) DO UPDATE SET kind = excluded.kind, scope = excluded.scope, hold = NULL')
+          .run(number, recovery.kind, recovery.scope);
+      } else {
+        this.db.prepare("UPDATE technical_recovery SET hold = 'finished' WHERE number = ?").run(number);
+      }
       if (decision) {
         this.db.prepare('INSERT INTO decisions (id, number, decision_key, template, requested) VALUES (?, ?, ?, ?, ?)')
           .run(decision.id, number, decision.key, JSON.stringify(decision.template), completed);
@@ -270,6 +280,38 @@ export class State {
         ' AND consumed IS NOT NULL ORDER BY rowid'
       ).all(number);
       return { attempt, approvedChoices };
+    });
+  }
+  adoptRecovery(number, kind, scope) {
+    this.db.prepare(
+      "INSERT OR IGNORE INTO technical_recovery (number, kind, scope) SELECT number, ?, ? FROM tasks" +
+      " WHERE number = ? AND state = 'blocked' AND cleaned = 0" +
+      " AND NOT EXISTS (SELECT 1 FROM decisions WHERE decisions.number = tasks.number AND consumed IS NULL)"
+    ).run(kind, scope, number);
+  }
+  recoveryRows() {
+    return this.db.prepare('SELECT * FROM technical_recovery ORDER BY number').all();
+  }
+  holdRecovery(number, reason) {
+    this.db.prepare('UPDATE technical_recovery SET hold = ? WHERE number = ?').run(reason, number);
+  }
+  activeMillis(number) {
+    return this.db.prepare('SELECT started, completed FROM attempts WHERE number = ? AND completed IS NOT NULL').all(number)
+      .reduce((total, row) => total + Math.max(0, Date.parse(row.completed) - Date.parse(row.started)), 0);
+  }
+  resumeRecovery(row, model, log, base, limit) {
+    const now = new Date().toISOString();
+    return this.transaction(() => {
+      const budget = this.db.prepare('UPDATE technical_recovery SET used = used + 1' +
+        ' WHERE number = ? AND kind = ? AND scope = ? AND hold IS NULL AND used < ?')
+        .run(row.number, row.kind, row.scope, limit);
+      const task = this.db.prepare(
+        "UPDATE tasks SET state = 'running', model = ?, log = ?, started = ?, retries = retries + 1," +
+        " pid = NULL, session = NULL, completed = NULL, detail = NULL, exit_code = NULL" +
+        " WHERE number = ? AND state = 'blocked'"
+      ).run(model, log, now, row.number);
+      if (!budget.changes || !task.changes) throw new Error('Technical recovery claim changed or exhausted');
+      return this.insertAttempt(row.number, base);
     });
   }
   recover() {
