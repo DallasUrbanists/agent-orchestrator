@@ -37,6 +37,7 @@ async function main() {
   if (values.help) {
     console.log('Commands: run | poll | doctor | status | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID | backup | restore FILE');
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
+    console.log('For GitHub intake, configure githubIntake.coordinatorId in the queue file.');
     console.log('Watch supervised merges with run --execute --queue FILE --watch-acceptance FILE --polls N.');
     console.log('Poll GitHub read-only with poll --repo OWNER/REPO --polls N --interval-seconds N.');
     console.log('Opt in to decision comments with run --execute --github-decisions and a reviewed GitHub queue.');
@@ -125,8 +126,9 @@ async function main() {
     if (command === 'status') {
       const sourceRepo = state.get('sourceRepo');
       const decisions = state.decisionStatus();
+      const intakeClaims = state.intakeClaims();
       return print({ control: state.get('control') ?? 'running', ...(sourceRepo && { sourceRepo }),
-        tasks: state.list(), ...(decisions.length && { decisions }),
+        tasks: state.list(), ...(decisions.length && { decisions }), ...(intakeClaims.length && { intakeClaims }),
         ...(state.get('restoreHold') === 'true' && { reconciliationRequired: true }) });
     }
     if (retryDecision) {

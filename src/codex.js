@@ -38,13 +38,16 @@ export function sandboxConfigArgs() {
     ...(windows ? ['-c', 'windows.sandbox="unelevated"'] : [])];
 }
 
-export function codexArgs(model, cwd, scratch) {
+export function codexArgs(model, cwd, scratch, reasoning = model === 'sol' ? 'high' : 'medium') {
   if (!Object.hasOwn(MODELS, model)) throw new Error('Worker model must be terra or sol');
+  if (!(reasoning === 'high' || (model === 'terra' && reasoning === 'medium'))) {
+    throw new Error('Unsupported worker reasoning effort');
+  }
   return ['exec', '--ignore-user-config', '--model', MODELS[model], '--cd', cwd,
     '--json', '--color', 'never', '--sandbox', 'workspace-write',
     '-c', 'approval_policy="never"', ...sandboxConfigArgs(),
     '-c', 'web_search="disabled"', '-c', 'shell_environment_policy.inherit="core"',
-    '-c', model === 'sol' ? 'model_reasoning_effort="high"' : 'model_reasoning_effort="medium"',
+    '-c', 'model_reasoning_effort=' + JSON.stringify(reasoning),
     ...(scratch ? ['TEMP', 'TMP', 'TMPDIR', 'ORCHESTRATOR_WORKER_TEMP'].flatMap(key =>
       ['-c', 'shell_environment_policy.set.' + key + '=' + JSON.stringify(scratch)]) : []),
     '--output-schema', schema, '-'];
@@ -114,7 +117,7 @@ const diagnostics = [
   ['rate-limit', /rate limit|usage limit|429 too many/i]
 ];
 
-export function runCodex({ executable, cwd, model, prompt, timeoutMs, signal,
+export function runCodex({ executable, cwd, model, reasoning, prompt, timeoutMs, signal,
   onRecord = () => {} }, spawnChild = spawn, killTree = terminateTree) {
   if (signal?.aborted) return Promise.resolve({ state: 'stopped', detail: 'cancelled-before-launch' });
   if (!Object.hasOwn(MODELS, model)) throw new Error('Worker model must be terra or sol');
@@ -135,7 +138,7 @@ export function runCodex({ executable, cwd, model, prompt, timeoutMs, signal,
       rmSync(scratch, { recursive: true, force: true });
     }
   }
-  const args = codexArgs(model, cwd, scratch);
+  const args = codexArgs(model, cwd, scratch, reasoning);
   return new Promise(resolve => {
     let child;
     try {
