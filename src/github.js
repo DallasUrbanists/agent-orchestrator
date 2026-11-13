@@ -174,6 +174,25 @@ export const githubStatus = {
   }
 };
 
+export async function readMergeEvidence(repo, number, head, base, options, run) {
+  if (!Number.isSafeInteger(number) || number < 1 || !/^[a-f0-9]{40}$/.test(head) || !/^[a-f0-9]{40}$/.test(base)) {
+    throw new Error('Merge evidence requires a PR number and full head and base SHAs');
+  }
+  const root = 'repos/' + githubRepo(repo);
+  const get = (endpoint, flags = []) => githubRequest('GET', [...flags, root + '/' + endpoint],
+    'GitHub merge preflight read failed', options, run);
+  const pull = () => get('pulls/' + number);
+  const branch = () => get('branches/main');
+  const [initial, main, reviews, checks, comparison] = await Promise.all([
+    pull(), branch(),
+    get('pulls/' + number + '/reviews?per_page=100', ['--paginate', '--slurp']),
+    get('commits/' + head + '/check-runs?filter=latest&per_page=100', ['--paginate', '--slurp']),
+    get('compare/' + base + '...' + head + '?per_page=1')
+  ]);
+  const [current, latestMain] = await Promise.all([pull(), branch()]);
+  return { initial, main, reviews, checks, comparison, current, latestMain };
+}
+
 const issueRevisionFields = `
   id number state title body createdAt lastEditedAt includesCreatedEdit
   repository { nameWithOwner }

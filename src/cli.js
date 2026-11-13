@@ -3,6 +3,7 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { checkSupervisedMerge } from './merge-preflight.js';
 import { findCodex, MODELS } from './codex.js';
 import { execute, preview } from './controller.js';
 import { recordHandoff, statusPublisher, statusRepository } from './issue-status.js';
@@ -29,7 +30,7 @@ async function main() {
       repo: { type: 'string' }, polls: { type: 'string', default: '1' },
       'interval-seconds': { type: 'string', default: '15' },
       execute: { type: 'boolean' }, 'github-decisions': { type: 'boolean' },
-      'github-status': { type: 'boolean' }, pr: { type: 'string' },
+      'github-status': { type: 'boolean' }, pr: { type: 'string' }, 'merge-evidence': { type: 'string' },
       limit: { type: 'string', default: '1' },
       'timeout-seconds': { type: 'string', default: '900' },
       'confirm-process-exited': { type: 'boolean' }, 'confirm-reconciled': { type: 'boolean' }, help: { type: 'boolean' }
@@ -37,7 +38,7 @@ async function main() {
   });
   const [command = 'run', argument, ...extra] = positionals;
   if (values.help) {
-    console.log('Commands: run | poll | doctor | status | attempts | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID | backup | restore FILE | sync-status [N] [--repo OWNER/REPO] | handoff N --pr N');
+    console.log('Commands: run | poll | doctor | status | attempts | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID | backup | restore FILE | sync-status [N] [--repo OWNER/REPO] | handoff N --pr N | check-merge N --merge-evidence FILE');
     console.log('Opt in to status labels and progress comments with run --execute --github-status.');
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
     console.log('For GitHub intake, configure githubIntake.coordinatorId in the queue file.');
@@ -47,7 +48,7 @@ async function main() {
     return;
   }
   const publish = command === 'sync-status' || command === 'handoff';
-  const withNumber = ['acknowledge', 'cleanup', 'handoff'].includes(command) ||
+  const withNumber = ['acknowledge', 'cleanup', 'handoff', 'check-merge'].includes(command) ||
     (command === 'sync-status' && argument !== undefined);
   const retryDecision = command === 'retry-decision';
   const validArgument = withNumber ? /^[1-9]\d*$/.test(argument ?? '') && Number.isSafeInteger(Number(argument))
@@ -57,6 +58,9 @@ async function main() {
     throw new Error('Unexpected command arguments. Use --help');
   }
 
+  if (command === 'check-merge' ? !values['merge-evidence'] : values['merge-evidence'] !== undefined) {
+    throw new Error('Only check-merge accepts and requires --merge-evidence FILE');
+  }
   if (values['github-status'] && (command !== 'run' || !values.execute)) {
     throw new Error('--github-status requires a real run with --execute');
   }
@@ -77,6 +81,14 @@ async function main() {
     if (values.execute) throw new Error('poll is read-only. Use run with a reviewed queue for execution');
     for await (const snapshot of pollGithubIssues(values.repo, polling)) print(snapshot);
     return;
+  }
+
+  if (command === 'check-merge') {
+    if (values.execute) throw new Error('check-merge is read-only');
+    const config = JSON.parse(readFileSync(values['merge-evidence'], 'utf8').replace(/^\uFEFF/, ''));
+    const result = await checkSupervisedMerge(config, Number(argument));
+    if (!result.eligibleAtObservation) process.exitCode = 1;
+    return print(result);
   }
 
   if (command === 'doctor') {
