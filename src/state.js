@@ -152,7 +152,7 @@ export class State {
   }
   resumeDecision(id, number, model, log) {
     const now = new Date().toISOString();
-    this.transaction(() => {
+    return this.transaction(() => {
       const answer = this.db.prepare(
         'UPDATE decisions SET consumed = ?, last_error = NULL WHERE id = ? AND number = ?' +
         ' AND reply_comment IS NOT NULL AND consumed IS NULL'
@@ -163,6 +163,10 @@ export class State {
         " WHERE number = ? AND state = 'blocked'"
       ).run(model, log, now, number);
       if (!answer.changes || !task.changes) throw new Error('Decision or blocked claim is unavailable for resumption');
+      return this.db.prepare(
+        'SELECT decision_key, choice, template FROM decisions WHERE number = ?' +
+        ' AND consumed IS NOT NULL ORDER BY rowid'
+      ).all(number);
     });
   }
   recover() {

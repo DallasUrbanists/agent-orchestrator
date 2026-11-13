@@ -361,6 +361,57 @@ test('recovers an ambiguous decision delivery and resumes a saved answer once in
   assert.deepEqual(restart.results, []);
 });
 
+test('resuming a second decision preserves every approved instruction for that task', async t => {
+  const { queue, stateDir, repo } = fixture(t);
+  queue.sourceRepo = 'fixture/decision-queue';
+  queue.authorizedResponders = [51];
+  queue.issues[0].decisions = ['layout', 'color'].map(key => ({
+    key,
+    question: 'Choose the ' + key,
+    choices: [
+      { id: 'first', label: 'First', instruction: 'Apply the approved ' + key + '.' },
+      { id: 'second', label: 'Second', instruction: 'Do not apply the first ' + key + '.' }
+    ]
+  }));
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/decision-queue.git']);
+
+  const time = '2026-11-11T10:00:00Z';
+  const comments = [];
+  const configured = { ...options, limit: 1, decisionsEnabled: true,
+    readIssues: async () => [remoteReady(1)],
+    decisionApi: {
+      async viewer() { return 10; },
+      async comments() { return comments; },
+      async post(_repo, _number, body) {
+        const comment = { id: comments.length + 1, user: { id: 10 }, body, created_at: time };
+        comments.push(comment);
+        return comment;
+      }
+    }
+  };
+  const reply = decision => comments.push({
+    id: comments.length + 1, user: { id: 51, type: 'User' },
+    body: '/orchestrator decide ' + decision + ' first', created_at: time, updated_at: time
+  });
+
+  const initial = await execute(queue, stateDir, configured,
+    async () => ({ state: 'blocked', result: { decisionKey: 'layout' } }));
+  reply(initial.results[0].decision);
+  const second = await execute(queue, stateDir, configured,
+    async () => ({ state: 'blocked', result: { decisionKey: 'color' } }));
+  reply(second.results[0].decision);
+
+  let finalPrompt;
+  const finished = await execute(queue, stateDir, configured, async ({ prompt }) => {
+    finalPrompt = prompt;
+    return done();
+  });
+  assert.deepEqual(finished.results.map(row => row.state), ['done']);
+  assert.match(finalPrompt, /Apply the approved layout\.[\s\S]*Apply the approved color\./);
+  assert.doesNotMatch(finalPrompt, /Do not apply the first/);
+});
+
+
 test('preserves earlier claims when a later GitHub poll fails', async t => {
   const { queue, stateDir, repo } = fixture(t, [task(1), task(2)]);
   queue.sourceRepo = 'fixture/issue-queue';
