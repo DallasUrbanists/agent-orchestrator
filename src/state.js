@@ -333,7 +333,12 @@ export class State {
         " WHERE number = ? AND state = 'done' AND cleaned = 0" +
         " AND NOT EXISTS (SELECT 1 FROM verified_handoffs WHERE number = ?)"
       ).run(number, number);
-      if (changed.changes) this.adoptRecovery(number, 'environment', scope);
+      if (!changed.changes) return;
+      this.adoptRecovery(number, 'environment', scope);
+      this.db.prepare(
+        "UPDATE technical_recovery SET kind = 'environment', scope = ?, hold = NULL" +
+        " WHERE number = ? AND hold = 'finished'"
+      ).run(scope, number);
     });
   }
 
