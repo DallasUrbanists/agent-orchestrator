@@ -240,7 +240,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const { executable, limit = 1, timeoutMs = 15 * 60 * 1000, signal,
     polls = 1, intervalMs = 15000, readIssues = readGithubIssues, decisionsEnabled = false,
     decisionApi = githubDecisions, readAcceptance, acceptancePath, intakeApi, publishStatus = false, statusApi,
-    waitForIssueRetry = wait, publishOptions } = options;
+    waitForIssueRetry = wait, publishOptions, finalHostVerification } = options;
   if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) {
     throw new Error('Specify a positive execution limit and a worker timeout up to one hour');
@@ -258,6 +258,12 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       throw new Error('Automatic publication requires matching repository and accepted prerequisite policy');
     }
     publicationOrigin(repo, handoff.repo);
+  }
+  if (finalHostVerification && (!Number.isSafeInteger(finalHostVerification.number) || finalHostVerification.number < 1 ||
+      !Number.isSafeInteger(finalHostVerification.afterAttempt) || finalHostVerification.afterAttempt < 1 ||
+      !technical?.profileEvidence?.(finalHostVerification.number) ||
+      !handoff?.issues.has(finalHostVerification.number) || limit !== 1)) {
+    throw new Error('Final host verification requires a reviewed profile, publication scope, and execution limit of one');
   }
   const responders = decisionsEnabled ? responderIds(queue) : null;
   if (acceptancePath && (inside(repo, acceptancePath) || inside(stateDir, acceptancePath))) {
@@ -340,7 +346,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       }
       if (handoff) {
         for (const number of handoff.issues.keys()) {
-          if (accepted.has(number) || state.handoff(number)?.linked) continue;
+          if ((finalHostVerification && finalHostVerification.number !== number) || accepted.has(number) || state.handoff(number)?.linked) continue;
           await publishTask(number);
           if (state.handoff(number)?.linked) await publisher?.sync(number);
         }
@@ -377,7 +383,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       if (results.length >= limit) break;
       const claimedIds = new Set(claims.map(claim => claim.issue_id));
       const dispatchable = issues.filter(issue => !claimedIds.has(issue.intake?.issueId) || answers.has(issue.number));
-      const independent = runnable(dispatchable, previous, sourceRepo, new Set(answers.keys()), accepted);
+      const independent = finalHostVerification ? [] : runnable(dispatchable, previous, sourceRepo, new Set(answers.keys()), accepted);
       const recovery = new Map();
       if (technical && !independent.length) {
         const candidates = new Map(issues.filter(issue => issue.state === 'ready').map(issue => [issue.number, issue]));
@@ -388,13 +394,17 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         for (const row of state.recoveryRows()) {
           const verifier = technical.verifierFor(row.number);
           const retryableHold = row.hold === 'verification-runner-required' || row.hold === 'verification-runner-unavailable';
-          if ((row.hold && !retryableHold) ||
+          const final = finalHostVerification && row.number === finalHostVerification.number &&
+            row.kind === 'environment' && row.hold === 'recovery-budget-exhausted' &&
+            state.attempts().filter(attempt => attempt.number === row.number).at(-1)?.id === finalHostVerification.afterAttempt &&
+            !state.get('final-host-verification:' + row.number);
+          if ((finalHostVerification && !final) || (row.hold && !retryableHold && !final) ||
               state.task(row.number)?.state !== 'blocked') continue;
           const candidate = candidates.get(row.number);
           if (!candidate) continue;
           if (recoveryScope(candidate) !== row.scope) {
             state.holdRecovery(row.number, 'task-scope-changed');
-          } else if (row.used >= technical.limit || state.activeMillis(row.number) >= ACTIVE_BUDGET_MS) {
+          } else if ((!final && row.used >= technical.limit) || state.activeMillis(row.number) >= ACTIVE_BUDGET_MS) {
             state.holdRecovery(row.number, 'recovery-budget-exhausted');
           } else if (row.kind === 'environment' && !verifier) {
             state.holdRecovery(row.number, 'verification-runner-required');
@@ -407,8 +417,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
                 continue;
               }
             }
-            if (row.hold) state.holdRecovery(row.number, null);
-            recovery.set(row.number, { ...row, verifierCode });
+            if (row.hold && !final) state.holdRecovery(row.number, null);
+            recovery.set(row.number, { ...row, verifierCode, final });
           }
         }
       }
@@ -458,7 +468,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         ? state.resumeDecision(answer.id, issue.number, model, log, git(location.path, ['rev-parse', 'HEAD']))
         : { attempt: retry
           ? state.resumeRecovery(retry, verifying ? 'verification-runner' : model, log,
-            git(location.path, ['rev-parse', 'HEAD']), technical.limit)
+            git(location.path, ['rev-parse', 'HEAD']), retry.final ? retry.used + 1 : technical.limit)
           : state.reserve({ number: issue.number, repo, worker: 'local-1', model, location, log, base, intake: issue.intake }),
           approvedChoices: retry ? state.approvedChoices(issue.number) : [] };
       const { attempt, approvedChoices } = dispatch;

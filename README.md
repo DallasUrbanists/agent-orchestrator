@@ -354,7 +354,12 @@ Exit zero means verification passed. Exit 10 means the verifier found a code
 failure that a Codex repair can address. Other exits mean the verification
 environment failed. If a repair reports success and a verifier is configured for that issue,
 the controller runs the verifier again before marking that attempt complete.
-Status shows held recoveries and their reasons.
+Status shows held recoveries and their reasons. After the owner authorizes a
+final host-only verification of an exhausted environment blocker, use
+`--execute --limit 1 --final-host-verification ISSUE:ATTEMPT` with the same
+queue and journal. Find the latest attempt ID with `attempts`. The controller
+requires a reviewed host profile and publication scope, records the extra
+attempt once, and preserves the existing retry history and time budget.
 
 Run the disposable D1-07-inspired acceptance test on Windows:
 
