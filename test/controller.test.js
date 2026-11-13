@@ -690,3 +690,93 @@ test('preserves earlier claims when a later GitHub poll fails', async t => {
   await assert.rejects(execute(queue, stateDir, { ...options, readIssues }, done), /poll failed/);
   assert.deepEqual(withState(stateDir, store => store.list().map(row => [row.number, row.state])), [[1, 'done']]);
 });
+
+test('three slots overlap isolated claims and a restart never dispatches completed work twice', async t => {
+  const { queue, stateDir } = fixture(t, [task(1), task(2), task(3), task(4, [1, 2, 3])]);
+  queue.workerSlots = 3;
+  const started = [];
+  let release;
+  const barrier = new Promise(resolve => { release = resolve; });
+  const timer = setTimeout(release, 8000);
+  t.after(() => clearTimeout(timer));
+  const result = await execute(queue, stateDir, { ...options, limit: 3 }, async ({ cwd }) => {
+    started.push(cwd);
+    if (started.length === 3) release();
+    await barrier;
+    assert.equal(started.length, 3);
+    return { state: 'done' };
+  });
+  assert.equal(new Set(started).size, 3);
+  assert.equal(result.results.length, 3);
+  assert.equal(withState(stateDir, state => new Set(state.list().map(row => row.worker)).size), 3);
+  const resumed = await execute(queue, stateDir, options, async ({ prompt }) => {
+    assert.match(prompt, /Task 4$/);
+    return { state: 'done' };
+  });
+  assert.deepEqual(resumed.results.map(row => row.number), [4]);
+});
+
+test('restart fences all three abandoned claims before dispatching new work', async t => {
+  const { repo, queue, stateDir } = fixture(t, [task(1), task(2), task(3), task(4)]);
+  queue.workerSlots = 3;
+  const base = git(repo, ['rev-parse', 'HEAD']);
+  withState(stateDir, state => {
+    for (const number of [1, 2, 3]) {
+      const location = worktreeLocation(stateDir, number);
+      createWorktree(repo, location, base);
+      state.reserve({ number, repo, worker: 'local-' + number, model: 'gpt-6.1-terra',
+        location, base, log: join(stateDir, 'abandoned-' + number + '.jsonl') });
+    }
+  });
+  const result = await execute(queue, stateDir, options, () => assert.fail('unsafe dispatch'));
+  assert.equal(result.reason, 'interrupted-worker-needs-review');
+  assert.deepEqual(withState(stateDir, state => state.list().map(row => row.state)),
+    ['interrupted', 'interrupted', 'interrupted']);
+});
+
+test('dispatch continues when a worker finishes during an intake poll', async t => {
+  const { queue, stateDir, repo } = fixture(t, [task(1), task(2), task(3)]);
+  queue.sourceRepo = 'Fixture/Issue-Queue';
+  queue.workerSlots = 3;
+  git(repo, ['remote', 'add', 'origin', 'git@github.com:fixture/issue-queue.git']);
+  let reads = 0;
+  let finish;
+  const first = new Promise(resolve => { finish = resolve; });
+  const readIssues = async () => {
+    if (++reads === 2) {
+      finish();
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    return [remoteReady(1), remoteReady(2), remoteReady(3)];
+  };
+  const result = await execute(queue, stateDir, { ...options, limit: 3, readIssues }, async ({ prompt }) => {
+    if (prompt.endsWith('Task 1')) await first;
+    return { state: 'done' };
+  });
+  assert.equal(result.reason, 'execution-limit');
+  assert.deepEqual(result.results.map(row => row.number).sort(), [1, 2, 3]);
+});
+
+test('dispatches a dependent when its prerequisite finishes during polling', async t => {
+  const { queue, stateDir, repo } = fixture(t, [task(1), task(2, [1])]);
+  queue.sourceRepo = 'Fixture/Issue-Queue';
+  queue.workerSlots = 3;
+  git(repo, ['remote', 'add', 'origin', 'git@github.com:fixture/issue-queue.git']);
+  let reads = 0;
+  let finish;
+  const first = new Promise(resolve => { finish = resolve; });
+  const readIssues = async () => {
+    if (++reads === 2) {
+      finish();
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    return [remoteReady(1), remoteReady(2, [1])];
+  };
+  const result = await execute(queue, stateDir, { ...options, limit: 3, readIssues }, async ({ prompt }) => {
+    if (prompt.endsWith('Task 1')) await first;
+    return { state: 'done' };
+  });
+  assert.equal(result.reason, 'no-eligible-work');
+  assert.deepEqual(result.results.map(row => row.number).sort(), [1, 2]);
+});
+
