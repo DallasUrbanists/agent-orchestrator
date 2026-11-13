@@ -1,6 +1,6 @@
 import { spawn, execFile } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
-import { delimiter, isAbsolute, join } from 'node:path';
+import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { delimiter, dirname, isAbsolute, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const MODELS = Object.freeze({ terra: 'gpt-6.1-terra', sol: 'gpt-6.1-sol' });
@@ -38,13 +38,15 @@ export function sandboxConfigArgs() {
     ...(windows ? ['-c', 'windows.sandbox="unelevated"'] : [])];
 }
 
-export function codexArgs(model, cwd) {
+export function codexArgs(model, cwd, scratch) {
   if (!Object.hasOwn(MODELS, model)) throw new Error('Worker model must be terra or sol');
   return ['exec', '--ignore-user-config', '--model', MODELS[model], '--cd', cwd,
     '--json', '--color', 'never', '--sandbox', 'workspace-write',
     '-c', 'approval_policy="never"', ...sandboxConfigArgs(),
     '-c', 'web_search="disabled"', '-c', 'shell_environment_policy.inherit="core"',
-    ...(model === 'sol' ? ['-c', 'model_reasoning_effort="high"'] : []),
+    '-c', model === 'sol' ? 'model_reasoning_effort="high"' : 'model_reasoning_effort="medium"',
+    ...(scratch ? ['TEMP', 'TMP', 'TMPDIR', 'ORCHESTRATOR_WORKER_TEMP'].flatMap(key =>
+      ['-c', 'shell_environment_policy.set.' + key + '=' + JSON.stringify(scratch)]) : []),
     '--output-schema', schema, '-'];
 }
 
@@ -115,7 +117,25 @@ const diagnostics = [
 export function runCodex({ executable, cwd, model, prompt, timeoutMs, signal,
   onRecord = () => {} }, spawnChild = spawn, killTree = terminateTree) {
   if (signal?.aborted) return Promise.resolve({ state: 'stopped', detail: 'cancelled-before-launch' });
-  const args = codexArgs(model, cwd);
+  if (!Object.hasOwn(MODELS, model)) throw new Error('Worker model must be terra or sol');
+  let scratch;
+  let worktree;
+  try {
+    worktree = realpathSync(cwd);
+    scratch = mkdtempSync(join(worktree, '.orchestrator-temp-'));
+  } catch {
+    return Promise.resolve({ state: 'failed', detail: 'worker-temp-setup-failed' });
+  }
+  function removeScratch() {
+    if (existsSync(scratch)) {
+      const resolved = realpathSync(scratch);
+      if (relative(resolved, scratch) !== '' || relative(dirname(resolved), worktree) !== '') {
+        throw new Error('Worker scratch directory changed location');
+      }
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }
+  const args = codexArgs(model, cwd, scratch);
   return new Promise(resolve => {
     let child;
     try {
@@ -123,6 +143,7 @@ export function runCodex({ executable, cwd, model, prompt, timeoutMs, signal,
         cwd, env: workerEnv(), shell: false, windowsHide: true, detached: !windows
       });
     } catch {
+      try { removeScratch(); } catch { /* Retain scratch if cleanup cannot be confirmed. */ }
       resolve({ state: 'failed', detail: 'spawn-error' });
       return;
     }
@@ -177,6 +198,9 @@ export function runCodex({ executable, cwd, model, prompt, timeoutMs, signal,
       clearTimeout(timer);
       clearTimeout(grace);
       signal?.removeEventListener('abort', cancel);
+      if (state !== 'interrupted') {
+        try { removeScratch(); } catch { record({ type: 'worker-temp-cleanup-failed' }); }
+      }
       record({ type: 'worker-exit', state, detail, code, signal: processSignal });
       if (recordingFailed && state !== 'interrupted' && state !== 'stopped') {
         resolve({ state: 'failed', detail: 'recording-failed', code, signal: processSignal, threadId });

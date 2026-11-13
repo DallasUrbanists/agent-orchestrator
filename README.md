@@ -29,6 +29,8 @@ This test makes real Codex requests and can consume usage. It creates a fresh lo
 
 The live worker also runs a synthetic filesystem probe that should return access denied when it tries to overwrite a file beside the worktree under Windows Temp. If the sentinel changes or the probe cannot establish the denial, the integration gate fails. This checks one write boundary on the host. The Windows worker currently uses the legacy unelevated workspace-write sandbox. Read access and network isolation have different limits, so keep the integration on disposable data. [Codex Windows sandbox](https://learn.chatgpt.com/docs/windows/windows-sandbox)
 
+Set `ORCHESTRATOR_TEST_CHROME` to the absolute path of an installed Chromium executable to also run the Windows browser probe through a real worker. The probe checks a Node child process, a fresh browser profile, loopback navigation, and scratch cleanup. A profile write alone does not establish Chromium readiness.
+
 On November 11, 2026, the disposable suite passed on Windows with Codex CLI 0.163.0, Node.js 24.22.1, and Git 2.50.1. The in-worktree writes succeeded and the sibling Temp write returned EPERM. This observation applies to the worker configuration used by the test.
 
 ## Run a reviewed local queue
@@ -72,6 +74,10 @@ For a local queue, dry-run lists tasks eligible now in dispatch order. Use the s
 The controller snapshots the target's current committed HEAD at the start of each invocation. Every task in that invocation starts from that commit. A dependency's completion opens the scheduling gate. To use its edits as a later task's base, inspect and integrate them yourself before starting the later task. Use `--limit 1`, the default, when you need to review between tasks.
 
 The allowlist matches the canonical checkout path. The controller keeps one state directory per checkout and requires it to sit outside the target checkout. It does not accept live GitHub issue bodies as executable tasks. It passes the operator-reviewed prompt as text on stdin, starts the CLI without a shell, and requests workspace-write with no approval escalation. The controller creates local branches. PR automation is future work.
+
+Every worker attempt receives a fresh scratch directory at the root of its worktree. The runner sets `TEMP`, `TMP`, and `TMPDIR` for sandboxed commands so tools such as Chromium can create profiles there. Harnesses can use `ORCHESTRATOR_WORKER_TEMP` to restore those variables inside the test process if the sandbox supplies its own Temp values. The runner removes scratch after confirmed exit and retains it for inspection when termination is uncertain. The system Temp exclusion stays enabled. Terra runs at medium reasoning and Sol runs at high reasoning.
+
+On the pilot host, legacy unelevated workers could write to scratch. Node child processes with piped output returned `spawn EPERM`, while file-backed output worked. Chromium started with file-backed output and created a profile, then exited with access-denied errors from Crashpad and Mojo IPC before navigation. In a disposable MXC comparison, Node started and profile creation passed, but Chromium still exited before navigation. Browser verification remains a coordinator step on that host.
 
 ## Poll GitHub issues and claim reviewed work
 

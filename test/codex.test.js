@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { codexArgs, jsonLines, MODELS, runCodex, terminateTree } from '../src/codex.js';
+
+const worktree = mkdtempSync(join(tmpdir(), 'worker with spaces-'));
+test.after(() => rmSync(worktree, { recursive: true, force: true }));
 
 const thread = '0199a213-81c0-7800-8aa1-bbab2a035a53';
 const encode = event => JSON.stringify(event) + '\n';
@@ -12,10 +18,11 @@ function fixture(overrides = {}) {
     pid: 1234, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough()
   });
   const events = [];
+  let scratch;
   let input = '';
   child.stdin.setEncoding('utf8').on('data', chunk => { input += chunk; });
   const options = {
-    executable: 'native-codex', model: 'sol', cwd: 'directory with spaces',
+    executable: 'native-codex', model: 'sol', cwd: worktree,
     prompt: 'Literal task $(no-shell); & $env:TEST', timeoutMs: 500,
     onRecord: record => events.push(record), ...overrides
   };
@@ -25,9 +32,15 @@ function fixture(overrides = {}) {
     assert.equal(spawnOptions.cwd, options.cwd);
     assert.equal(spawnOptions.shell, false);
     assert.equal(spawnOptions.env.GITHUB_TOKEN, undefined);
+    const tempFlags = args.filter(arg => arg.startsWith('shell_environment_policy.set.'));
+    const tempValues = tempFlags.map(arg => JSON.parse(arg.slice(arg.indexOf('=') + 1)));
+    assert.equal(tempFlags.length, 4);
+    assert.equal(new Set(tempValues).size, 1);
+    scratch = tempValues[0];
+    assert.ok(existsSync(scratch));
     return child;
   }
-  return { child, options, events, spawn, input: () => input };
+  return { child, options, events, spawn, input: () => input, scratch: () => scratch };
 }
 
 test('routes only Terra and Sol and builds an explicit sandboxed argument array', () => {
@@ -39,6 +52,7 @@ test('routes only Terra and Sol and builds an explicit sandboxed argument array'
     assert.ok(args.includes('--json'));
     assert.equal(args.at(-1), '-');
     assert.ok(args.includes('approval_policy="never"'));
+    assert.ok(args.includes('model_reasoning_effort="' + (model === 'sol' ? 'high' : 'medium') + '"'));
     assert.equal(args.some(arg => /bypass|astra/i.test(arg)), false);
   }
   assert.throws(() => codexArgs('astra', 'x'), /terra or sol/);
@@ -70,6 +84,7 @@ test('passes prompt via stdin, returns result and exit code, and omits raw outpu
   assert.deepEqual(await run, { state: 'done', detail: null, code: 0, signal: null,
     threadId: thread, result: { outcome: 'done', summary: 'sensitive command output' } });
   assert.ok(events.some(event => event.threadId === thread));
+  assert.deepEqual(readdirSync(worktree), []);
   assert.doesNotMatch(JSON.stringify(events), /sensitive|Literal task/);
 });
 
@@ -89,7 +104,7 @@ test('distinguishes nonzero exit and a truncated successful exit', async () => {
 for (const reason of ['timeout', 'cancelled', 'unconfirmed']) {
   test('reports ' + reason + ' and requests process-tree termination', async () => {
     const cancel = new AbortController();
-    const { child, options, spawn } = fixture({ signal: cancel.signal, timeoutMs: 20 });
+    const { child, options, spawn, scratch } = fixture({ signal: cancel.signal, timeoutMs: 20 });
     let terminated = false;
     const run = runCodex(options, spawn, async pid => {
       assert.equal(pid, child.pid);
@@ -102,6 +117,7 @@ for (const reason of ['timeout', 'cancelled', 'unconfirmed']) {
     assert.ok(terminated);
     assert.equal(result.state, { timeout: 'failed', cancelled: 'stopped', unconfirmed: 'interrupted' }[reason]);
     assert.equal(result.detail, reason === 'unconfirmed' ? 'process-tree-exit-unconfirmed' : reason);
+    assert.equal(existsSync(scratch()), reason === 'unconfirmed');
   });
 }
 
