@@ -62,6 +62,50 @@ function fixtureApi(rows, comments, { detail = row => row, beforePoll = () => {}
     comments: (id, options) => githubIntake.comments(id, options, run) };
 }
 
+test('adopts a local journal without reclaiming work or dropping dependency holds', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'orchestrator-adopt-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const repo = join(root, 'target');
+  const remote = join(root, 'origin.git');
+  const stateDir = join(root, 'run');
+  git(root, ['init', '-b', 'main', repo]);
+  git(root, ['init', '--bare', '--initial-branch=main', remote]);
+  git(repo, ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+    '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'Seed']);
+  const base = git(repo, ['rev-parse', 'HEAD']);
+  git(remote, ['fetch', '--', repo, 'refs/heads/main:refs/heads/main']);
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/' + repoName]);
+  git(repo, ['config', '--local', 'url.' + pathToFileURL(remote).href + '.insteadOf', 'https://github.com/' + repoName]);
+  const accepted = [{ number: 3, commit: base }];
+  const common = { target: repo, allowedRepos: [repo], acceptedPrerequisites: accepted };
+  await execute({ ...common, issues: [{ number: 1, state: 'ready', model: 'terra', dependencies: [],
+    prompt: 'Legacy issue' }] }, stateDir, { limit: 1, readAcceptance: () => accepted },
+  async () => ({ state: 'done' }));
+
+  const queue = { ...common, sourceRepo: repoName,
+    githubIntake: { coordinatorId, requiredPrerequisites: { 2: [4] } } };
+  const intakeApi = fixtureApi(() => [issue(1, coordinatorId, 'Already claimed'),
+    issue(2, coordinatorId, 'Held for a separate prerequisite'),
+    issue(5, coordinatorId, 'Depends on: #3\nIndependent issue')], new Map());
+  const options = { adoptLocalIntake: true, intakeApi, limit: 1, readAcceptance: () => accepted };
+  await assert.rejects(execute(queue, stateDir, { ...options, readAcceptance: () => [] }),
+    /Acceptance receipt changed or disappeared/);
+  const result = await execute(queue, stateDir, options, async ({ prompt }) => {
+    assert.match(prompt, /Independent issue/);
+    return { state: 'done' };
+  });
+  assert.deepEqual(result.results.map(row => row.number), [5]);
+  const state = new State(stateDir, { readOnly: true });
+  try {
+    assert.equal(state.task(1).branch, 'orchestrator/task-1');
+    assert.equal(state.task(2), undefined);
+    assert.equal(state.task(5).branch, 'orchestrator/github-issue-5');
+    assert.equal(state.attempts().length, 2);
+    assert.deepEqual(JSON.parse(state.get('intakeAcceptance')).accepted, [[3, base]]);
+  } finally { state.close(); }
+  assert.deepEqual((await execute(queue, stateDir, options, () => assert.fail('duplicate'))).results, []);
+});
+
 test('intake resumes the same approved claim after an authorized decision reply', async t => {
   const root = mkdtempSync(join(tmpdir(), 'intake-decisions-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));

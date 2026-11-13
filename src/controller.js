@@ -63,10 +63,16 @@ function prepareQueue(queue, repo, readIssues, decisionsEnabled = false, intakeA
     throw new Error('The checkout origin must match sourceRepo on github.com');
   }
   if (Object.hasOwn(queue, 'githubIntake')) {
-    const { coordinatorId } = queue.githubIntake ?? {};
+    const { coordinatorId, requiredPrerequisites = {} } = queue.githubIntake ?? {};
     if (!Number.isSafeInteger(coordinatorId) || coordinatorId < 1 || Object.hasOwn(queue, 'issues') ||
         !Array.isArray(queue.acceptedPrerequisites)) {
       throw new Error('GitHub intake requires coordinatorId and acceptedPrerequisites, with no local issues array');
+    }
+    if (!requiredPrerequisites || typeof requiredPrerequisites !== 'object' || Array.isArray(requiredPrerequisites) ||
+        Object.entries(requiredPrerequisites).some(([issue, numbers]) => !/^[1-9]\d*$/.test(issue) ||
+          !Number.isSafeInteger(Number(issue)) || !Array.isArray(numbers) || numbers.some(number =>
+            !Number.isSafeInteger(number) || number < 1 || number === Number(issue)))) {
+      throw new Error('Invalid additional GitHub intake prerequisites');
     }
     const templates = new Map();
     if (decisionsEnabled) {
@@ -83,7 +89,10 @@ function prepareQueue(queue, repo, readIssues, decisionsEnabled = false, intakeA
     }
     return { sourceRepo, coordinatorId, async load(signal) {
       const issues = await readIssueIntake(sourceRepo, coordinatorId, { signal }, intakeApi);
-      return issues.map(issue => {
+      return issues.map(row => {
+        const extra = requiredPrerequisites[row.number];
+        const issue = extra && row.state === 'ready'
+          ? { ...row, dependencies: [...new Set([...row.dependencies, ...extra])] } : row;
         const template = templates.get(issue.number);
         return template && issue.intake?.hash === template.revision ? { ...issue, decisions: template.decisions } : issue;
       });
@@ -240,7 +249,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const { executable, limit = 1, timeoutMs = 15 * 60 * 1000, signal,
     polls = 1, intervalMs = 15000, readIssues = readGithubIssues, decisionsEnabled = false,
     decisionApi = githubDecisions, readAcceptance, acceptancePath, intakeApi, publishStatus = false, statusApi,
-    waitForIssueRetry = wait, publishOptions, finalHostVerification, continuous = false } = options;
+    waitForIssueRetry = wait, publishOptions, finalHostVerification, continuous = false, adoptLocalIntake = false } = options;
   if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) {
     throw new Error('Specify a positive execution limit and a worker timeout up to one hour');
@@ -251,6 +260,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const { sourceRepo, coordinatorId, load } = prepareQueue(queue, repo, readIssues, decisionsEnabled, intakeApi);
   if (publishStatus && !sourceRepo) throw new Error('GitHub status publishing requires a GitHub-backed queue');
   if (coordinatorId && !readAcceptance) throw new Error('GitHub intake requires --watch-acceptance');
+  if (adoptLocalIntake && !coordinatorId) throw new Error('Journal adoption requires GitHub intake');
   if (continuous && ((!sourceRepo && !readAcceptance) || finalHostVerification)) {
     throw new Error('Continuous polling requires GitHub or watched acceptance and a regular execution run');
   }
@@ -279,10 +289,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   let state;
   try {
     state = new State(stateDir);
-    state.bind(repo, sourceRepo, Object.hasOwn(queue, 'acceptedPrerequisites'), coordinatorId);
     if (state.get('restoreHold') === 'true') return { reason: 'restored-state-needs-reconciliation', results };
-    state.recover();
-    const publisher = publishStatus ? statusPublisher(state, sourceRepo, { api: statusApi, signal }) : null;
     const refreshMain = coordinatorId ? () => {
       const origin = git(repo, ['config', '--local', '--get-all', 'remote.origin.url']);
       if (githubOrigin(origin) !== sourceRepo) throw new Error('The checkout origin changed during intake');
@@ -293,6 +300,16 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     } : undefined;
     const saved = JSON.parse(state.get('intakeAcceptance') ?? '{}');
     const loadAcceptance = readAcceptance && watchAcceptance(queue, repo, readAcceptance, refreshMain, saved);
+    if (adoptLocalIntake && state.get('repo') && !state.get('sourceRepo')) {
+      if (dispatchHold(state.list(), null)) throw new Error('Stop or reconcile active work before adopting its journal');
+      const observation = loadAcceptance();
+      await load(signal);
+      if (signal?.aborted) return { reason: 'stopped', results };
+      state.adoptLocalIntake(repo, sourceRepo, coordinatorId, observation);
+    }
+    state.bind(repo, sourceRepo, Object.hasOwn(queue, 'acceptedPrerequisites'), coordinatorId);
+    state.recover();
+    const publisher = publishStatus ? statusPublisher(state, sourceRepo, { api: statusApi, signal }) : null;
     const startupBase = loadAcceptance ? null : git(repo, ['rev-parse', '--verify', 'HEAD^{commit}']);
     const initial = loadAcceptance ? null : {
       base: startupBase, accepted: verifyAcceptedPrerequisites(queue, repo, startupBase)
@@ -414,6 +431,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
               state.task(row.number)?.state !== 'blocked') continue;
           const candidate = candidates.get(row.number);
           if (!candidate) continue;
+          if (coordinatorId && !claimsByIssue.has(row.number)) continue;
           if (recoveryScope(candidate) !== row.scope) {
             state.holdRecovery(row.number, 'task-scope-changed');
           } else if ((!final && row.used >= technical.limit) || state.activeMillis(row.number) >= ACTIVE_BUDGET_MS) {
