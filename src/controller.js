@@ -63,10 +63,29 @@ function prepareQueue(queue, repo, readIssues, decisionsEnabled = false, intakeA
   if (Object.hasOwn(queue, 'githubIntake')) {
     const { coordinatorId } = queue.githubIntake ?? {};
     if (!Number.isSafeInteger(coordinatorId) || coordinatorId < 1 || Object.hasOwn(queue, 'issues') ||
-        !Array.isArray(queue.acceptedPrerequisites) || decisionsEnabled) {
-      throw new Error('GitHub intake requires coordinatorId and acceptedPrerequisites, with no local issues or decision posting');
+        !Array.isArray(queue.acceptedPrerequisites)) {
+      throw new Error('GitHub intake requires coordinatorId and acceptedPrerequisites, with no local issues array');
     }
-    return { sourceRepo, coordinatorId, load: signal => readIssueIntake(sourceRepo, coordinatorId, { signal }, intakeApi) };
+    const templates = new Map();
+    if (decisionsEnabled) {
+      const bindings = queue.intakeDecisions;
+      if (!Array.isArray(bindings)) throw new Error('GitHub intake decisions require an intakeDecisions array');
+      for (const binding of bindings) {
+        if (!Number.isSafeInteger(binding?.number) || binding.number < 1 || templates.has(binding.number) ||
+            typeof binding.revision !== 'string' || !/^[0-9a-f]{64}$/.test(binding.revision) ||
+            !Array.isArray(binding.decisions) || !binding.decisions.length) {
+          throw new Error('Intake decision templates require a unique issue number and a reviewed revision hash');
+        }
+        templates.set(binding.number, { revision: binding.revision, decisions: reviewedDecisions(binding) });
+      }
+    }
+    return { sourceRepo, coordinatorId, async load(signal) {
+      const issues = await readIssueIntake(sourceRepo, coordinatorId, { signal }, intakeApi);
+      return issues.map(issue => {
+        const template = templates.get(issue.number);
+        return template && issue.intake?.hash === template.revision ? { ...issue, decisions: template.decisions } : issue;
+      });
+    } };
   }
   if (!Array.isArray(queue.issues)) throw new Error('GitHub queues need an issues array of reviewed prompts');
   const requireAcceptance = Object.hasOwn(queue, 'acceptedPrerequisites');
@@ -204,7 +223,8 @@ export async function preview(queue, statePath, { readIssues = readGithubIssues,
     }));
     return { mode: 'dry-run', ...(sourceRepo && { sourceRepo }),
       reason: hold ?? (eligible.length ? 'eligible-work' : 'no-eligible-work'), eligible,
-      ...(coordinatorId && { coordinatorId, admitted: unclaimed.filter(issue => issue.state === 'ready' &&
+      ...(coordinatorId && { coordinatorId, revisions: issues.filter(issue => issue.intake)
+        .map(issue => ({ number: issue.number, revision: issue.intake.hash })), admitted: unclaimed.filter(issue => issue.state === 'ready' &&
         !accepted.has(issue.number) && !rows.some(row => row.number === issue.number))
         .map(issue => issue.number), awaitingApproval: issues.filter(issue => issue.reason === 'needs-coordinator-approval')
         .map(issue => issue.number), held: issues.filter(issue => issue.reason === 'unsupported-task-metadata-or-revision')
@@ -295,11 +315,22 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         const observed = JSON.stringify({ base, accepted: [...accepted] });
         if (state.get('intakeAcceptance') !== observed) state.set('intakeAcceptance', observed);
       }
+      const claims = state.intakeClaims();
+      const claimsByIssue = new Map(claims.map(claim => [claim.number, claim]));
       const answers = new Map();
       if (decisionsEnabled) {
         const ready = new Map(issues.filter(issue => issue.state === 'ready').map(issue => [issue.number, issue]));
-        const approved = row => !accepted?.has(row.number) &&
-          ready.get(row.number)?.decisions.some(item => item.key === row.decision_key);
+        const approved = row => {
+          if (accepted?.has(row.number)) return false;
+          const issue = ready.get(row.number);
+          const template = issue?.decisions?.find(item => item.key === row.decision_key);
+          if (!coordinatorId) return Boolean(template);
+          const claim = claimsByIssue.get(row.number);
+          if (claim?.issue_id === issue?.intake?.issueId && claim?.revision === issue?.intake?.hash &&
+              template && JSON.stringify(template) === row.template) return true;
+          state.decisionError(row.id, 'intake-decision-scope-no-longer-approved');
+          return false;
+        };
         const canContinue = () => !signal?.aborted && !dispatchHold(previous, state.get('control'));
         const pending = state.pendingDecisions().filter(approved);
         const verified = await syncDecisions(state, sourceRepo, pending, {
@@ -313,9 +344,9 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         }
       }
       if (results.length >= limit) break;
-      const claimedIds = new Set(state.intakeClaims().map(claim => claim.issue_id));
-      const unclaimed = issues.filter(issue => !claimedIds.has(issue.intake?.issueId));
-      const independent = runnable(unclaimed, previous, sourceRepo, new Set(answers.keys()), accepted);
+      const claimedIds = new Set(claims.map(claim => claim.issue_id));
+      const dispatchable = issues.filter(issue => !claimedIds.has(issue.intake?.issueId) || answers.has(issue.number));
+      const independent = runnable(dispatchable, previous, sourceRepo, new Set(answers.keys()), accepted);
       const recovery = new Map();
       if (technical && !independent.length) {
         const candidates = new Map(issues.filter(issue => issue.state === 'ready').map(issue => [issue.number, issue]));
