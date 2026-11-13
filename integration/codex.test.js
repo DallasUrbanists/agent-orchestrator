@@ -105,7 +105,7 @@ test('one live controller dispatches a dependent task from supervised merged mai
   }
 });
 
-test('blocks, runs independent work, and resumes after an authorized fixture reply', {
+test('blocks, runs independent work, and resumes after a reply received while stopped', {
   skip: !live, timeout: 470000
 }, async t => {
   const { scratch, repo, stateDir } = disposable(t);
@@ -165,6 +165,7 @@ test('blocks, runs independent work, and resumes after an authorized fixture rep
   const timestamp = '2026-11-11T12:00:00Z';
   let posted;
   let posts = 0;
+  const replies = [];
   const decisionApi = {
     async viewer() { return 100; },
     async post(_repo, number, body) {
@@ -173,16 +174,28 @@ test('blocks, runs independent work, and resumes after an authorized fixture rep
       posted = { id: 10, user: { id: 100, type: 'User' }, body, created_at: timestamp };
       return posted;
     },
-    async comments() {
-      if (!posted) return [];
-      if (reads < 4) return [posted];
-      const id = /agent-orchestrator-decision:([a-f0-9-]+)/.exec(posted.body)[1];
-      return [posted, { id: 11, user: { id: 101, type: 'User' }, created_at: timestamp, updated_at: timestamp,
-        body: '/orchestrator decide ' + id + ' continue' }];
-    }
+    async comments() { return posted ? [posted, ...replies] : []; }
   };
   const options = { executable, limit: 4, timeoutMs: 140000, polls: 2, intervalMs: 10, readIssues,
     decisionsEnabled: true, decisionApi };
+  const initial = await execute(queue, stateDir, { ...options, limit: 2 });
+  assert.deepEqual(initial.results.map(item => [item.number, item.state]), [[1, 'blocked'], [2, 'done']], JSON.stringify(initial));
+  assert.equal(initial.reason, 'execution-limit');
+  const id = initial.results[0].decision;
+  assert.ok(id && posted);
+  const blocked = new State(stateDir, { readOnly: true });
+  try {
+    assert.equal(blocked.decisionStatus()[0].consumed, null);
+    assert.equal(blocked.task(1).state, 'blocked');
+    assert.deepEqual(blocked.attempts().map(row => row.state), ['blocked', 'done']);
+  } finally { blocked.close(); }
+
+  // The fixture receives all four replies after the first controller released its lease.
+  const reply = (comment, account, choice) => ({
+    id: comment, user: { id: account, type: 'User' }, created_at: timestamp, updated_at: timestamp,
+    body: '/orchestrator decide ' + id + ' ' + choice
+  });
+  replies.push(reply(9, 101, 'leave'), reply(11, 102, 'leave'), reply(12, 101, 'continue'), reply(13, 101, 'continue'));
   const result = await execute(queue, stateDir, options);
   const store = new State(stateDir);
   let rows, attempts;
@@ -192,20 +205,21 @@ test('blocks, runs independent work, and resumes after an authorized fixture rep
     attempts = store.attempts();
     const [decision] = store.decisionStatus();
     assert.equal(decision.responder_id, 101);
+    assert.equal(decision.reply_comment, 12);
     assert.equal(decision.choice, 'continue');
     assert.ok(decision.consumed);
   } finally { store.close(); }
-  t.diagnostic(JSON.stringify(result));
+  t.diagnostic(JSON.stringify({ beforeStop: initial, afterRestart: result }));
   for (const row of rows) {
     t.diagnostic(JSON.stringify({ model: row.model, state: row.state, detail: row.detail,
       exit: row.exit_code, thread: row.session, log: row.log }));
   }
-  assert.deepEqual(result.results.map(item => [item.number, item.state]), [[1, 'blocked'], [2, 'done'], [1, 'done']]);
+  assert.deepEqual(result.results.map(item => [item.number, item.state]), [[1, 'done']]);
   assert.equal(posts, 1);
-  assert.equal(result.results[2].resumedFrom, result.results[0].decision);
+  assert.equal(result.results[0].resumedFrom, id);
   assert.equal(rows[0].retries, 1);
   assert.deepEqual(attempts.map(item => [item.number, item.state]), [[1, 'blocked'], [2, 'done'], [1, 'done']]);
-  assert.equal(attempts[2].decision, result.results[2].resumedFrom);
+  assert.equal(attempts[2].decision, id);
   assert.equal(attempts[2].session, rows[0].session);
   assert.equal(new Set(attempts.map(item => item.session)).size, 3);
   assert.equal(result.reason, 'no-eligible-work');
