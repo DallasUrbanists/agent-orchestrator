@@ -1,3 +1,4 @@
+import { repairPull } from './merge-conflict.js';
 import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, mkdirSync, openSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
@@ -473,6 +474,26 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       }
       const [issue] = independent.length ? independent
         : runnable(issues, previous, sourceRepo, new Set(recovery.keys()), accepted).filter(issue => recovery.has(issue.number));
+      if (!issue && !finalHostVerification && queue.pullRepair && !signal?.aborted && handoff) {
+        for (const number of queue.pullRepair.issues ?? []) {
+          const receipt = state.handoff(number);
+          const task = state.task(number);
+          const candidate = issues.find(row => row.number === number && row.state === 'ready');
+          const claim = claimsByIssue.get(number);
+          if (!receipt?.linked || !candidate || task?.state !== 'done' || accepted.has(number) ||
+              !handoff.issues.has(number) || !technical?.verifierFor(number) ||
+              (coordinatorId && (!claim || claim.issue_id !== candidate.intake?.issueId ||
+                claim.revision !== candidate.intake?.hash))) continue;
+          const authorized = () => !dispatchHold(state.list(), state.get('control'));
+          try {
+            await repairPull({ state, stateDir, target: repo, repo: handoff.repo, task, receipt,
+              entry: handoff.issues.get(number), issue: candidate, reviewers: queue.pullRepair.reviewers ?? [],
+              verifier: technical.verifierFor(number)(), worker, executable, signal, timeoutMs, authorized });
+          } catch {
+            state.set('pullRepairError:' + receipt.pull, 'repair-held');
+          }
+        }
+      }
       const beforeClaim = dispatchHold(previous, state.get('control'));
       if (beforeClaim) return { reason: beforeClaim, results };
       if (signal?.aborted) return { reason: 'stopped', results };
