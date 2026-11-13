@@ -331,6 +331,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     }
     state.bind(repo, sourceRepo, Object.hasOwn(queue, 'acceptedPrerequisites'), coordinatorId);
     state.recover();
+    if (state.get('activePullRepair')) return { reason: 'pull-repair-interrupted', results };
     const statusNumbers = publishStatus && !sourceRepo ? new Set(queue.issues.map(issue => issue.number)) : undefined;
     if (statusNumbers) {
       const savedStatusRepo = state.get('statusRepo');
@@ -518,7 +519,13 @@ export async function execute(queue, statePath, options, worker = runCodex) {
               !handoff.issues.has(number) || !technical?.verifierFor(number) ||
               (coordinatorId && (!claim || claim.issue_id !== candidate.intake?.issueId ||
                 claim.revision !== candidate.intake?.hash))) continue;
-          const authorized = () => !dispatchHold(state.list(), state.get('control'));
+          const authorized = async () => {
+            if (signal?.aborted || dispatchHold(state.list(), state.get('control'))) return false;
+            if (!coordinatorId) return true;
+            const current = (await load(signal)).find(row => row.number === number);
+            return current?.state === 'ready' && current.intake?.issueId === claim.issue_id &&
+              current.intake.hash === claim.revision && !dispatchHold(state.list(), state.get('control'));
+          };
           try {
             await repairPull({ state, stateDir, target: repo, repo: handoff.repo, task, receipt,
               entry: handoff.issues.get(number), issue: candidate, reviewers: queue.pullRepair.reviewers ?? [],
@@ -526,6 +533,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           } catch {
             state.set('pullRepairError:' + receipt.pull, 'repair-held');
           }
+          if (state.get('activePullRepair')) return { reason: 'pull-repair-interrupted', results };
         }
       }
       const beforeClaim = dispatchHold(previous, state.get('control'));
