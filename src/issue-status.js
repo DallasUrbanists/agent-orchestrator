@@ -15,12 +15,13 @@ const activitySummaries = {
 };
 
 export function observeProgress(state, attempt, event, at) {
+  if (typeof event.type !== 'string') return false;
   if (event.type === 'worker-started' && Number.isSafeInteger(event.pid) && event.pid > 0) {
     state.observeAttempt(attempt, { launched: at });
     return true;
   }
   // Publish controlled phrases only. Raw model output can contain secrets or mentions.
-  const kind = event.type?.startsWith('item.') ? event.itemType : event.type;
+  const kind = event.type.startsWith('item.') ? event.itemType : event.type;
   if (Object.hasOwn(activitySummaries, kind)) {
     const summary = kind === 'command_execution' && event.type !== 'item.completed'
       ? 'Codex reported a local command in progress.' : activitySummaries[kind];

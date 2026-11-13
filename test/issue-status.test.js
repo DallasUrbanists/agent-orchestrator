@@ -69,6 +69,8 @@ test('launch opens one comment and the five-minute update reports observed activ
   await sync(1);
   assert.deepEqual([...f.labels], ['keep-me']);
   assert.equal(f.posts, 0);
+  assert.equal(f.observe({ pid: 321, threadId: 'session' }, 0), false);
+  assert.equal(f.observe({ type: 1, pid: 321 }, 0), false);
   assert.equal(f.observe({ type: 'worker-started', pid: null }, 0), false);
   assert.equal(f.observe({ type: 'worker-started', pid: 321 }, 0), true);
   await sync(1);
