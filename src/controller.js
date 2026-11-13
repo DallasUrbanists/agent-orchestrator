@@ -189,14 +189,14 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           ready.get(row.number)?.decisions.some(item => item.key === row.decision_key);
         const canContinue = () => !signal?.aborted && !dispatchHold(previous, state.get('control'));
         const pending = state.pendingDecisions().filter(approved);
-        await syncDecisions(state, sourceRepo, pending.filter(row => !row.reply_comment), {
+        const verified = await syncDecisions(state, sourceRepo, pending, {
           api: decisionApi, responders, signal, canContinue
         });
         if (signal?.aborted) return { reason: 'stopped', results };
         const afterDecisions = dispatchHold(previous, state.get('control'));
         if (afterDecisions) return { reason: afterDecisions, results };
         for (const row of state.pendingDecisions().filter(approved)) {
-          if (row.reply_comment && !unavailable.has(row.id)) answers.set(row.number, row);
+          if (verified.has(row.id) && !unavailable.has(row.id)) answers.set(row.number, row);
         }
       }
       if (results.length >= limit) break;
