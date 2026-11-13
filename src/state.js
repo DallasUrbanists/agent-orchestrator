@@ -327,9 +327,13 @@ export class State {
   resumeRecovery(row, model, log, base, limit) {
     const now = new Date().toISOString();
     return this.transaction(() => {
-      const budget = this.db.prepare('UPDATE technical_recovery SET used = used + 1' +
-        ' WHERE number = ? AND kind = ? AND scope = ? AND hold IS NULL AND used < ?')
-        .run(row.number, row.kind, row.scope, limit);
+      if (row.final && (model !== 'verification-runner' || this.get('final-host-verification:' + row.number))) {
+        throw new Error('Final host verification already consumed or invalid');
+      }
+      const budget = this.db.prepare('UPDATE technical_recovery SET used = used + 1, hold = NULL' +
+        ' WHERE number = ? AND kind = ? AND scope = ? AND hold IS ? AND used < ?')
+        .run(row.number, row.kind, row.scope, row.final ? 'recovery-budget-exhausted' : null, limit);
+      if (row.final) this.set('final-host-verification:' + row.number, now);
       const task = this.db.prepare(
         "UPDATE tasks SET state = 'running', model = ?, log = ?, started = ?, retries = retries + 1," +
         " pid = NULL, session = NULL, completed = NULL, detail = NULL, exit_code = NULL" +
