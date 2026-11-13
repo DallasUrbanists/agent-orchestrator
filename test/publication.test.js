@@ -119,6 +119,35 @@ test('automatically verifies and publishes a recovered task, without releasing i
   assert.match(f.pulls[0].body, /Approved verification runner exited successfully[\s\S]*Verifier SHA-256/);
 });
 
+test('publishes measured profile checks and holds malformed verifier evidence', async t => {
+  for (const valid of [true, false]) {
+    const f = fixture(t);
+    const path = join(f.root, 'verifier.mjs');
+    const output = valid ? [{ name: 'portrait', measurements: { width: 1080, frames: 300 } }]
+      : [{ name: 'portrait', measurements: { output: 'private machine path' } }];
+    const code = 'process.stdout.write(' + JSON.stringify(JSON.stringify(output)) + ');';
+    writeFileSync(path, code);
+    f.queue.technicalRecovery = { hostVerification: {
+      runner: { path, sha256: createHash('sha256').update(code).digest('hex') },
+      profiles: { render: 'Check the rendered fixture.' },
+      issues: [{ number: 7, profile: 'render' }]
+    } };
+    f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'] }] };
+    const result = await f.executeWith(async ({ cwd }) => {
+      writeFileSync(join(cwd, 'renderer.txt'), 'verified');
+      return { state: 'done' };
+    });
+    if (valid) {
+      assert.match(f.pulls[0].body, /Measured checks[\s\S]*portrait — width 1080, frames 300/);
+      assert.match(f.inspect(state => state.handoff(7).evidence), /frames 300/);
+    } else {
+      assert.equal(result.results[0].detail, 'invalid-verification-evidence');
+      assert.equal(f.inspect(state => state.handoff(7)), undefined);
+      assert.equal(f.pushes.size, 0);
+    }
+  }
+});
+
 test('one authorized verification after exhaustion preserves the claim and publishes without a worker', async t => {
   const f = fixture(t);
   const path = join(f.root, 'verifier.mjs');
