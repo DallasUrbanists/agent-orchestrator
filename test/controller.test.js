@@ -570,6 +570,31 @@ test('continuous watch dispatches after several idle polls and stops at its exec
   assert.deepEqual(result.results.map(row => row.number), [1]);
 });
 
+test('continuous polling fills an idle slot when work arrives during a running worker', async t => {
+  const { queue, repo, stateDir } = fixture(t, [task(1), task(2)]);
+  queue.workerSlots = 2;
+  queue.sourceRepo = 'Fixture/Issue-Queue';
+  git(repo, ['remote', 'add', 'origin', 'git@github.com:fixture/issue-queue.git']);
+  let reads = 0, running = false, overlapped = false, finish;
+  const barrier = new Promise(resolve => { finish = resolve; });
+  const timeout = setTimeout(finish, 5000);
+  t.after(() => clearTimeout(timeout));
+  await execute(queue, stateDir, { ...options, continuous: true, limit: 2, intervalMs: 5, signal: AbortSignal.timeout(15000),
+    readIssues: async () => ++reads < 3 ? [remoteReady(1)] : [remoteReady(1), remoteReady(2)]
+  }, async ({ prompt }) => {
+    if (prompt.endsWith('Task 1')) {
+      running = true;
+      await barrier;
+      running = false;
+    } else {
+      overlapped = running;
+      finish();
+    }
+    return done();
+  });
+  assert.equal(overlapped, true);
+});
+
 test('continuous watch honors a pause during an idle poll', async t => {
   const { queue, stateDir } = fixture(t, [{ ...task(1), state: 'blocked' }]);
   queue.acceptedPrerequisites = [];

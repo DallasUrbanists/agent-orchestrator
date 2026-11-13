@@ -643,7 +643,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       if (signal?.aborted) return { reason: 'stopped', results };
       if (!issue) {
         if (active.size) {
-          await Promise.race(active.values());
+          if (continuous) await wait(intervalMs, undefined, { signal });
+          else await Promise.race(active.values());
           continue;
         }
         idlePolls++;
