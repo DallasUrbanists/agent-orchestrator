@@ -25,24 +25,32 @@ async function main() {
       queue: { type: 'string' }, state: { type: 'string', default: './state' },
       repo: { type: 'string' }, polls: { type: 'string', default: '1' },
       'interval-seconds': { type: 'string', default: '15' },
-      execute: { type: 'boolean' }, limit: { type: 'string', default: '1' },
+      execute: { type: 'boolean' }, 'github-decisions': { type: 'boolean' },
+      limit: { type: 'string', default: '1' },
       'timeout-seconds': { type: 'string', default: '900' },
       'confirm-process-exited': { type: 'boolean' }, help: { type: 'boolean' }
     }
   });
   const [command = 'run', argument, ...extra] = positionals;
   if (values.help) {
-    console.log('Commands: run | poll | doctor | status | pause | stop | unpause | acknowledge N | cleanup N');
+    console.log('Commands: run | poll | doctor | status | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID');
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
     console.log('Poll GitHub read-only with poll --repo OWNER/REPO --polls N --interval-seconds N.');
+    console.log('Opt in to decision comments with run --execute --github-decisions and a reviewed GitHub queue.');
     return;
   }
   const withNumber = ['acknowledge', 'cleanup'].includes(command);
-  if (extra.length || (withNumber ? !/^[1-9]\d*$/.test(argument ?? '') ||
-      !Number.isSafeInteger(Number(argument)) : argument !== undefined)) {
+  const retryDecision = command === 'retry-decision';
+  const validArgument = withNumber ? /^[1-9]\d*$/.test(argument ?? '') && Number.isSafeInteger(Number(argument))
+    : retryDecision ? /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(argument ?? '')
+      : argument === undefined;
+  if (extra.length || !validArgument) {
     throw new Error('Unexpected command arguments. Use --help');
   }
 
+  if (values['github-decisions'] && (command !== 'run' || !values.execute)) {
+    throw new Error('--github-decisions requires a real run with --execute');
+  }
   if (values.repo && command !== 'poll') throw new Error('--repo is only used with poll');
   const polling = { polls: Number(values.polls), intervalMs: 1000 * Number(values['interval-seconds']) };
   if (command === 'poll') {
@@ -74,7 +82,7 @@ async function main() {
     try {
       const result = await execute(data, resolve(values.state), {
         executable, limit: Number(values.limit), timeoutMs: 1000 * Number(values['timeout-seconds']),
-        signal: abort.signal, ...polling
+        signal: abort.signal, decisionsEnabled: values['github-decisions'], ...polling
       });
       print(result);
       if (result.reason === 'interrupted-worker-needs-review' ||
@@ -86,7 +94,7 @@ async function main() {
     return;
   }
 
-  if (!['status', 'pause', 'stop', 'unpause', 'acknowledge', 'cleanup'].includes(command)) {
+  if (!['status', 'pause', 'stop', 'unpause', 'acknowledge', 'cleanup', 'retry-decision'].includes(command)) {
     throw new Error('Unknown command. Use --help');
   }
   const path = resolve(values.state);
@@ -94,13 +102,19 @@ async function main() {
     return print({ control: 'running', tasks: [] });
   }
   const stateDir = stateDirectory(path);
-  const release = withNumber ? lease(stateDir) : () => {};
+  const release = withNumber || retryDecision ? lease(stateDir) : () => {};
   let state;
   try {
     state = new State(stateDir);
     if (command === 'status') {
       const sourceRepo = state.get('sourceRepo');
-      return print({ control: state.get('control') ?? 'running', ...(sourceRepo && { sourceRepo }), tasks: state.list() });
+      const decisions = state.decisionStatus();
+      return print({ control: state.get('control') ?? 'running', ...(sourceRepo && { sourceRepo }),
+        tasks: state.list(), ...(decisions.length && { decisions }) });
+    }
+    if (retryDecision) {
+      state.retryDecision(argument);
+      return print({ decision: argument, delivery: 'queued-for-reconciliation' });
     }
     if (command === 'acknowledge') {
       if (!values['confirm-process-exited']) throw new Error('Verify the process tree exited and pass --confirm-process-exited');

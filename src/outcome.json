@@ -2,8 +2,9 @@
   "type": "object",
   "properties": {
     "outcome": { "type": "string", "enum": ["done", "blocked"] },
-    "summary": { "type": "string" }
+    "summary": { "type": "string" },
+    "decisionKey": { "type": ["string", "null"] }
   },
-  "required": ["outcome", "summary"],
+  "required": ["outcome", "summary", "decisionKey"],
   "additionalProperties": false
 }

@@ -262,6 +262,156 @@ test('rejects a mismatched origin or a different claim source before polling', a
   await assert.rejects(execute({ ...queue, sourceRepo: undefined }, stateDir, guarded), /different task source/);
 });
 
+test('keeps GitHub-backed runs read-only without decision opt-in', async t => {
+  const { queue, stateDir, repo } = fixture(t);
+  queue.sourceRepo = 'fixture/decision-queue';
+  queue.authorizedResponders = [51];
+  queue.issues[0].decisions = [{ key: 'layout', question: 'Which layout?', choices: [
+    { id: 'list', label: 'List', instruction: 'Use a list.' },
+    { id: 'grid', label: 'Grid', instruction: 'Use a grid.' }
+  ] }];
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/decision-queue.git']);
+  const result = await execute(queue, stateDir, { ...options, readIssues: async () => [remoteReady(1)],
+    decisionApi: { async viewer() { assert.fail('decision API called without opt-in'); } }
+  }, async () => ({ state: 'blocked', result: { decisionKey: 'layout' } }));
+  assert.deepEqual(result.results.map(row => row.state), ['blocked']);
+  assert.deepEqual(withState(stateDir, store => store.decisionStatus()), []);
+});
+
+test('recovers an ambiguous decision delivery and resumes a saved answer once in the same worktree', async t => {
+  const { queue, stateDir, repo } = fixture(t, [task(1), task(2)]);
+  queue.sourceRepo = 'fixture/decision-queue';
+  queue.authorizedResponders = [51];
+  queue.issues[0].decisions = [{
+    key: 'layout', question: 'Which layout should we use?',
+    choices: [
+      { id: 'list', label: 'List layout', instruction: 'Use the approved list layout.' },
+      { id: 'grid', label: 'Grid layout', instruction: 'Use the approved grid layout.' }
+    ]
+  }];
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/decision-queue.git']);
+
+  const time = '2026-11-11T10:00:00Z';
+  let posts = 0;
+  let posted;
+  let visible = false;
+  let replies = [];
+  let dependencies = [];
+  const decisionApi = {
+    async viewer() { return 10; },
+    async comments() { return visible ? [posted, ...replies] : []; },
+    async post(repoName, number, body) {
+      assert.equal(repoName, queue.sourceRepo);
+      assert.equal(number, 1);
+      assert.match(body, /Which layout should we use\?/);
+      assert.doesNotMatch(body, /private worker output|Use the approved/);
+      posts++;
+      posted = { id: 21, user: { id: 10 }, body, created_at: time };
+      throw new Error('Lost the response after GitHub created the comment');
+    }
+  };
+  const configured = { ...options, decisionsEnabled: true, decisionApi,
+    readIssues: async () => [remoteReady(1, dependencies), remoteReady(2)] };
+  let originalWorktree;
+  const initial = await execute(queue, stateDir, configured, async ({ cwd, prompt }) => {
+    if (prompt.endsWith('Task 2')) return done();
+    originalWorktree = cwd;
+    writeFileSync(join(cwd, 'unfinished.txt'), 'prior work');
+    return { state: 'blocked', result: { decisionKey: 'layout', summary: 'private worker output' } };
+  });
+  assert.deepEqual(initial.results.map(row => [row.number, row.state]), [[1, 'blocked'], [2, 'done']]);
+  const id = initial.results[0].decision;
+  const status = () => withState(stateDir, store => store.decisionStatus()[0]);
+  assert.equal(status().posting, 1);
+  assert.equal(status().last_error, 'delivery-unconfirmed');
+
+  visible = true;
+  const command = '/orchestrator decide ' + id + ' grid';
+  const comment = (id, author) => ({ id, user: { id: author, type: 'User' }, body: command,
+    created_at: time, updated_at: time });
+  replies = [comment(22, 99)];
+  const rejected = await execute(queue, stateDir, configured, () => assert.fail('unauthorized resume'));
+  assert.equal(rejected.results.length, 0);
+  assert.equal(status().request_comment, 21);
+  assert.equal(status().reply_comment, null);
+
+  // Capture the reply before the task becomes eligible, then restart with the saved answer.
+  dependencies = [99];
+  replies.push(comment(23, 51));
+  const held = await execute(queue, stateDir, configured, () => assert.fail('dependency unavailable'));
+  assert.equal(held.results.length, 0);
+  assert.equal(status().reply_comment, 23);
+  assert.equal(status().consumed, null);
+
+  dependencies = [];
+  queue.issues[0].decisions[0].choices[1].instruction = 'Changed local text after publication.';
+  const resumed = await execute(queue, stateDir, configured, async ({ cwd, prompt }) => {
+    assert.equal(cwd, originalWorktree);
+    assert.equal(readFileSync(join(cwd, 'unfinished.txt'), 'utf8'), 'prior work');
+    assert.match(prompt, /Authorized choice: grid/);
+    assert.match(prompt, /Use the approved grid layout/);
+    assert.doesNotMatch(prompt, /Changed local text/);
+    return done();
+  });
+  assert.deepEqual(resumed.results.map(row => [row.number, row.state, row.resumedFrom]), [[1, 'done', id]]);
+  assert.ok(status().consumed);
+  assert.equal(withState(stateDir, store => store.task(1).retries), 1);
+  assert.equal(posts, 1);
+  const restart = await execute(queue, stateDir, configured, () => assert.fail('duplicate resume'));
+  assert.deepEqual(restart.results, []);
+});
+
+test('resuming a second decision preserves every approved instruction for that task', async t => {
+  const { queue, stateDir, repo } = fixture(t);
+  queue.sourceRepo = 'fixture/decision-queue';
+  queue.authorizedResponders = [51];
+  queue.issues[0].decisions = ['layout', 'color'].map(key => ({
+    key,
+    question: 'Choose the ' + key,
+    choices: [
+      { id: 'first', label: 'First', instruction: 'Apply the approved ' + key + '.' },
+      { id: 'second', label: 'Second', instruction: 'Do not apply the first ' + key + '.' }
+    ]
+  }));
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/decision-queue.git']);
+
+  const time = '2026-11-11T10:00:00Z';
+  const comments = [];
+  const configured = { ...options, limit: 1, decisionsEnabled: true,
+    readIssues: async () => [remoteReady(1)],
+    decisionApi: {
+      async viewer() { return 10; },
+      async comments() { return comments; },
+      async post(_repo, _number, body) {
+        const comment = { id: comments.length + 1, user: { id: 10 }, body, created_at: time };
+        comments.push(comment);
+        return comment;
+      }
+    }
+  };
+  const reply = decision => comments.push({
+    id: comments.length + 1, user: { id: 51, type: 'User' },
+    body: '/orchestrator decide ' + decision + ' first', created_at: time, updated_at: time
+  });
+
+  const initial = await execute(queue, stateDir, configured,
+    async () => ({ state: 'blocked', result: { decisionKey: 'layout' } }));
+  reply(initial.results[0].decision);
+  const second = await execute(queue, stateDir, configured,
+    async () => ({ state: 'blocked', result: { decisionKey: 'color' } }));
+  reply(second.results[0].decision);
+
+  let finalPrompt;
+  const finished = await execute(queue, stateDir, configured, async ({ prompt }) => {
+    finalPrompt = prompt;
+    return done();
+  });
+  assert.deepEqual(finished.results.map(row => row.state), ['done']);
+  assert.match(finalPrompt, /Apply the approved layout\.[\s\S]*Apply the approved color\./);
+  assert.doesNotMatch(finalPrompt, /Do not apply the first/);
+});
+
+
 test('preserves earlier claims when a later GitHub poll fails', async t => {
   const { queue, stateDir, repo } = fixture(t, [task(1), task(2)]);
   queue.sourceRepo = 'fixture/issue-queue';

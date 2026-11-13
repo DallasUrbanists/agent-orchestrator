@@ -81,13 +81,13 @@ export function plan(issues, workers = DEFAULT_WORKERS, active = []) {
 }
 
 /** Returns currently runnable tasks in the order used by the controller. */
-export function eligibleIssues(issues, persisted, { acceptSourceCompletion = false } = {}) {
+export function eligibleIssues(issues, persisted, { acceptSourceCompletion = false, resumable = new Set() } = {}) {
   const byId = new Map(issues.map(issue => [issue.number, issue]));
   function isComplete(number) {
     const claimedState = persisted.get(number);
     return claimedState === 'done' ||
       ((acceptSourceCompletion || claimedState === undefined) && byId.get(number)?.state === 'done');
   }
-  return issues.filter(issue => issue.state === 'ready' && !persisted.has(issue.number) &&
+  return issues.filter(issue => issue.state === 'ready' && (!persisted.has(issue.number) || resumable.has(issue.number)) &&
     issue.dependencies.every(isComplete)).sort(byPriority);
 }

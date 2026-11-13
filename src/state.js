@@ -43,7 +43,12 @@ export class State {
       "  state TEXT NOT NULL, worktree TEXT NOT NULL, branch TEXT NOT NULL, log TEXT NOT NULL," +
       "  pid INTEGER, session TEXT, started TEXT NOT NULL, completed TEXT, detail TEXT, exit_code INTEGER," +
       "  retries INTEGER NOT NULL DEFAULT 0, acknowledged INTEGER NOT NULL DEFAULT 0," +
-      "  cleaned INTEGER NOT NULL DEFAULT 0);"
+      "  cleaned INTEGER NOT NULL DEFAULT 0);" +
+      "CREATE TABLE IF NOT EXISTS decisions (" +
+      "  id TEXT PRIMARY KEY, number INTEGER NOT NULL, decision_key TEXT NOT NULL, template TEXT NOT NULL," +
+      "  requested TEXT NOT NULL, publisher_id INTEGER, posting INTEGER NOT NULL DEFAULT 0," +
+      "  request_comment INTEGER, reply_comment INTEGER, responder_id INTEGER, choice TEXT," +
+      "  answered TEXT, consumed TEXT, last_error TEXT, UNIQUE(number, decision_key));"
     );
   }
   close() { this.db.close(); }
@@ -61,19 +66,25 @@ export class State {
       throw new Error('This state directory belongs to a different task source');
     }
   }
-  bind(repo, sourceRepo = null) {
+  transaction(update) {
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      const result = update();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  bind(repo, sourceRepo = null) {
+    this.transaction(() => {
       this.assertBinding(repo, sourceRepo);
       if (this.get('repo') === undefined) {
         this.set('repo', repo);
         if (sourceRepo) this.set('sourceRepo', sourceRepo);
       }
-      this.db.exec('COMMIT');
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
+    });
   }
   list() { return this.db.prepare('SELECT * FROM tasks ORDER BY number').all(); }
   task(number) { return this.db.prepare('SELECT * FROM tasks WHERE number = ?').get(number); }
@@ -88,9 +99,75 @@ export class State {
     this.db.prepare('UPDATE tasks SET pid = coalesce(?, pid), session = coalesce(?, session) WHERE number = ?')
       .run(pid ?? null, threadId ?? null, number);
   }
-  finish(number, { state, detail, code }) {
-    this.db.prepare('UPDATE tasks SET state = ?, detail = ?, exit_code = ?, completed = ? WHERE number = ?')
-      .run(state, detail ?? null, code ?? null, new Date().toISOString(), number);
+  finish(number, { state, detail, code }, decision = null) {
+    const completed = new Date().toISOString();
+    const finishTask = () => this.db.prepare(
+      'UPDATE tasks SET state = ?, detail = ?, exit_code = ?, completed = ? WHERE number = ?'
+    ).run(state, detail ?? null, code ?? null, completed, number);
+    if (!decision) return finishTask();
+    this.transaction(() => {
+      finishTask();
+      this.db.prepare('INSERT INTO decisions (id, number, decision_key, template, requested) VALUES (?, ?, ?, ?, ?)')
+        .run(decision.id, number, decision.key, JSON.stringify(decision.template), completed);
+    });
+  }
+
+  decisionStatus() {
+    return this.db.prepare(
+      'SELECT id, number, decision_key, requested, posting, request_comment, reply_comment,' +
+      ' responder_id, choice, answered, consumed, last_error FROM decisions ORDER BY requested, id'
+    ).all();
+  }
+  decisionKeys(number) {
+    return this.db.prepare('SELECT decision_key FROM decisions WHERE number = ?').all(number).map(row => row.decision_key);
+  }
+  pendingDecisions() {
+    return this.db.prepare(
+      "SELECT decisions.* FROM decisions JOIN tasks USING (number)" +
+      " WHERE tasks.state = 'blocked' AND decisions.consumed IS NULL ORDER BY requested, id"
+    ).all();
+  }
+  decisionError(id, error) {
+    this.db.prepare('UPDATE decisions SET last_error = ? WHERE id = ?').run(error, id);
+  }
+  beginDecisionPost(id, publisher) {
+    this.db.prepare('UPDATE decisions SET publisher_id = ?, posting = 1 WHERE id = ?').run(publisher, id);
+  }
+  decisionPosted(id, comment) {
+    this.db.prepare('UPDATE decisions SET posting = 0, request_comment = ?, last_error = NULL WHERE id = ?')
+      .run(comment, id);
+  }
+  answerDecision(id, { comment, author, choice }) {
+    this.db.prepare(
+      'UPDATE decisions SET reply_comment = ?, responder_id = ?, choice = ?, answered = ?, last_error = NULL' +
+      ' WHERE id = ? AND reply_comment IS NULL'
+    ).run(comment, author, choice, new Date().toISOString(), id);
+  }
+  retryDecision(id) {
+    const result = this.db.prepare(
+      "UPDATE decisions SET posting = 0, last_error = NULL WHERE id = ? AND posting = 1 AND request_comment IS NULL" +
+      " AND number IN (SELECT number FROM tasks WHERE state = 'blocked')"
+    ).run(id);
+    if (!result.changes) throw new Error('No blocked decision with unconfirmed delivery for that ID');
+  }
+  resumeDecision(id, number, model, log) {
+    const now = new Date().toISOString();
+    return this.transaction(() => {
+      const answer = this.db.prepare(
+        'UPDATE decisions SET consumed = ?, last_error = NULL WHERE id = ? AND number = ?' +
+        ' AND reply_comment IS NOT NULL AND consumed IS NULL'
+      ).run(now, id, number);
+      const task = this.db.prepare(
+        "UPDATE tasks SET state = 'running', model = ?, log = ?, started = ?, retries = retries + 1," +
+        " pid = NULL, session = NULL, completed = NULL, detail = NULL, exit_code = NULL" +
+        " WHERE number = ? AND state = 'blocked'"
+      ).run(model, log, now, number);
+      if (!answer.changes || !task.changes) throw new Error('Decision or blocked claim is unavailable for resumption');
+      return this.db.prepare(
+        'SELECT decision_key, choice, template FROM decisions WHERE number = ?' +
+        ' AND consumed IS NOT NULL ORDER BY rowid'
+      ).all(number);
+    });
   }
   recover() {
     this.db.prepare(

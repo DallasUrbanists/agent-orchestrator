@@ -57,6 +57,17 @@ export function createWorktree(repo, location, base) {
   git(repo, ['worktree', 'add', '-b', location.branch, '--', location.path, base]);
 }
 
+export function verifyResumeWorktree(repo, location, claim) {
+  if (relative(location.path, claim.worktree) !== '' || location.branch !== claim.branch ||
+      relative(realpathSync(location.path), location.path) !== '' ||
+      relative(realpathSync(git(location.path, ['rev-parse', '--show-toplevel'])), location.path) !== '' ||
+      git(location.path, ['symbolic-ref', '--short', 'HEAD']) !== location.branch ||
+      relative(realpathSync(git(location.path, ['rev-parse', '--path-format=absolute', '--git-common-dir'])),
+        realpathSync(git(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']))) !== '') {
+    throw new Error('The blocked worktree no longer matches its recorded checkout and branch');
+  }
+}
+
 export function removeCleanWorktree(repo, location) {
   if (relative(realpathSync(location.path), location.path) !== '' ||
       git(location.path, ['symbolic-ref', '--short', 'HEAD']) !== location.branch ||
