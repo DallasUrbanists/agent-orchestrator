@@ -199,6 +199,16 @@ npm run start -- --queue intake.local.json --state .\state\intake-demo --execute
 npm run status -- --state .\state\intake-demo
 ```
 
+To switch an existing local journal to intake, stop its controller after owned
+work finishes and run the intake command with `--adopt-local-intake` once.
+Use the same checkout, state directory, and cumulative acceptance receipts.
+The controller checks the checkout and receipts before changing the binding.
+Existing claims keep their worktrees and history. Finish pending local repairs
+and handoffs before switching. To preserve an additional reviewed prerequisite,
+set `githubIntake.requiredPrerequisites` to a map from issue number to extra
+prerequisite issue numbers. These entries can add requirements to GitHub issue
+metadata.
+
 The SQLite claim records the issue ID, the approved revision hash, the coordinator ID, the approval comment ID when applicable, and the dispatch base. The same journal prevents a claimed issue from running again across polls and restarts, even after a fresh approval. Keep the journal and worktree paths when restarting. The controller also keeps the last verified base and receipts and rejects a rewind or removed receipt. Intake reads GitHub with GraphQL queries. With no write options enabled, it
 only reads. To enable authorized decision replies in the same run, add
 `--github-decisions`, set `authorizedResponders` to the approved numeric IDs,

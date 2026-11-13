@@ -29,7 +29,7 @@ async function main() {
       queue: { type: 'string' }, 'watch-acceptance': { type: 'string' }, state: { type: 'string', default: './state' },
       repo: { type: 'string' }, polls: { type: 'string', default: '1' },
       'interval-seconds': { type: 'string', default: '15' },
-      execute: { type: 'boolean' }, continuous: { type: 'boolean' }, 'github-decisions': { type: 'boolean' },
+      execute: { type: 'boolean' }, 'adopt-local-intake': { type: 'boolean' }, continuous: { type: 'boolean' }, 'github-decisions': { type: 'boolean' },
       'github-status': { type: 'boolean' }, pr: { type: 'string' }, 'merge-evidence': { type: 'string' },
       limit: { type: 'string', default: '1' },
       'timeout-seconds': { type: 'string', default: '900' }, 'final-host-verification': { type: 'string' },
@@ -55,6 +55,9 @@ async function main() {
     console.log('Poll GitHub read-only with poll --repo OWNER/REPO --polls N --interval-seconds N.');
     console.log('Opt in to decision comments with run --execute --github-decisions and a reviewed GitHub queue.');
     return;
+  }
+  if (values['adopt-local-intake'] && (command !== 'run' || !values.execute)) {
+    throw new Error('--adopt-local-intake requires a real run with --execute');
   }
   if (values.continuous && (command !== 'run' || !values.execute)) {
     throw new Error('--continuous requires a real run with --execute');
@@ -129,7 +132,8 @@ async function main() {
       const result = await execute(data, resolve(values.state), {
         executable, limit: Number(values.limit), timeoutMs: 1000 * Number(values['timeout-seconds']),
         signal: abort.signal, decisionsEnabled: values['github-decisions'], publishStatus: values['github-status'],
-        readAcceptance, acceptancePath, finalHostVerification, continuous: values.continuous, ...polling
+        readAcceptance, acceptancePath, finalHostVerification, continuous: values.continuous,
+        adoptLocalIntake: values['adopt-local-intake'], ...polling
       });
       print(result);
       if (['interrupted-worker-needs-review', 'restored-state-needs-reconciliation'].includes(result.reason) ||

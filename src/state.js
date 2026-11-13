@@ -127,6 +127,19 @@ export class State {
       if (coordinatorId !== null) this.set('intakeCoordinatorId', String(coordinatorId));
     });
   }
+  adoptLocalIntake(repo, sourceRepo, coordinatorId, { base, accepted }) {
+    this.transaction(() => {
+      this.assertBinding(repo, null, true);
+      if (this.get('repo') !== repo || this.get('sourceRepo') || this.get('intakeCoordinatorId') ||
+          (this.get('statusRepo') && this.get('statusRepo') !== sourceRepo)) {
+        throw new Error('Expected an existing local journal for this repository');
+      }
+      this.set('sourceRepo', sourceRepo);
+      this.set('intakeCoordinatorId', String(coordinatorId));
+      this.set('intakeAcceptance', JSON.stringify({ base, accepted: [...accepted] }));
+    });
+  }
+
   list() { return this.db.prepare('SELECT * FROM tasks ORDER BY number').all(); }
   task(number) { return this.db.prepare('SELECT * FROM tasks WHERE number = ?').get(number); }
 
