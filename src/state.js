@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, realpathSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 /** Resolve existing ancestors before a missing state directory is created. */
@@ -30,8 +30,20 @@ export function lease(path) {
   return () => lock.close();
 }
 
+export function hasJournal(path) {
+  const journal = join(path, 'tasks.sqlite');
+  if (existsSync(journal)) return true;
+  if (['-wal', '-shm', '-journal'].some(suffix => existsSync(journal + suffix)) ||
+      ['logs', 'worktrees', 'backups'].some(name => {
+        const directory = join(path, name);
+        return existsSync(directory) && readdirSync(directory).length > 0;
+      })) throw new Error('The state journal is missing. Inspect the existing state and restore a verified backup');
+  return false;
+}
+
 export class State {
   constructor(path, { readOnly = false } = {}) {
+    hasJournal(path);
     this.db = new DatabaseSync(join(path, 'tasks.sqlite'), { readOnly });
     this.db.exec('PRAGMA busy_timeout = 3000;');
     if (readOnly) return;

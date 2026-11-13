@@ -94,14 +94,14 @@ test('rejects targets outside the allowlist', async t => {
 test('restarts hold interrupted claims for inspection and never relaunch them', async t => {
   const { queue, stateDir, repo } = fixture(t, [task(1), task(2)]);
   const location = worktreeLocation(stateDir, 1);
-  createWorktree(repo, location, git(repo, ['rev-parse', 'HEAD']));
-  writeFileSync(join(location.path, 'unfinished.txt'), 'preserved');
   withState(stateDir, store => {
     store.bind(repo);
     const attempt = store.reserve({ number: 1, repo, worker: 'local-1', model: 'gpt-6.1-terra',
       location, log: 'log', base: git(repo, ['rev-parse', 'HEAD']) });
     store.process(1, attempt, { pid: 1234 });
   });
+  createWorktree(repo, location, git(repo, ['rev-parse', 'HEAD']));
+  writeFileSync(join(location.path, 'unfinished.txt'), 'preserved');
   const hold = await execute(queue, stateDir, options, () => assert.fail('orphan not reviewed'));
   assert.equal(hold.reason, 'interrupted-worker-needs-review');
   withState(stateDir, store => {
@@ -169,6 +169,7 @@ test('rejects state paths under a checkout or its shared Git directory before cr
 
 test('a log collision preserves the existing log and stops before launching any worker', async t => {
   const { queue, stateDir } = fixture(t, [task(1), task(2)]);
+  withState(stateDir, store => store.bind(queue.target));
   const dir = join(stateDir, 'logs');
   mkdirSync(dir);
   const log = join(dir, 'task-1.jsonl');

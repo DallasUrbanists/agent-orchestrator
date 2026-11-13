@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -7,8 +7,9 @@ import { findCodex, MODELS } from './codex.js';
 import { execute, preview } from './controller.js';
 import { pollGithubIssues } from './github.js';
 import { plan } from './scheduler.js';
-import { lease, State, stateDirectory } from './state.js';
+import { hasJournal, lease, State, stateDirectory } from './state.js';
 import { removeCleanWorktree } from './worktrees.js';
+import { backupJournal, restoreJournal } from './backup.js';
 import { assertWorkerPidAbsent } from './recovery.js';
 
 function print(value) { console.log(JSON.stringify(value, null, 2)); }
@@ -29,12 +30,12 @@ async function main() {
       execute: { type: 'boolean' }, 'github-decisions': { type: 'boolean' },
       limit: { type: 'string', default: '1' },
       'timeout-seconds': { type: 'string', default: '900' },
-      'confirm-process-exited': { type: 'boolean' }, help: { type: 'boolean' }
+      'confirm-process-exited': { type: 'boolean' }, 'confirm-reconciled': { type: 'boolean' }, help: { type: 'boolean' }
     }
   });
   const [command = 'run', argument, ...extra] = positionals;
   if (values.help) {
-    console.log('Commands: run | poll | doctor | status | attempts | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID');
+    console.log('Commands: run | poll | doctor | status | attempts | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID | backup | restore FILE');
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
     console.log('Poll GitHub read-only with poll --repo OWNER/REPO --polls N --interval-seconds N.');
     console.log('Opt in to decision comments with run --execute --github-decisions and a reviewed GitHub queue.');
@@ -44,7 +45,7 @@ async function main() {
   const retryDecision = command === 'retry-decision';
   const validArgument = withNumber ? /^[1-9]\d*$/.test(argument ?? '') && Number.isSafeInteger(Number(argument))
     : retryDecision ? /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(argument ?? '')
-      : argument === undefined;
+      : command === 'restore' ? argument !== undefined : argument === undefined;
   if (extra.length || !validArgument) {
     throw new Error('Unexpected command arguments. Use --help');
   }
@@ -86,7 +87,7 @@ async function main() {
         signal: abort.signal, decisionsEnabled: values['github-decisions'], ...polling
       });
       print(result);
-      if (result.reason === 'interrupted-worker-needs-review' ||
+      if (['interrupted-worker-needs-review', 'restored-state-needs-reconciliation'].includes(result.reason) ||
           result.results.some(task => task.state === 'failed')) process.exitCode = 1;
     } finally {
       process.off('SIGINT', stop);
@@ -95,16 +96,24 @@ async function main() {
     return;
   }
 
+  if (command === 'backup' || command === 'restore') {
+    const stateDir = realpathSync(resolve(values.state));
+    return print(command === 'backup'
+      ? { snapshot: await backupJournal(stateDir) }
+      : { restored: restoreJournal(stateDir, argument), control: 'pause', reconciliationRequired: true });
+  }
+
   if (!['status', 'attempts', 'pause', 'stop', 'unpause', 'acknowledge', 'cleanup', 'retry-decision'].includes(command)) {
     throw new Error('Unknown command. Use --help');
   }
   const path = resolve(values.state);
-  if (command === 'attempts' && !existsSync(resolve(path, 'tasks.sqlite'))) return print({ attempts: [] });
-  if (command === 'status' && !existsSync(resolve(path, 'tasks.sqlite'))) {
+  if (command === 'attempts' && !hasJournal(path)) return print({ attempts: [] });
+  if (command === 'status' && !hasJournal(path)) {
     return print({ control: 'running', tasks: [] });
   }
   const stateDir = stateDirectory(path);
-  const release = withNumber || retryDecision ? lease(stateDir) : () => {};
+  const release = withNumber || retryDecision || (command === 'unpause' && values['confirm-reconciled'])
+    ? lease(stateDir) : () => {};
   let state;
   try {
     state = new State(stateDir);
@@ -112,7 +121,8 @@ async function main() {
       const sourceRepo = state.get('sourceRepo');
       const decisions = state.decisionStatus();
       return print({ control: state.get('control') ?? 'running', ...(sourceRepo && { sourceRepo }),
-        tasks: state.list(), ...(decisions.length && { decisions }) });
+        tasks: state.list(), ...(decisions.length && { decisions }),
+        ...(state.get('restoreHold') === 'true' && { reconciliationRequired: true }) });
     }
     if (command === 'attempts') return print({ attempts: state.attempts() });
     if (retryDecision) {
@@ -136,7 +146,15 @@ async function main() {
       return print({ cleaned: task.number, retainedBranch: task.branch });
     }
     const control = command === 'unpause' ? 'running' : command;
-    state.set('control', control);
+    if (command === 'unpause' && state.get('restoreHold') === 'true') {
+      if (!values['confirm-reconciled']) {
+        throw new Error('Reconcile restored claims, workers, and GitHub actions before passing --confirm-reconciled');
+      }
+      state.transaction(() => {
+        state.set('control', control);
+        state.set('restoreHold', 'false');
+      });
+    } else state.set('control', control);
     print({ control });
   } finally {
     try { state?.close(); } finally { release(); }
