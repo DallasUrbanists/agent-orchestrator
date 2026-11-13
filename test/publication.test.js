@@ -117,21 +117,21 @@ test('checks the claimed approval before publication and again after a push', as
     number: 7, ...f.publishOptions, authorize });
 
   try {
-  await assert.rejects(publish(async () => false), /original approved intake revision/);
-  assert.equal(state.handoff(7), undefined);
-  assert.equal(f.pushes.size, 0);
+    await assert.rejects(publish(async () => false), /original approved intake revision/);
+    assert.equal(state.handoff(7), undefined);
+    assert.equal(f.pushes.size, 0);
 
-  await assert.rejects(publish(async () => f.pushes.size === 0), /original approved intake revision/);
-  assert.equal(f.pushes.size, 1);
-  assert.equal(f.pulls.length, 0);
-  assert.equal(f.comments.length, 0);
-  const commit = state.handoff(7).commit_sha;
+    await assert.rejects(publish(async () => f.pushes.size === 0), /original approved intake revision/);
+    assert.equal(f.pushes.size, 1);
+    assert.equal(f.pulls.length, 0);
+    assert.equal(f.comments.length, 0);
+    const commit = state.handoff(7).commit_sha;
 
-  await publish(async () => true);
-  assert.equal(state.handoff(7).linked, 1);
-  assert.deepEqual([...f.pushes], [commit]);
-  assert.equal(f.pulls.length, 1);
-  assert.equal(f.comments.length, 1);
+    await publish(async () => true);
+    assert.equal(state.handoff(7).linked, 1);
+    assert.deepEqual([...f.pushes], [commit]);
+    assert.equal(f.pulls.length, 1);
+    assert.equal(f.comments.length, 1);
   } finally { state.close(); }
 });
 
