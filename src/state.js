@@ -275,12 +275,14 @@ export class State {
       ).run(model, log, now, number);
       if (!answer.changes || !task.changes) throw new Error('Decision or blocked claim is unavailable for resumption');
       const attempt = this.insertAttempt(number, base, id);
-      const approvedChoices = this.db.prepare(
-        'SELECT decision_key, choice, template FROM decisions WHERE number = ?' +
-        ' AND consumed IS NOT NULL ORDER BY rowid'
-      ).all(number);
-      return { attempt, approvedChoices };
+      return { attempt, approvedChoices: this.approvedChoices(number) };
     });
+  }
+  approvedChoices(number) {
+    return this.db.prepare(
+      'SELECT decision_key, choice, template FROM decisions WHERE number = ?' +
+      ' AND consumed IS NOT NULL ORDER BY rowid'
+    ).all(number);
   }
   adoptRecovery(number, kind, scope) {
     this.db.prepare(

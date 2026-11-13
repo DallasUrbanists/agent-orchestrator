@@ -315,7 +315,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         }
       }
       const [issue] = independent.length ? independent
-        : runnable(issues.filter(issue => recovery.has(issue.number)), previous, sourceRepo, new Set(recovery.keys()), accepted);
+        : runnable(issues, previous, sourceRepo, new Set(recovery.keys()), accepted).filter(issue => recovery.has(issue.number));
       const beforeClaim = dispatchHold(previous, state.get('control'));
       if (beforeClaim) return { reason: beforeClaim, results };
       if (signal?.aborted) return { reason: 'stopped', results };
@@ -361,7 +361,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           ? state.resumeRecovery(retry, verifying ? 'verification-runner' : model, log,
             git(location.path, ['rev-parse', 'HEAD']), technical.limit)
           : state.reserve({ number: issue.number, repo, worker: 'local-1', model, location, log, base, intake: issue.intake }),
-          approvedChoices: [] };
+          approvedChoices: retry ? state.approvedChoices(issue.number) : [] };
       const { attempt, approvedChoices } = dispatch;
       let logFile;
       try {

@@ -117,6 +117,63 @@ test('a changed verifier fails closed before dispatch', async t => {
   await assert.rejects(execute(queue, stateDir, options, () => assert.fail('worker launched')), /changed after approval/);
 });
 
+test('recovery retains a prerequisite completed in the issue snapshot', async t => {
+  const { queue, stateDir } = fixture(t);
+  delete queue.acceptedPrerequisites;
+  queue.issues = [
+    { ...queue.issues[0], number: 1, state: 'done' },
+    { ...queue.issues[0], dependencies: [1] }
+  ];
+  let calls = 0;
+  const result = await execute(queue, stateDir, options, async () => ++calls === 1 ? blocker('code') : { state: 'done' });
+  assert.deepEqual(result.results.map(row => [row.number, row.state, row.recovery]),
+    [[7, 'blocked', undefined], [7, 'done', 'code']]);
+});
+
+test('a technical repair receives every consumed decision instruction', async t => {
+  const { queue, stateDir, repo } = fixture(t);
+  delete queue.acceptedPrerequisites;
+  queue.sourceRepo = 'fixture/decisions';
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/fixture/decisions.git']);
+  queue.authorizedResponders = [51];
+  queue.issues = [{
+    ...queue.issues[0],
+    decisions: [{ key: 'route', question: 'Which route?', choices: [
+      { id: 'local', label: 'Local', instruction: 'Use only the approved local route.' },
+      { id: 'other', label: 'Other', instruction: 'Use a different route.' }
+    ] }]
+  }];
+  const at = '2026-01-01T00:00:00Z';
+  const comments = [];
+  const decisions = {
+    ...options, decisionsEnabled: true, readIssues: async () => [{ number: 7, state: 'ready', dependencies: [], model: 'terra' }],
+    decisionApi: {
+      async viewer() { return 10; },
+      async comments() { return comments; },
+      async post(_repo, _number, body) {
+        const posted = { id: 1, user: { id: 10 }, body, created_at: at };
+        comments.push(posted);
+        return posted;
+      }
+    }
+  };
+  const first = await execute(queue, stateDir, { ...decisions, limit: 1 },
+    async () => ({ state: 'blocked', result: { decisionKey: 'route' } }));
+  const id = first.results[0].decision;
+  comments.push({ id: 2, user: { id: 51, type: 'User' }, body: '/orchestrator decide ' + id + ' local',
+    created_at: at, updated_at: at });
+  const prompts = [];
+  const result = await execute(queue, stateDir, decisions, async ({ prompt }) => {
+    prompts.push(prompt);
+    return prompts.length === 1 ? blocker('code') : { state: 'done' };
+  });
+  assert.deepEqual(result.results.map(row => [row.state, row.recovery]), [['blocked', undefined], ['done', 'code']]);
+  for (const prompt of prompts) {
+    assert.match(prompt, /Use only the approved local route/);
+    assert.doesNotMatch(prompt, /Use a different route/);
+  }
+});
+
 test('durable recovery budget survives a restart and holds dependents after exhaustion', async t => {
   const { queue, stateDir, read } = fixture(t);
   queue.technicalRecovery.limit = 1;
