@@ -312,7 +312,14 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     const automatic = JSON.parse(state.get('automaticAcceptance') ?? '[]');
     const receipts = readAcceptance && (() => {
       const manual = readAcceptance();
-      return [...manual, ...automatic.filter(row => !manual.some(entry => entry.number === row.number))];
+      if (!Array.isArray(manual)) throw new Error('The watched acceptance file must contain a JSON array');
+      for (const row of automatic) {
+        const entry = manual.find(item => item?.number === row.number);
+        if (entry && entry.commit !== row.commit) {
+          throw new Error('Watched receipt disagrees with automatic acceptance for #' + row.number);
+        }
+      }
+      return [...manual, ...automatic.filter(row => !manual.some(entry => entry?.number === row.number))];
     });
     const loadAcceptance = receipts && watchAcceptance(queue, repo, receipts, refreshMain, saved);
     if (adoptLocalIntake && state.get('repo') && !state.get('sourceRepo')) {
