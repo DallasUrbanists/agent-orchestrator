@@ -2,13 +2,16 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 
-export function git(cwd, args) {
+export function git(cwd, args, indexFile, raw = false) {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^GIT_/i.test(key)));
   env.GIT_TERMINAL_PROMPT = '0';
+  env.GIT_LITERAL_PATHSPECS = '1';
+  if (indexFile) env.GIT_INDEX_FILE = indexFile;
   try {
-    return execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-C', cwd, ...args], {
+    const output = execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-C', cwd, ...args], {
       env, encoding: 'utf8', windowsHide: true, timeout: 30000, stdio: ['ignore', 'pipe', 'pipe']
-    }).trimEnd();
+    });
+    return raw ? output : output.trimEnd();
   } catch (error) {
     // A remote URL, filter output, or a path can contain sensitive text.
     throw new Error('Git ' + args.slice(0, 2).filter(part => /^[a-z-]+$/.test(part)).join(' ') +

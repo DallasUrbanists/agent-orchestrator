@@ -177,6 +177,27 @@ export const githubStatus = {
   }
 };
 
+export const githubHandoff = {
+  issue: githubStatus.issue,
+  viewer: githubStatus.viewer,
+  comments: githubStatus.comments,
+  post: githubStatus.post,
+  async pulls(repo, branch, options, run) {
+    repo = githubRepo(repo);
+    const head = encodeURIComponent(repo.split('/')[0] + ':' + branch);
+    const pages = await githubRequest('GET', ['--paginate', '--slurp',
+      'repos/' + repo + '/pulls?state=all&base=main&per_page=100&head=' + head],
+    'GitHub handoff lookup failed', options, run);
+    if (!Array.isArray(pages) || !pages.length || !pages.every(Array.isArray)) throw new Error('Invalid handoff pages');
+    return pages.flat();
+  },
+  create(repo, { branch, title, body }, options, run) {
+    return githubRequest('POST', ['repos/' + githubRepo(repo) + '/pulls', '--raw-field', 'head=' + branch,
+      '--raw-field', 'base=main', '--raw-field', 'title=' + title, '--raw-field', 'body=' + body],
+    'GitHub handoff creation failed', options, run);
+  }
+};
+
 export async function readMergeEvidence(repo, number, head, base, options, run) {
   if (!Number.isSafeInteger(number) || number < 1 || !/^[a-f0-9]{40}$/.test(head) || !/^[a-f0-9]{40}$/.test(base)) {
     throw new Error('Merge evidence requires a PR number and full head and base SHAs');

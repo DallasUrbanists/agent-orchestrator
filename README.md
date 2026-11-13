@@ -237,6 +237,41 @@ node src/cli.js sync-status 12 --state .\state\intake-demo
 
 Reconciliation retries label and comment edits and looks for an existing comment by its attempt marker and publisher account. If GitHub rejects a create request, the controller can retry. If the response is lost and GitHub has yet to show the comment, the controller reports unconfirmed delivery and keeps looking on later polls. It does not blindly post a second comment. A missing local claim leaves the issue alone. To reconcile one issue from an older local queue, run `sync-status N --repo OWNER/REPO`. The controller verifies the saved checkout's GitHub origin and leaves the queue binding in place. Review a running claim through the original journal before using this mode. Keep GitHub credentials in the controller's `gh` context.
 
+### Publish verified work for review
+
+Add a trusted `publication` object to a real run's queue to let the coordinator
+commit and publish verified work. Use the same GitHub repository as the saved
+checkout's fetch and push origin. Keep accepted prerequisites enabled. In the
+coordinator account, authenticate Git push and `gh` with pull request and issue
+write permissions.
+
+```json
+"publication": {
+  "repo": "example-org/disposable-demo",
+  "issues": [{ "number": 7, "paths": ["apps/renderer/src/", "tests/renderer/", "package-lock.json"] }]
+}
+```
+
+Specify exact files or directories ending in `/`. For newly completed work,
+configure the approved technical verifier for that issue. The controller checks
+the scope and snapshots the content before and after that verifier. A worker's
+self-reported success alone does not publish a PR. A verifier dispatched after
+a technical blocker follows the same publication path on success.
+
+To publish an already completed saved task without rerunning implementation,
+add `verified` to its reviewed scope with `base` (the original commit),
+`tree` (the content tree independently verified for this task), and `summary`
+(the reviewed verification evidence safe to publish on GitHub). Use the same
+journal. The `captureVerifiedTree` helper calculates the candidate tree ID
+from the recorded worktree claim and base using a temporary Git index.
+Compare the captured tree with the work you verified before authorizing publication.
+
+The controller saves the verified tree and commit before pushing the task
+branch. It looks up the matching PR before creating one and records the issue
+link once. If delivery is uncertain, the next run checks the remote state
+before retrying. Review pending handoffs in `status`. The coordinator still
+owns merge approval. Dependents wait for an accepted merge receipt.
+
 ### Check a supervised merge
 
 A coordinator can check a reviewed PR with `check-merge`. Save a trusted

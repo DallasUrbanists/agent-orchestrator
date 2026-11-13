@@ -1,6 +1,8 @@
+import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, mkdirSync, openSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
+import { captureVerifiedTree, publicationOrigin, publicationPolicy, publishVerified } from './publication.js';
 import { MODELS, runCodex } from './codex.js';
 import { githubDecisions, githubOrigin, githubRepo, readGithubIssues, validatePolling } from './github.js';
 import { ACTIVE_BUDGET_MS, recoveryPolicy, recoveryScope, verifyTechnical } from './technical-recovery.js';
@@ -238,7 +240,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const { executable, limit = 1, timeoutMs = 15 * 60 * 1000, signal,
     polls = 1, intervalMs = 15000, readIssues = readGithubIssues, decisionsEnabled = false,
     decisionApi = githubDecisions, readAcceptance, acceptancePath, intakeApi, publishStatus = false, statusApi,
-    waitForIssueRetry = wait } = options;
+    waitForIssueRetry = wait, publishOptions } = options;
   if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) {
     throw new Error('Specify a positive execution limit and a worker timeout up to one hour');
@@ -250,6 +252,13 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   if (publishStatus && !sourceRepo) throw new Error('GitHub status publishing requires a GitHub-backed queue');
   if (coordinatorId && !readAcceptance) throw new Error('GitHub intake requires --watch-acceptance');
   const technical = recoveryPolicy(queue.technicalRecovery, repo, stateDir);
+  const handoff = queue.publication === undefined ? null : publicationPolicy(queue.publication);
+  if (handoff) {
+    if (!Object.hasOwn(queue, 'acceptedPrerequisites') || (sourceRepo && sourceRepo !== handoff.repo)) {
+      throw new Error('Automatic publication requires matching repository and accepted prerequisite policy');
+    }
+    publicationOrigin(repo, handoff.repo);
+  }
   const responders = decisionsEnabled ? responderIds(queue) : null;
   if (acceptancePath && (inside(repo, acceptancePath) || inside(stateDir, acceptancePath))) {
     throw new Error('Keep the acceptance file outside the target checkout and state directory');
@@ -283,6 +292,20 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     const logDir = join(stateDir, 'logs');
     mkdirSync(logDir, { recursive: true });
     if (relative(realpathSync(logDir), logDir) !== '') throw new Error('Log directory redirects elsewhere');
+    async function publishTask(number) {
+      if (!handoff?.issues.has(number) || state.handoff(number)?.linked || signal?.aborted ||
+          dispatchHold(state.list(), state.get('control'))) return;
+      try {
+        await publishVerified({ ...publishOptions, state, stateDir, target: repo, policy: handoff, number, signal });
+        if (state.handoff(number)) {
+          state.updateHandoff(number);
+          if (state.get('publicationHold:' + number)) state.set('publicationHold:' + number, '');
+        }
+      } catch {
+        if (state.handoff(number)) state.updateHandoff(number, { error: 'publication-held' });
+        else if (state.task(number)?.state === 'done') state.set('publicationHold:' + number, 'publication-held');
+      }
+    }
     await publisher?.all();
     let idlePolls = 0, pollFailures = 0;
     const issueRetryDelays = [5000, 15000, 60000];
@@ -315,6 +338,14 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         const observed = JSON.stringify({ base, accepted: [...accepted] });
         if (state.get('intakeAcceptance') !== observed) state.set('intakeAcceptance', observed);
       }
+      if (handoff) {
+        for (const number of handoff.issues.keys()) {
+          if (accepted.has(number) || state.handoff(number)?.linked) continue;
+          await publishTask(number);
+          if (state.handoff(number)?.linked) await publisher?.sync(number);
+        }
+      }
+
       const claims = state.intakeClaims();
       const claimsByIssue = new Map(claims.map(claim => [claim.number, claim]));
       const answers = new Map();
@@ -470,18 +501,46 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           abort();
         }
       }, 200);
-      let result;
+      let result, verification;
       try {
         if (!continuing) createWorktree(repo, location, base);
         if (signal?.aborted || state.get('control') === 'stop') abort();
         const remaining = technical ? Math.max(1, ACTIVE_BUDGET_MS - state.activeMillis(issue.number)) : timeoutMs;
         const execution = { cwd: location.path, timeoutMs: Math.min(timeoutMs, remaining), signal: cancel.signal, onRecord: record };
-        result = verifying ? await verifyTechnical({ ...execution, verifierCode })
-          : await worker({ ...execution, executable, model: issue.model, reasoning: issue.reasoning,
-            prompt: workerPrompt(issue, templates, approvedChoices, Boolean(retry), Boolean(technical)) });
-        if (retry?.kind === 'code' && result.state === 'done' && verifierCode) {
-          result = await verifyTechnical({ ...execution, verifierCode,
-            timeoutMs: Math.max(1, execution.timeoutMs - (Date.now() - Date.parse(state.task(issue.number).started))) });
+        const publicationEntry = handoff?.issues.get(issue.number);
+        result = verifying ? null : await worker({ ...execution, executable, model: issue.model, reasoning: issue.reasoning,
+          prompt: workerPrompt(issue, templates, approvedChoices, Boolean(retry), Boolean(technical)) });
+        if (verifying || (result.state === 'done' && (publicationEntry || (retry?.kind === 'code' && verifierCode)))) {
+          let bytes = verifierCode;
+          if (!bytes) {
+            try { bytes = technical?.verifierFor(issue.number)?.(); }
+            catch { /* An unavailable verifier holds only its issue. */ }
+          }
+          if (!bytes) {
+            result = { state: 'blocked', detail: 'publication-verifier-required', result: { technicalBlocker: 'environment' } };
+          } else {
+            const snapshot = () => {
+              if (!publicationEntry) return null;
+              try {
+                const attemptBase = state.attempts().find(row => row.id === attempt).base;
+                const { tree } = captureVerifiedTree(repo, stateDir, state.task(issue.number), publicationEntry.paths, attemptBase);
+                return { base: attemptBase, tree };
+              } catch { return null; }
+            };
+            const before = snapshot();
+            result = publicationEntry && !before ? { state: 'blocked', detail: 'publication-scope-not-verified' }
+              : await verifyTechnical({ ...execution, verifierCode: bytes,
+                timeoutMs: Math.max(1, execution.timeoutMs - (Date.now() - Date.parse(state.task(issue.number).started))) });
+            if (result.state === 'done' && before) {
+              const after = snapshot();
+              if (after?.tree === before.tree) {
+                verification = { repo: handoff.repo, ...before,
+                  evidence: 'Approved verification runner exited successfully. Journal attempt ' + attempt + '.\n' +
+                    'Verifier SHA-256: ' + createHash('sha256').update(bytes).digest('hex') + '.\n' +
+                    'Verified tree: ' + before.tree + '.' };
+              } else result = { state: 'blocked', detail: 'verified-worktree-changed-during-verification' };
+            }
+          }
         }
       } catch {
         // If a worker adapter threw after launching, its process state is unknown.
@@ -505,13 +564,14 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const kind = result.result?.technicalBlocker;
       const nextRecovery = technical && result.state === 'blocked' && !result.result?.decisionKey &&
         (kind === 'code' || kind === 'environment') ? { kind, scope: recoveryScope(issue) } : null;
-      state.finish(issue.number, attempt, result, request, nextRecovery);
+      state.finish(issue.number, attempt, result, request, nextRecovery, verification);
       if (nextRecovery && ((retry ? retry.used + 1 : 0) >= technical.limit || state.activeMillis(issue.number) >= ACTIVE_BUDGET_MS)) {
         state.holdRecovery(issue.number, 'recovery-budget-exhausted');
       } else if (nextRecovery?.kind === 'environment' && !technical.verifierFor(issue.number)) {
         state.holdRecovery(issue.number, 'verification-runner-required');
       }
       await publication;
+      if (verification && !accepted.has(issue.number)) await publishTask(issue.number);
       await publisher?.sync(issue.number);
       newDecision = Boolean(request);
       results.push({ number: issue.number, state: result.state, detail: result.detail,
