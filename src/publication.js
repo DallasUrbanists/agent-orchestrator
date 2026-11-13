@@ -124,11 +124,18 @@ async function ensureLink(state, api, repo, number, body, options) {
 }
 
 export async function publishVerified({ state, stateDir, target, policy, number, signal,
-  api = githubHandoff, push = pushTask }) {
+  api = githubHandoff, push = pushTask, authorize }) {
   const { repo, issues } = policy;
   const entry = issues.get(number);
   const task = state.task(number);
   if (task?.state !== 'done' || !entry || task.cleaned || signal?.aborted) return null;
+  async function verifyApproval() {
+    if (!authorize || await authorize()) return;
+    throw Object.assign(new Error('Publication requires the original approved intake revision'), {
+      code: 'intake-publication-scope-no-longer-approved'
+    });
+  }
+  await verifyApproval();
   publicationOrigin(target, repo);
   const options = { signal };
   const issue = await api.issue(repo, number, options);
@@ -185,7 +192,10 @@ export async function publishVerified({ state, stateDir, target, policy, number,
   let pull = matches[0];
   if (pull && !valid(pull)) throw new Error('Existing pull request does not match the open verified handoff');
   if (!pull) {
+    await verifyApproval();
+    if (signal?.aborted || ['pause', 'stop'].includes(state.get('control'))) return null;
     await push(current.cwd, task.branch, commit);
+    await verifyApproval();
     if (signal?.aborted || ['pause', 'stop'].includes(state.get('control'))) return null;
     pull = await api.create(repo, { branch: task.branch, title: 'Implement issue #' + number, body: evidenceBody }, options);
   }
@@ -193,8 +203,11 @@ export async function publishVerified({ state, stateDir, target, policy, number,
     throw new Error('Existing pull request does not match the open verified handoff');
   }
   state.updateHandoff(number, { pull: pull.number });
+  await verifyApproval();
   if (signal?.aborted || ['pause', 'stop'].includes(state.get('control'))) return null;
   if (pull.body !== evidenceBody) await ensureLink(state, api, repo, pull.number, evidenceBody, options);
+  if (signal?.aborted || ['pause', 'stop'].includes(state.get('control'))) return null;
+  if (pull.body !== evidenceBody) await verifyApproval();
   if (signal?.aborted || ['pause', 'stop'].includes(state.get('control'))) return null;
   await ensureLink(state, api, repo, number, notice + '\nVerified work is ready for review: ' + pull.html_url, options);
   state.transaction(() => {

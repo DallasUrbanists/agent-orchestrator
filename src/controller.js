@@ -273,17 +273,26 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     mkdirSync(logDir, { recursive: true });
     if (relative(realpathSync(logDir), logDir) !== '') throw new Error('Log directory redirects elsewhere');
     async function publishTask(number) {
-      if (!handoff?.issues.has(number) || state.handoff(number)?.linked || signal?.aborted ||
+      if (!handoff?.issues.has(number) || state.task(number)?.state !== 'done' ||
+          state.handoff(number)?.linked || signal?.aborted ||
           dispatchHold(state.list(), state.get('control'))) return;
+      const claim = coordinatorId && state.intakeClaims().find(row => row.number === number);
+      const authorize = coordinatorId ? async () => {
+        if (!claim) return false;
+        const current = (await load(signal)).find(issue => issue.number === number);
+        return current?.state === 'ready' && current.intake?.issueId === claim.issue_id &&
+          current.intake.hash === claim.revision;
+      } : undefined;
       try {
-        await publishVerified({ ...publishOptions, state, stateDir, target: repo, policy: handoff, number, signal });
+        await publishVerified({ ...publishOptions, state, stateDir, target: repo, policy: handoff, number, signal, authorize });
         if (state.handoff(number)) {
           state.updateHandoff(number);
           if (state.get('publicationHold:' + number)) state.set('publicationHold:' + number, '');
         }
-      } catch {
-        if (state.handoff(number)) state.updateHandoff(number, { error: 'publication-held' });
-        else if (state.task(number)?.state === 'done') state.set('publicationHold:' + number, 'publication-held');
+      } catch (error) {
+        const reason = error.code === 'intake-publication-scope-no-longer-approved' ? error.code : 'publication-held';
+        if (state.handoff(number)) state.updateHandoff(number, { error: reason });
+        else state.set('publicationHold:' + number, reason);
       }
     }
     await publisher?.all();
