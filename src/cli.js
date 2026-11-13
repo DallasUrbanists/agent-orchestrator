@@ -34,7 +34,7 @@ async function main() {
   });
   const [command = 'run', argument, ...extra] = positionals;
   if (values.help) {
-    console.log('Commands: run | poll | doctor | status | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID');
+    console.log('Commands: run | poll | doctor | status | attempts | pause | stop | unpause | acknowledge N | cleanup N | retry-decision ID');
     console.log('Run defaults to dry-run. Use --queue FILE --state DIR --execute --limit N for real work.');
     console.log('Poll GitHub read-only with poll --repo OWNER/REPO --polls N --interval-seconds N.');
     console.log('Opt in to decision comments with run --execute --github-decisions and a reviewed GitHub queue.');
@@ -95,10 +95,11 @@ async function main() {
     return;
   }
 
-  if (!['status', 'pause', 'stop', 'unpause', 'acknowledge', 'cleanup', 'retry-decision'].includes(command)) {
+  if (!['status', 'attempts', 'pause', 'stop', 'unpause', 'acknowledge', 'cleanup', 'retry-decision'].includes(command)) {
     throw new Error('Unknown command. Use --help');
   }
   const path = resolve(values.state);
+  if (command === 'attempts' && !existsSync(resolve(path, 'tasks.sqlite'))) return print({ attempts: [] });
   if (command === 'status' && !existsSync(resolve(path, 'tasks.sqlite'))) {
     return print({ control: 'running', tasks: [] });
   }
@@ -110,10 +111,10 @@ async function main() {
     if (command === 'status') {
       const sourceRepo = state.get('sourceRepo');
       const decisions = state.decisionStatus();
-      const attempts = state.attempts();
       return print({ control: state.get('control') ?? 'running', ...(sourceRepo && { sourceRepo }),
-        tasks: state.list(), ...(decisions.length && { decisions }), ...(attempts.length && { attempts }) });
+        tasks: state.list(), ...(decisions.length && { decisions }) });
     }
+    if (command === 'attempts') return print({ attempts: state.attempts() });
     if (retryDecision) {
       state.retryDecision(argument);
       return print({ decision: argument, delivery: 'queued-for-reconciliation' });
