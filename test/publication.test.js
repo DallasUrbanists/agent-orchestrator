@@ -1,0 +1,156 @@
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test from 'node:test';
+import { execute } from '../src/controller.js';
+import { captureVerifiedTree } from '../src/publication.js';
+import { State } from '../src/state.js';
+import { git } from '../src/worktrees.js';
+
+const repo = 'fixture/publication';
+const options = { limit: 4 };
+const workerForbidden = () => assert.fail('saved implementation reran');
+
+function fixture(t) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'orchestrator-handoff-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const target = join(root, 'target'), stateDir = join(root, 'state');
+  mkdirSync(target);
+  git(target, ['init', '-b', 'main']);
+  writeFileSync(join(target, 'seed.txt'), 'seed');
+  git(target, ['add', '.']);
+  git(target, ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+    '-c', 'commit.gpgsign=false', 'commit', '-m', 'seed']);
+  git(target, ['remote', 'add', 'origin', 'https://github.com/' + repo + '.git']);
+  const base = git(target, ['rev-parse', 'HEAD']);
+  const queue = { target, allowedRepos: [target], acceptedPrerequisites: [], issues: [
+    { number: 7, model: 'sol', state: 'ready', dependencies: [], prompt: 'Implement fixture' },
+    { number: 8, model: 'sol', state: 'ready', dependencies: [7], prompt: 'Wait for acceptance' }
+  ] };
+  const inspect = fn => {
+    const state = new State(stateDir, { readOnly: true });
+    try { return fn(state); } finally { state.close(); }
+  };
+  const pushes = new Set(), comments = [], pulls = [];
+  let loseCreate = false, loseComment = false;
+  const api = {
+    async issue(_repo, number) {
+      return { number, state: 'open', html_url: 'https://github.com/' + repo + '/issues/' + number };
+    },
+    async viewer() { return 1; },
+    async pulls() { return pulls; },
+    async create(_repo, { branch, body }) {
+      const pull = { number: 12, state: 'open', body, html_url: 'https://github.com/' + repo + '/pull/12',
+        head: { sha: [...pushes][0], ref: branch, repo: { full_name: repo } },
+        base: { ref: 'main', repo: { full_name: repo } } };
+      pulls.push(pull);
+      if (loseCreate) throw new Error('lost create response');
+      return pull;
+    },
+    async comments() { return comments; },
+    async post(_repo, number, body) {
+      const posted = { id: 40, number, body, user: { id: 1 } };
+      comments.push(posted);
+      if (loseComment) throw new Error('lost issue comment response');
+      return posted;
+    }
+  };
+  const executeWith = worker => execute(queue, stateDir, { ...options,
+    publishOptions: { api, push: async (_cwd, _branch, commit) => pushes.add(commit) } }, worker);
+  return { root, queue, stateDir, target, base, inspect, pulls, comments, pushes, executeWith,
+    loseCreate() { loseCreate = true; }, loseComment() { loseComment = true; } };
+}
+
+test('publishes a saved verified task without reimplementation and reconciles lost GitHub responses', async t => {
+  const f = fixture(t);
+  await f.executeWith(async ({ cwd }) => {
+    writeFileSync(join(cwd, 'renderer.txt'), 'verified');
+    return { state: 'done' };
+  });
+  const task = f.inspect(state => state.task(7));
+  const { tree } = captureVerifiedTree(f.target, f.stateDir, task, ['renderer.txt'], f.base);
+  f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'],
+    verified: { base: f.base, tree, summary: 'Six stills and both missing-font checks passed.' } }] };
+  f.loseCreate();
+  await f.executeWith(workerForbidden);
+  assert.equal(f.pulls.length, 1);
+  assert.equal(f.comments.length, 0);
+  const commit = f.inspect(state => state.handoff(7).commit_sha);
+  f.loseComment();
+  await f.executeWith(workerForbidden);
+  assert.equal(f.comments.length, 1);
+  await f.executeWith(workerForbidden);
+  assert.equal(f.inspect(state => state.handoff(7).linked), 1);
+  assert.equal(f.inspect(state => state.task(8)), undefined);
+  assert.equal(f.inspect(state => state.attempts().length), 1);
+  assert.deepEqual([...f.pushes], [commit]);
+  assert.equal(git(task.worktree, ['rev-list', '--parents', '-n', '1', 'HEAD']), commit + ' ' + f.base);
+  assert.match(f.pulls[0].body, /Related issue: #7[\s\S]*Six stills/);
+  assert.match(f.comments[0].body, /pull\/12/);
+
+  git(f.target, ['merge', '--ff-only', task.branch]);
+  f.pulls[0].state = 'closed';
+  await f.executeWith(workerForbidden);
+  f.queue.acceptedPrerequisites = [{ number: 7, commit }];
+  const resumed = await f.executeWith(async ({ cwd }) => {
+    assert.equal(git(cwd, ['rev-parse', 'HEAD']), commit);
+    return { state: 'done' };
+  });
+  assert.deepEqual(resumed.results.map(row => row.number), [8]);
+  assert.equal(f.pulls.length, 1);
+});
+
+test('automatically verifies and publishes a recovered task, without releasing its dependent', async t => {
+  const f = fixture(t);
+  const path = join(f.root, 'verifier.mjs');
+  const body = "import {readFileSync} from 'node:fs'; process.exit(readFileSync('renderer.txt','utf8') === 'verified' ? 0 : 10);";
+  writeFileSync(path, body);
+  f.queue.technicalRecovery = { verifier: { number: 7, path, sha256: createHash('sha256').update(body).digest('hex') } };
+  f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'] }] };
+  const result = await f.executeWith(async ({ cwd }) => {
+    writeFileSync(join(cwd, 'renderer.txt'), 'verified');
+    return { state: 'blocked', result: { technicalBlocker: 'environment' } };
+  });
+  assert.deepEqual(result.results.map(row => [row.number, row.state]), [[7, 'blocked'], [7, 'done']]);
+  assert.equal(f.inspect(state => state.task(8)), undefined);
+  assert.equal(f.inspect(state => state.handoff(7).linked), 1);
+  assert.match(f.pulls[0].body, /Approved verification runner exited successfully[\s\S]*Verifier SHA-256/);
+});
+
+test('publication holds if the approved verifier changes the verified source', async t => {
+  const f = fixture(t);
+  const path = join(f.root, 'verifier.mjs');
+  const body = "import {writeFileSync} from 'node:fs'; writeFileSync('renderer.txt','changed by verifier');";
+  writeFileSync(path, body);
+  f.queue.technicalRecovery = { verifier: { number: 7, path, sha256: createHash('sha256').update(body).digest('hex') } };
+  f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'] }] };
+  const result = await f.executeWith(async ({ cwd }) => {
+    writeFileSync(join(cwd, 'renderer.txt'), 'original');
+    return { state: 'done' };
+  });
+  assert.deepEqual(result.results.map(row => [row.state, row.detail]),
+    [['blocked', 'verified-worktree-changed-during-verification']]);
+  assert.equal(f.inspect(state => state.handoff(7)), undefined);
+  assert.equal(f.pushes.size, 0);
+});
+
+test('rejects out-of-scope edits and a saved tree that has changed', async t => {
+  const f = fixture(t);
+  await f.executeWith(async ({ cwd }) => {
+    writeFileSync(join(cwd, 'renderer.txt'), 'verified');
+    return { state: 'done' };
+  });
+  const task = f.inspect(state => state.task(7));
+  const { tree } = captureVerifiedTree(f.target, f.stateDir, task, ['renderer.txt'], f.base);
+  f.queue.publication = { repo, issues: [{ number: 7, paths: ['renderer.txt'],
+    verified: { base: f.base, tree, summary: 'Verified.' } }] };
+  writeFileSync(join(task.worktree, 'unexpected.txt'), 'outside scope');
+  assert.throws(() => captureVerifiedTree(f.target, f.stateDir, task, ['renderer.txt'], f.base), /outside the reviewed scope/);
+  rmSync(join(task.worktree, 'unexpected.txt'));
+  writeFileSync(join(task.worktree, 'renderer.txt'), 'changed');
+  await f.executeWith(workerForbidden);
+  assert.equal(f.pulls.length, 0);
+  assert.equal(f.pushes.size, 0);
+});
