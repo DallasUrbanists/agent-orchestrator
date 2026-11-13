@@ -349,14 +349,19 @@ export class State {
       " AND NOT EXISTS (SELECT 1 FROM decisions WHERE decisions.number = tasks.number AND consumed IS NULL)"
     ).run(kind, scope, number);
   }
-  retryInvalidVerificationEvidence(number, scope) {
-    this.db.prepare(
-      "UPDATE technical_recovery SET kind = 'environment', hold = NULL" +
-      " WHERE number = ? AND scope = ? AND hold = 'finished'" +
-      " AND EXISTS (SELECT 1 FROM tasks WHERE number = ? AND state = 'blocked'" +
-      " AND detail = 'invalid-verification-evidence' AND cleaned = 0)" +
-      " AND NOT EXISTS (SELECT 1 FROM decisions WHERE decisions.number = ? AND consumed IS NULL)"
-    ).run(number, scope, number, number);
+  retryInvalidVerificationEvidence(number, scope, verifierHash) {
+    this.transaction(() => {
+      const key = 'host-evidence-retry:' + number + ':' + verifierHash;
+      if (this.get(key)) return;
+      const changed = this.db.prepare(
+        "UPDATE technical_recovery SET kind = 'environment', hold = NULL" +
+        " WHERE number = ? AND scope = ? AND hold = 'finished'" +
+        " AND EXISTS (SELECT 1 FROM tasks WHERE number = ? AND state = 'blocked'" +
+        " AND detail = 'invalid-verification-evidence' AND cleaned = 0)" +
+        " AND NOT EXISTS (SELECT 1 FROM decisions WHERE decisions.number = ? AND consumed IS NULL)"
+      ).run(number, scope, number, number);
+      if (changed.changes) this.set(key, 'true');
+    });
   }
 
   recoveryRows() {

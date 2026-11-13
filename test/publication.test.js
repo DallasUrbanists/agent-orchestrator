@@ -187,10 +187,13 @@ test('explicit adoption retries rejected host evidence without reimplementation'
     return { state: 'blocked', result: { technicalBlocker: 'environment' } };
   }, { limit: 2 });
   assert.equal(f.inspect(state => state.task(7).detail), 'invalid-verification-evidence');
+  await f.executeWith(workerForbidden);
+  await f.executeWith(workerForbidden);
+  assert.equal(f.inspect(state => state.attempts().length), 3);
   configure(JSON.stringify([{ name: 'schema', measurements: { tests: 9 } }]));
   await f.executeWith(workerForbidden);
   assert.equal(f.inspect(state => state.handoff(7).linked), 1);
-  assert.equal(f.inspect(state => state.attempts().length), 3);
+  assert.equal(f.inspect(state => state.attempts().length), 4);
 });
 
 test('a verified attempt stays pending across restart until its PR link is recorded', async t => {

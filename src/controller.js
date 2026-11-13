@@ -532,7 +532,13 @@ export async function execute(queue, statePath, options, worker = runCodex) {
           if (!candidate) continue;
           const scope = recoveryScope(candidate);
           state.adoptRecovery(number, kind, scope);
-          if (kind === 'environment') state.retryInvalidVerificationEvidence(number, scope);
+          if (kind === 'environment' && state.task(number)?.detail === 'invalid-verification-evidence') {
+            const paths = handoff?.issues.get(number)?.paths;
+            const read = technical.verifierFor(number) ?? technical.selectProfile?.(number, kind, paths)?.read;
+            let bytes;
+            try { bytes = read?.(); } catch { /* Wait for the pinned verifier to become available. */ }
+            if (bytes) state.retryInvalidVerificationEvidence(number, scope, createHash('sha256').update(bytes).digest('hex'));
+          }
         }
         for (let row of state.recoveryRows()) {
           const retryableHold = row.hold === 'verification-runner-required' || row.hold === 'verification-runner-unavailable' ||
