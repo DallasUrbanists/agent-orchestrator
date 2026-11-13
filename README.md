@@ -563,3 +563,5 @@ publication share one serialized execution lane. A restart holds unacknowledged
 interrupted claims for reconciliation.
 
 For automatic host recovery, set `technicalRecovery.hostVerification.rules` to a list of entries with `profile`, `blockers`, and `paths`. The controller matches saved blocker classes and exact entries in the coordinator-owned publication scope. A rule for checks that should run again after repair should include both `environment` and `code`. Explicit issue bindings take precedence. Multiple distinct matches hold the issue without spending an attempt. A host setup failure from a rule-selected verifier holds that issue for operator follow-up.
+
+After a verified PR repair is pushed, the controller reconciles the review threads recorded for that repair commit. It explicitly resolves matching threads when GitHub confirms the commit is the open PR's current head. Later polls retry an unconfirmed resolution and skip threads GitHub already reports as resolved. The controller still requests fresh review and leaves merge approval with the coordinator.

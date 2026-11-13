@@ -30,6 +30,7 @@ import { mkdtempSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { git } from './worktrees.js';
 import { publicationOrigin, permitted, assertRegularPath } from './publication.js';
+import { githubHandoff } from './github.js';
 import { verifyTechnical } from './technical-recovery.js';
 
 const query = `query($owner:String!,$repo:String!,$number:Int!){
@@ -44,6 +45,29 @@ function readPull(repo, number) {
     '-f','repo='+name,'-F','number='+number], {encoding:'utf8', windowsHide:true, timeout:30000,
     stdio:['ignore','pipe','pipe']});
   return JSON.parse(output).data.repository.pullRequest;
+}
+
+export async function reconcileRepairedThreads({ state, repo, number, branch, head, reviewers, signal,
+  lookup = readPull, api = githubHandoff }) {
+  const key = 'pullRepair:' + number;
+  const stopped = () => signal?.aborted || ['pause', 'stop'].includes(state.get('control'));
+  if (stopped() || !commitId.test(head) || state.get(key) !== 'published:' + head) return;
+  const current = pull => pull?.state === 'OPEN' && !pull.isCrossRepository &&
+    pull.headRefName === branch && pull.baseRefName === 'main' && pull.headRefOid === head &&
+    !pull.reviewThreads.pageInfo.hasNextPage;
+  const eligible = thread => !thread.isResolved &&
+    state.get(key + ':published-thread:' + thread.id) === head &&
+    reviewers.includes(thread.comments.nodes[0]?.author?.login);
+  const pull = lookup(repo, number);
+  if (!current(pull)) return;
+  for (const thread of pull.reviewThreads.nodes.filter(eligible)) {
+    if (stopped()) return;
+    const latest = lookup(repo, number);
+    if (!current(latest)) return;
+    if (!latest.reviewThreads.nodes.some(row => row.id === thread.id && eligible(row))) continue;
+    const resolved = await api.resolveThread(thread.id, { signal });
+    if (resolved?.id !== thread.id || !resolved.isResolved) throw new Error('Unconfirmed review thread resolution');
+  }
 }
 
 export async function repairPull({ state, stateDir, target, repo, task, receipt, entry, issue, reviewers,
