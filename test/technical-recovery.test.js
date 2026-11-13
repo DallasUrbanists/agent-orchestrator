@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { findCodex, runCodex } from '../src/codex.js';
 import { execute } from '../src/controller.js';
@@ -201,6 +204,57 @@ test('a technical repair receives every consumed decision instruction', async t 
   for (const prompt of prompts) {
     assert.match(prompt, /Use only the approved local route/);
     assert.doesNotMatch(prompt, /Use a different route/);
+  }
+});
+
+test('Windows stop terminates the verifier process tree and preserves the blocked worktree', {
+  skip: process.platform !== 'win32', timeout: 25000
+}, async t => {
+  const { queue, stateDir, read } = fixture(t, [
+    "import { spawn } from 'node:child_process';",
+    "import { writeFileSync } from 'node:fs';",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });",
+    "child.once('spawn', () => writeFileSync('verifier-child.pid', String(child.pid)));",
+    "setInterval(() => {}, 1000);"
+  ].join('\n'));
+  await execute(queue, stateDir, { ...options, limit: 1 }, async ({ cwd }) => {
+    writeFileSync(join(cwd, 'partial.txt'), 'pending review');
+    return blocker('environment');
+  });
+  const claim = read(state => state.task(7));
+  const marker = join(claim.worktree, 'verifier-child.pid');
+  const abort = new AbortController();
+  let pid;
+  const run = execute(queue, stateDir, { ...options, timeoutMs: 9000, signal: abort.signal },
+    async ({ prompt }) => {
+      assert.match(prompt, /Fixture #9/);
+      return { state: 'done' };
+    });
+  try {
+    for (let i = 0; i < 100 && !existsSync(marker); i++) await delay(40);
+    assert.ok(existsSync(marker), 'verifier did not start its child');
+    pid = Number(readFileSync(marker, 'utf8'));
+    assert.ok(Number.isSafeInteger(pid) && pid > 0);
+    process.kill(pid, 0);
+    const stop = execFileSync(process.execPath, [fileURLToPath(new URL('../src/cli.js', import.meta.url)),
+      'stop', '--state', stateDir], { encoding: 'utf8', windowsHide: true, timeout: 4000 });
+    assert.equal(JSON.parse(stop).control, 'stop');
+    const result = await run;
+    assert.deepEqual(result.results.map(row => [row.number, row.state]), [[9, 'done'], [7, 'stopped']]);
+    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+    pid = undefined;
+    assert.equal(readFileSync(join(claim.worktree, 'partial.txt'), 'utf8'), 'pending review');
+    assert.equal(read(state => state.task(8)), undefined);
+    assert.equal(read(state => state.attempts().at(-1).state), 'stopped');
+    assert.throws(() => process.kill(read(state => state.attempts().at(-1).pid), 0), { code: 'ESRCH' });
+    const restarted = await execute(queue, stateDir, options, () => assert.fail('dispatch after stop'));
+    assert.equal(restarted.reason, 'stop');
+  } finally {
+    abort.abort();
+    await run.catch(() => {});
+    if (pid) {
+      try { process.kill(pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    }
   }
 });
 
