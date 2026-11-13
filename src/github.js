@@ -22,7 +22,7 @@ export function githubOrigin(url) {
   catch { return null; }
 }
 
-function dependencies(body, number) {
+export function dependencies(body, number) {
   const lines = (body ?? '').split(/\r?\n/).filter(line => /^\s*depends on\s*:/i.test(line));
   if (lines.length === 0) return [];
   const list = lines[0].slice(lines[0].indexOf(':') + 1).trim();
@@ -90,7 +90,7 @@ async function githubRequest(method, args, failure, { signal } = {}, run = reque
     throw new Error(failure + '. Check gh authentication, access, and rate limits');
   }
   try { return JSON.parse(stdout); }
-  catch { throw new Error('GitHub returned unreadable ' + (failure.startsWith('GitHub issue poll') ? 'issue pages' : 'decision data')); }
+  catch { throw new Error('GitHub returned unreadable ' + (failure.startsWith('GitHub issue poll') ? 'issue pages' : 'GitHub data')); }
 }
 
 export async function readGithubIssues(sourceRepo, options, run) {
@@ -125,6 +125,76 @@ export const githubDecisions = {
       'GitHub decision comment delivery could not be confirmed', options, run);
   }
 };
+
+const issueRevisionFields = `
+  id number state title body createdAt lastEditedAt includesCreatedEdit
+  repository { nameWithOwner }
+  blockedBy(first:1) { totalCount }
+  author { __typename ... on User { databaseId } }
+  editor { __typename ... on User { databaseId } }
+  userContentEdits(last:1) { nodes { id editedAt deletedAt } }
+  timelineItems(last:1,itemTypes:[RENAMED_TITLE_EVENT]) {
+    nodes { ... on RenamedTitleEvent {
+      id createdAt currentTitle actor { __typename ... on User { databaseId } }
+    } }
+  }
+`;
+
+async function graphqlPages(query, fields, options, run) {
+  const pages = await githubRequest('POST', ['graphql', '--paginate', '--slurp', '--raw-field', 'query=' + query,
+    ...Object.entries(fields).flatMap(([key, value]) => ['--raw-field', key + '=' + value])],
+    'GitHub intake lookup failed', options, run);
+  if (!Array.isArray(pages) || !pages.length || pages.some(page => !page?.data || page.errors?.length)) {
+    throw new Error('GitHub returned an incomplete intake snapshot');
+  }
+  return pages.map(page => page.data);
+}
+
+export const githubIntake = {
+  async issues(repo, options, run) {
+    const [owner, name] = githubRepo(repo).split('/');
+    const pages = await graphqlPages(`query($owner:String!,$name:String!,$endCursor:String) {
+      repository(owner:$owner,name:$name) {
+        nameWithOwner
+        issues(first:100,after:$endCursor,states:[OPEN],orderBy:{field:CREATED_AT,direction:ASC}) {
+          nodes { ${issueRevisionFields} }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }`, { owner, name }, options, run);
+    return intakeConnections(pages.map(page => {
+      if (page.repository?.nameWithOwner?.toLowerCase() !== owner + '/' + name) {
+        throw new Error('GitHub returned a different intake repository');
+      }
+      return page.repository.issues;
+    }));
+  },
+  async comments(id, options, run) {
+    const pages = await graphqlPages(`query($id:ID!,$endCursor:String) {
+      node(id:$id) {
+        ... on Issue {
+          ${issueRevisionFields}
+          comments(first:100,after:$endCursor) {
+            nodes { id body createdAt lastEditedAt includesCreatedEdit isMinimized
+              author { __typename ... on User { databaseId } } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    }`, { id }, options, run);
+    if (pages.some(page => page.node?.id !== id)) return [];
+    intakeConnections(pages.map(page => page.node.comments));
+    return pages.map(page => page.node);
+  }
+};
+
+function intakeConnections(connections) {
+  if (connections.some((page, i) => !Array.isArray(page?.nodes) ||
+      page.pageInfo?.hasNextPage !== (i < connections.length - 1))) {
+    throw new Error('GitHub returned incomplete intake pagination');
+  }
+  return connections.flatMap(page => page.nodes);
+}
 
 export function validatePolling(polls, intervalMs) {
   if (!Number.isSafeInteger(polls) || polls < 1 || polls > 1000 ||

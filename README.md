@@ -138,6 +138,56 @@ npm run start -- --queue queue.local.json --state .\state\github-demo --execute 
 
 After reviewing the worker output and checks, the supervising coordinator merges the accepted change and advances the dedicated checkout's local `main`. Then replace the acceptance file atomically with the complete receipt array, including the new merged commit. The controller checks ancestry against the refreshed `main` and creates the dependent worktree from that exact commit. It stops on a non-fast-forward change or a receipt that is removed, changed, or outside the base history. A GitHub merge becomes visible after the coordinator updates the local checkout. The controller does not fetch or merge automatically in this mode. The dispatch and idle poll limits still apply.
 
+### GitHub issue intake with coordinator approval
+
+This mode discovers open issues on every poll, including issues opened after the controller starts. Use a dedicated checkout and a single persistent state directory. The local configuration identifies the target and coordinator. Each task comes directly from its GitHub issue, without an entry in an `issues` array or an approval label.
+
+Verify your numeric GitHub ID before configuring the coordinator.
+
+```powershell
+gh api --method GET user --jq '{login,id}'
+```
+
+Save a configuration such as the following for your disposable repository. Hexel's verified coordinator ID is `24529106`.
+
+```json
+{
+  "target": "C:/sandbox/disposable-demo",
+  "allowedRepos": ["C:/sandbox/disposable-demo"],
+  "sourceRepo": "example-org/disposable-demo",
+  "githubIntake": { "coordinatorId": 24529106 },
+  "acceptedPrerequisites": []
+}
+```
+
+- The coordinator's own open issue is approved at creation. A coordinator-authored issue stays self-approved while GitHub identifies the coordinator as the author and as the actor behind its latest title and body edits.
+- For a third-party issue, or a coordinator issue whose latest title or body edit is from another actor, review the current title and body and post exactly `/orchestrator approve` in a new comment. The controller compares GitHub account IDs. Edits to the title or body invalidate earlier comments, even if the issue is reverted to the previous text. When GitHub reports an edit and a comment at the same timestamp, post a new comment. Edited, hidden, and deleted comments do not approve work.
+- A generic issue defaults to Terra at medium reasoning. It can declare same-repository prerequisites with `Depends on: #12, #13`. The controller also recognizes Storytelling Studio's baseline dispatch table and linked numeric prerequisites, including Terra at high reasoning and Sol at high reasoning. It holds unsupported or ambiguous metadata, including conditional tasks, alternative prerequisites, native GitHub blockers, and stable prerequisite IDs with no matching link. Intake has one worker slot and uses isolated worktrees. Coordinate any separate workers or supervisors that share project resources.
+- An approved issue can wait in the queue. Only the supervising coordinator's acceptance receipt for each prerequisite, verified against the fetched `main` history, releases the issue. GitHub issue closure and local worker success do not count as acceptance.
+
+Dry-run previews show admitted issues, issues awaiting approval, and issues held for unsupported metadata. The preview checks receipts against the checkout's current `HEAD`, so update the dedicated checkout before previewing integrated work.
+
+```powershell
+npm run dry-run -- --queue intake.local.json --state .\state\intake-demo
+```
+
+For a real run, initialize a separate `acceptance.json` with `[]` or the current receipt array. Keep it outside both the target checkout and the state directory. After reviewing and merging a change, atomically replace the file with the full cumulative receipt array. Each receipt identifies the accepted issue number and the full commit SHA from `main`. The controller fetches `origin/main` itself, leaves the dedicated checkout's working files in place, and starts the next eligible issue from the fetched commit. Keep the controller running within the poll and execution limits.
+
+```powershell
+npm run start -- --queue intake.local.json --state .\state\intake-demo --execute --watch-acceptance acceptance.json --limit 2 --polls 240 --interval-seconds 15
+npm run status -- --state .\state\intake-demo
+```
+
+The SQLite claim records the issue ID, the approved revision hash, the coordinator ID, the approval comment ID when applicable, and the dispatch base. The same journal prevents a claimed issue from running again across polls and restarts, even after a fresh approval. Keep the journal and worktree paths when restarting. The controller also keeps the last verified base and receipts and rejects a rewind or removed receipt. Intake reads GitHub with GraphQL queries. It does not post comments, push changes, or merge. The `--github-decisions` option still requires a separate queue with reviewed decision templates.
+
+Run the intake loop against a disposable bare Git origin with fixture GitHub responses and real Codex workers on Windows.
+
+```powershell
+$env:ORCHESTRATOR_LIVE_INTAKE = '1'
+node --test test/intake.test.js
+Remove-Item Env:ORCHESTRATOR_LIVE_INTAKE
+```
+
 ## Ask for a decision on GitHub
 
 Enable issue comments explicitly with `--github-decisions` on a real run. Use a GitHub-backed queue, a signed-in `gh` account with permission to comment on the target issues, and a local list of authorized GitHub account IDs. To find an account ID, run `gh api users/LOGIN --jq .id` and verify the account before adding it.
