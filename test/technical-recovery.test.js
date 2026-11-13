@@ -70,7 +70,7 @@ test('project host profiles pick reviewed checks across restarts and distinguish
     assert.equal(readFileSync(join(cwd, 'check.txt'), 'utf8'), 'broken');
     repaired.push(cwd);
     writeFileSync(join(cwd, 'check.txt'), 'ready');
-    return { state: 'done' };
+    return blocker('environment');
   });
   assert.deepEqual(next.results.filter(row => row.number === 7).map(row => row.detail),
     ['verification-code-failure', 'verification-passed']);
