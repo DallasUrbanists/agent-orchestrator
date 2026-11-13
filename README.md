@@ -303,13 +303,17 @@ trusted path and pass only coordinator-reviewed profiles to it.
   "limit": 2,
   "hostVerification": {
     "runner": { "path": "C:/reviewed/project-checks.mjs", "sha256": "<SHA-256>" },
+    "toolchain": { "node": "C:/pinned/node.exe", "npm": "C:/pinned/npm-cli.js", "chrome": "C:/pinned/chrome.exe" },
     "profiles": { "full-render-decode": "Rendered and decoded both approved formats." },
     "issues": [{ "number": 8, "profile": "full-render-decode" }]
   }
 }
 ```
 
-The script receives `orchestratorProfile` as a constant. Each profile description
+The script receives `orchestratorProfile` and `orchestratorToolchain` as constants. The example in
+`fixtures/host-verifiers/storytelling-render.mjs` checks the pinned Storytelling
+Studio toolchain and retains the exported media, decode logs, and receipt under
+its worktree's ignored `.local` directory. Each profile description
 is reviewed evidence text for the handoff. Issue text and worker output cannot
 supply a command or choose a host profile. A bound issue gets host verification
 after a worker reports completion or after an environment blocker is recovered.

@@ -18,9 +18,12 @@ export function recoveryPolicy(value, repo, stateDir) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 2) throw new Error('Technical recovery requires a limit of one or two attempts');
   if (hostVerification !== undefined) {
     if (verifier !== undefined) throw new Error('Choose either a single verifier or project host verification profiles');
-    const { runner, profiles, issues } = hostVerification ?? {};
+    const { runner, profiles, issues, toolchain = {} } = hostVerification ?? {};
     if (!runner || !profiles || typeof profiles !== 'object' || Array.isArray(profiles) ||
-        !Array.isArray(issues) || !issues.length) throw new Error('Host verification requires a runner, profiles and issue bindings');
+        !Array.isArray(issues) || !issues.length || !toolchain || typeof toolchain !== 'object' ||
+        Array.isArray(toolchain) || Object.entries(toolchain).some(([key, entry]) =>
+          !/^[a-z][a-zA-Z0-9]{0,39}$/.test(key) || typeof entry !== 'string' || !entry || entry.length > 4096
+        )) throw new Error('Host verification requires a runner, profiles and issue bindings');
     const base = recoveryPolicy({ verifier: { ...runner, number: 1 } }, repo, stateDir).verifierFor(1);
     const byIssue = new Map();
     for (const row of issues) {
@@ -33,7 +36,8 @@ export function recoveryPolicy(value, repo, stateDir) {
       }
       byIssue.set(row.number, {
         evidence,
-        read: () => Buffer.concat([Buffer.from('const orchestratorProfile = ' + JSON.stringify(profile) + ';\n'), base()])
+        read: () => Buffer.concat([Buffer.from('const orchestratorProfile = ' + JSON.stringify(profile) +
+          ';\nconst orchestratorToolchain = ' + JSON.stringify(toolchain) + ';\n'), base()])
       });
     }
     return { limit, adopt, verifierFor: issue => byIssue.get(issue)?.read,
