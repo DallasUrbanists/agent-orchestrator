@@ -1,11 +1,11 @@
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, realpathSync } from 'node:fs';
+import { appendFileSync, closeSync, mkdirSync, openSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
 import { MODELS, runCodex } from './codex.js';
 import { githubDecisions, githubOrigin, githubRepo, readGithubIssues, validatePolling } from './github.js';
 import { approvedInstruction, decisionRequest, responderIds, reviewedDecisions, syncDecisions } from './decisions.js';
 import { eligibleIssues, validateIssues } from './scheduler.js';
-import { lease, resolveStatePath, State, stateDirectory } from './state.js';
+import { hasJournal, lease, resolveStatePath, State, stateDirectory } from './state.js';
 import { createWorktree, git, inside, verifyResumeWorktree, verifyTarget, worktreeLocation } from './worktrees.js';
 
 function workerPrompt(issue, templates, approvedChoices) {
@@ -153,12 +153,13 @@ export async function preview(queue, statePath, { readIssues = readGithubIssues,
     ? verifyAcceptedPrerequisites(queue, repo, git(repo, ['rev-parse', '--verify', 'HEAD^{commit}'])) : null;
   let state;
   try {
-    if (existsSync(join(stateDir, 'tasks.sqlite'))) {
+    if (hasJournal(stateDir)) {
       state = new State(stateDir, { readOnly: true });
       state.assertBinding(repo, sourceRepo, accepted !== null);
     }
     const rows = state?.list() ?? [];
-    const hold = dispatchHold(rows, state?.get('control'));
+    const hold = state?.get('restoreHold') === 'true'
+      ? 'restored-state-needs-reconciliation' : dispatchHold(rows, state?.get('control'));
     const issues = hold ? [] : await load(signal);
     const eligible = runnable(issues, rows, sourceRepo, undefined, accepted).map(issue => ({
       number: issue.number, model: MODELS[issue.model], title: issue.title
@@ -198,6 +199,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   try {
     state = new State(stateDir);
     state.bind(repo, sourceRepo, initial.accepted !== null);
+    if (state.get('restoreHold') === 'true') return { reason: 'restored-state-needs-reconciliation', results };
     state.recover();
     const logDir = join(stateDir, 'logs');
     mkdirSync(logDir, { recursive: true });
