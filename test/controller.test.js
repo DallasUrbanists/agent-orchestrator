@@ -91,6 +91,7 @@ test('local queues publish progress to their matching origin and reconcile the s
   withState(stateDir, state => {
     assert.equal(state.get('sourceRepo'), undefined);
     assert.equal(state.get('statusRepo'), statusRepo);
+    assert.deepEqual(JSON.parse(state.get('statusNumbers')), [1]);
     assert.equal(state.task(1).branch, 'orchestrator/task-1');
     assert.equal(state.githubProgress(1)[0].comment, 2);
   });

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { HEARTBEAT_MS, observeProgress, statusPublisher, statusRepository } from '../src/issue-status.js';
+import { HEARTBEAT_MS, observeProgress, statusPublisher, statusRepository, statusIssueNumbers } from '../src/issue-status.js';
 import { State } from '../src/state.js';
 import { git } from '../src/worktrees.js';
 
@@ -81,9 +81,30 @@ test('single-issue status reconciliation validates the legacy origin without reb
   assert.equal(state.get('sourceRepo'), undefined);
   state.set('statusRepo', repo);
   assert.equal(statusRepository(state, stateDir), repo);
+  assert.throws(() => statusIssueNumbers(state), /scope is missing/);
+  state.set('statusNumbers', '[1,3]');
+  assert.deepEqual([...statusIssueNumbers(state)], [1, 3]);
   assert.throws(() => statusRepository(state, stateDir, 'fixture/other'), /does not match the journal/);
   git(target, ['remote', 'set-url', 'origin', 'https://github.com/fixture/other.git']);
   assert.throws(() => statusRepository(state, stateDir), /saved checkout origin/);
+});
+
+test('bulk reconciliation honors the saved reporting scope', async t => {
+  const f = fixture(t);
+  f.observe({ type: 'worker-started', pid: 321 }, 0);
+  const requested = [];
+  const api = { async issue(_repo, number) {
+    requested.push(number);
+    throw new Error('fixture stops after issue lookup');
+  } };
+  f.state.db.prepare('DELETE FROM settings WHERE name = ?').run('sourceRepo');
+  f.state.set('statusRepo', repo);
+  f.state.set('statusNumbers', '[2]');
+  await statusPublisher(f.state, repo, { api, numbers: statusIssueNumbers(f.state) }).all();
+  assert.deepEqual(requested, []);
+  f.state.set('statusNumbers', '[1]');
+  await statusPublisher(f.state, repo, { api, numbers: statusIssueNumbers(f.state) }).all();
+  assert.deepEqual(requested, [1]);
 });
 
 test('launch opens one comment and the five-minute update reports observed activity and quiet time', async t => {

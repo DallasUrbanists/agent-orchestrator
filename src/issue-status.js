@@ -180,6 +180,15 @@ export function statusRepository(state, stateDir, requestedRepo) {
   return repo;
 }
 
+export function statusIssueNumbers(state) {
+  if (state.get('sourceRepo') || !state.get('statusRepo')) return undefined;
+  const numbers = JSON.parse(state.get('statusNumbers') ?? 'null');
+  if (!Array.isArray(numbers) || !numbers.every(validId)) {
+    throw new Error('Saved status scope is missing or invalid. Run with the reviewed reporting queue first');
+  }
+  return new Set(numbers);
+}
+
 export async function recordHandoff(state, sourceRepo, number, pull, api = githubStatus) {
   const repo = githubRepo(sourceRepo);
   const task = state.task(number);

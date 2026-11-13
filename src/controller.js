@@ -313,13 +313,17 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     }
     state.bind(repo, sourceRepo, Object.hasOwn(queue, 'acceptedPrerequisites'), coordinatorId);
     state.recover();
-    if (publishStatus && !sourceRepo) {
+    const statusNumbers = publishStatus && !sourceRepo ? new Set(queue.issues.map(issue => issue.number)) : undefined;
+    if (statusNumbers) {
       const savedStatusRepo = state.get('statusRepo');
       if (savedStatusRepo && savedStatusRepo !== statusRepo) throw new Error('This journal has a different statusRepo');
-      if (!savedStatusRepo) state.set('statusRepo', statusRepo);
+      state.transaction(() => {
+        state.set('statusRepo', statusRepo);
+        state.set('statusNumbers', JSON.stringify([...statusNumbers]));
+      });
     }
     const publisher = publishStatus ? statusPublisher(state, statusRepo, {
-      api: statusApi, signal, numbers: sourceRepo ? undefined : new Set(queue.issues.map(issue => issue.number))
+      api: statusApi, signal, numbers: statusNumbers
     }) : null;
     const startupBase = loadAcceptance ? null : git(repo, ['rev-parse', '--verify', 'HEAD^{commit}']);
     const initial = loadAcceptance ? null : {
