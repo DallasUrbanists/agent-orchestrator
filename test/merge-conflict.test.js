@@ -65,6 +65,14 @@ test('repairs and verifies a conflict before pushing the same task branch', asyn
       return {state:'done'};
     }
   };
+  const set = state.set.bind(state);
+  state.set = (key, value) => {
+    if (value.startsWith('published:')) throw new Error('journal write interrupted');
+    return set(key, value);
+  };
+  await assert.rejects(repairPull(opts), /journal write interrupted/);
+  assert.match(state.get('pullRepair:1'), /^verified:/);
+  state.set = set;
   await repairPull(opts);
   const repaired = git(remote,['rev-parse','refs/heads/task']);
   assert.equal(git(remote,['rev-list','--parents','-1',repaired]), [repaired,head,base].join(' '));

@@ -53,12 +53,30 @@ export async function repairPull({ state, stateDir, target, repo, task, receipt,
   if (pull.state !== 'OPEN' || pull.isCrossRepository || pull.headRefName !== task.branch ||
       pull.baseRefName !== 'main' || !commitId.test(pull.headRefOid) || !commitId.test(pull.baseRefOid) ||
       pull.reviewThreads.pageInfo.hasNextPage) return;
+  const key = 'pullRepair:' + receipt.pull;
+  const ref = 'refs/heads/' + task.branch;
+  async function publish(candidate) {
+    const remote = git(target, ['ls-remote', '--refs', 'origin', ref]);
+    if (remote !== candidate.commit + '\t' + ref) {
+      const latest = read();
+      if (latest.state !== 'OPEN' || latest.headRefOid !== candidate.head ||
+          latest.baseRefOid !== candidate.base || remote !== candidate.head + '\t' + ref ||
+          !(await authorized()) || signal?.aborted) return;
+      git(target, ['push', '--no-follow-tags', 'origin', candidate.commit + ':' + ref]);
+    }
+    state.set(key, 'published:' + candidate.commit);
+  }
+  const pending = state.get(key);
+  if (pending?.startsWith('verified:')) {
+    checkOrigin(target, repo);
+    await publish(JSON.parse(pending.slice(9)));
+    return;
+  }
   const inScope = path => permitted(path, entry.paths);
   const notes = pull.reviewThreads.nodes.filter(thread => !thread.isResolved && inScope(thread.path) &&
     reviewers.includes(thread.comments.nodes[0]?.author?.login));
   if (!notes.length && pull.mergeable !== 'CONFLICTING') return;
-  const key = 'pullRepair:' + receipt.pull;
-  if (state.get(key) || !(await authorized()) || signal?.aborted) return;
+  if (pending || !(await authorized()) || signal?.aborted) return;
   checkOrigin(target, repo);
   git(target, ['fetch','--no-tags','origin','refs/heads/main','refs/pull/'+receipt.pull+'/head']);
   git(target, ['merge-base','--is-ancestor',receipt.commit_sha,pull.headRefOid]);
@@ -128,6 +146,7 @@ export async function repairPull({ state, stateDir, target, repo, task, receipt,
   const parents = conflict ? ['-p',pull.headRefOid,'-p',pull.baseRefOid] : ['-p',pull.headRefOid];
   const commit = git(cwd,['-c','user.name=Agent Orchestrator','-c','user.email=orchestrator@users.noreply.github.com',
     'commit-tree',tree,...parents,'-m','Repair PR #'+receipt.pull,'-m',verification.evidence ?? 'Approved host checks passed.']);
-  git(cwd,['push','--no-follow-tags','origin',commit+':refs/heads/'+task.branch]);
-  state.set(key,'published:'+commit);
+  const candidate = { commit, head: pull.headRefOid, base: pull.baseRefOid };
+  state.set(key, 'verified:' + JSON.stringify(candidate));
+  await publish(candidate);
 }
