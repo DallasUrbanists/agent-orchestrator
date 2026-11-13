@@ -207,6 +207,7 @@ async function main() {
       const handoffHolds = state.list().filter(row => state.get('publicationHold:' + row.number)).map(row => row.number);
       const recovery = state.recoveryRows().map(({ scope, ...row }) => row);
       return print({ control: state.get('control') ?? 'running', ...(sourceRepo && { sourceRepo }),
+        intakeWaiting: JSON.parse(state.get('intakeWaiting') ?? 'null'),
         tasks: state.list(), ...(decisions.length && { decisions }), ...(intakeClaims.length && { intakeClaims }), ...(githubUpdates.length && { githubUpdates }), ...(handoffs.length && { handoffs }), ...(handoffHolds.length && { handoffHolds }), ...(recovery.length && { recovery }),
         ...(state.get('restoreHold') === 'true' && { reconciliationRequired: true }) });
     }
