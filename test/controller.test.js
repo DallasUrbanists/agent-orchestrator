@@ -98,14 +98,17 @@ test('restarts hold interrupted claims for inspection and never relaunch them', 
   writeFileSync(join(location.path, 'unfinished.txt'), 'preserved');
   withState(stateDir, store => {
     store.bind(repo);
-    store.reserve({ number: 1, repo, worker: 'local-1', model: 'gpt-6.1-terra', location, log: 'log' });
-    store.process(1, { pid: 1234 });
+    const attempt = store.reserve({ number: 1, repo, worker: 'local-1', model: 'gpt-6.1-terra',
+      location, log: 'log', base: git(repo, ['rev-parse', 'HEAD']) });
+    store.process(1, attempt, { pid: 1234 });
   });
   const hold = await execute(queue, stateDir, options, () => assert.fail('orphan not reviewed'));
   assert.equal(hold.reason, 'interrupted-worker-needs-review');
   withState(stateDir, store => {
     assert.equal(store.task(1).state, 'interrupted');
     assert.equal(store.task(1).pid, 1234);
+    assert.equal(store.attempts()[0].state, 'interrupted');
+    assert.equal(store.attempts()[0].pid, 1234);
     store.acknowledge(1);
   });
   const resumed = await execute(queue, stateDir, options, done);
@@ -218,9 +221,9 @@ test('GitHub completion releases dependencies with unsuccessful local claims', a
     store.bind(repo, queue.sourceRepo);
     for (const [index, state] of outcomes.entries()) {
       const number = index + 1;
-      store.reserve({ number, repo, worker: 'local-1', model: 'gpt-6.1-terra',
-        location: worktreeLocation(stateDir, number, queue.sourceRepo), log: 'log' });
-      store.finish(number, { state });
+      const attempt = store.reserve({ number, repo, worker: 'local-1', model: 'gpt-6.1-terra',
+        location: worktreeLocation(stateDir, number, queue.sourceRepo), log: 'log', base: git(repo, ['rev-parse', 'HEAD']) });
+      store.finish(number, attempt, { state });
     }
   });
   const dependent = remoteReady(4, [1, 2, 3]);
@@ -394,21 +397,41 @@ test('resuming a second decision preserves every approved instruction for that t
     body: '/orchestrator decide ' + decision + ' first', created_at: time, updated_at: time
   });
 
-  const initial = await execute(queue, stateDir, configured,
-    async () => ({ state: 'blocked', result: { decisionKey: 'layout' } }));
+  const initial = await execute(queue, stateDir, configured, async ({ onRecord }) => {
+    onRecord({ pid: 1234, threadId: 'first-session' });
+    return { state: 'blocked', result: { decisionKey: 'layout' } };
+  });
   reply(initial.results[0].decision);
   const second = await execute(queue, stateDir, configured,
     async () => ({ state: 'blocked', result: { decisionKey: 'color' } }));
   reply(second.results[0].decision);
 
   let finalPrompt;
-  const finished = await execute(queue, stateDir, configured, async ({ prompt }) => {
+  const finished = await execute(queue, stateDir, configured, async ({ prompt, onRecord }) => {
+    const [first, , active] = withState(stateDir, store => store.attempts());
+    assert.equal(first.session, 'first-session');
+    assert.equal(active.state, 'running');
+    assert.notEqual(active.id, first.id);
+    withState(stateDir, store => {
+      assert.throws(() => store.process(1, first.id, { pid: 5678 }), /no longer owns/);
+      assert.throws(() => store.finish(1, first.id, { state: 'done' }), /no longer owns/);
+      assert.equal(store.task(1).state, 'running');
+    });
+    onRecord({ pid: 9012, threadId: 'third-session' });
     finalPrompt = prompt;
     return done();
   });
   assert.deepEqual(finished.results.map(row => row.state), ['done']);
   assert.match(finalPrompt, /Apply the approved layout\.[\s\S]*Apply the approved color\./);
   assert.doesNotMatch(finalPrompt, /Do not apply the first/);
+  const history = withState(stateDir, store => store.attempts());
+  assert.deepEqual(history.map(item => item.state), ['blocked', 'blocked', 'done']);
+  assert.deepEqual(history.map(item => item.decision), [null, initial.results[0].decision, second.results[0].decision]);
+  assert.deepEqual(history.map(item => item.session), ['first-session', null, 'third-session']);
+  assert.ok(history.every(item => item.completed && item.base === git(repo, ['rev-parse', 'HEAD'])));
+  assert.equal(new Set(history.map(item => item.log)).size, 3);
+  assert.ok(history.every(item => readFileSync(item.log, 'utf8').split('\n').filter(Boolean)
+    .every(line => JSON.parse(line).attempt === item.id)));
 });
 
 

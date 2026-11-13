@@ -109,8 +109,9 @@ async function main() {
     if (command === 'status') {
       const sourceRepo = state.get('sourceRepo');
       const decisions = state.decisionStatus();
+      const attempts = state.attempts();
       return print({ control: state.get('control') ?? 'running', ...(sourceRepo && { sourceRepo }),
-        tasks: state.list(), ...(decisions.length && { decisions }) });
+        tasks: state.list(), ...(decisions.length && { decisions }), ...(attempts.length && { attempts }) });
     }
     if (retryDecision) {
       state.retryDecision(argument);

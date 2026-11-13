@@ -108,10 +108,11 @@ test('blocks, runs independent work, and resumes after an authorized fixture rep
     decisionsEnabled: true, decisionApi };
   const result = await execute(queue, stateDir, options);
   const store = new State(stateDir);
-  let rows;
+  let rows, attempts;
   try {
     assert.equal(store.get('sourceRepo'), sourceRepo);
     rows = store.list();
+    attempts = store.attempts();
     const [decision] = store.decisionStatus();
     assert.equal(decision.responder_id, 101);
     assert.equal(decision.choice, 'continue');
@@ -126,6 +127,10 @@ test('blocks, runs independent work, and resumes after an authorized fixture rep
   assert.equal(posts, 1);
   assert.equal(result.results[2].resumedFrom, result.results[0].decision);
   assert.equal(rows[0].retries, 1);
+  assert.deepEqual(attempts.map(item => [item.number, item.state]), [[1, 'blocked'], [2, 'done'], [1, 'done']]);
+  assert.equal(attempts[2].decision, result.results[2].resumedFrom);
+  assert.equal(attempts[2].session, rows[0].session);
+  assert.equal(new Set(attempts.map(item => item.session)).size, 3);
   assert.equal(result.reason, 'no-eligible-work');
   assert.equal(rows.length, 2);
   assert.notEqual(rows[0].worktree, rows[1].worktree);
