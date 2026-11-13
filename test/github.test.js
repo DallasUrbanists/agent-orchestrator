@@ -64,6 +64,19 @@ test('uses a fixed GET-only gh request with pagination and repository validation
   assert.equal(githubOrigin('https://elsewhere.example/Owner/Project.git'), null);
 });
 
+test('marks transient transport failures without exposing the captured diagnostic', async () => {
+  for (const [stderr, transient] of [
+    ['gh: Service unavailable (HTTP 503)', true],
+    ['gh: Get API: connection reset by peer', true],
+    ['gh: API rate limit exceeded (HTTP 403)', false],
+    ['gh: Unauthorized (HTTP 401)', false]
+  ]) {
+    await assert.rejects(readGithubIssues('owner/project', {}, async () => {
+      throw Object.assign(new Error('sensitive details'), { code: 1, stderr });
+    }), error => error.transient === transient && !error.message.includes(stderr));
+  }
+});
+
 test('failed or invalid GitHub reads never expose captured output or accept a partial snapshot', async () => {
   await assert.rejects(readGithubIssues('owner/project', {}, async () => {
     throw Object.assign(new Error('secret command output'), {

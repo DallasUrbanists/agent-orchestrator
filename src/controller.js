@@ -217,7 +217,8 @@ export async function preview(queue, statePath, { readIssues = readGithubIssues,
 export async function execute(queue, statePath, options, worker = runCodex) {
   const { executable, limit = 1, timeoutMs = 15 * 60 * 1000, signal,
     polls = 1, intervalMs = 15000, readIssues = readGithubIssues, decisionsEnabled = false,
-    decisionApi = githubDecisions, readAcceptance, acceptancePath, intakeApi, publishStatus = false, statusApi } = options;
+    decisionApi = githubDecisions, readAcceptance, acceptancePath, intakeApi, publishStatus = false, statusApi,
+    waitForIssueRetry = wait } = options;
   if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) {
     throw new Error('Specify a positive execution limit and a worker timeout up to one hour');
@@ -263,7 +264,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     mkdirSync(logDir, { recursive: true });
     if (relative(realpathSync(logDir), logDir) !== '') throw new Error('Log directory redirects elsewhere');
     await publisher?.all();
-    let idlePolls = 0;
+    let idlePolls = 0, pollFailures = 0;
+    const issueRetryDelays = [5000, 15000, 60000];
     let newDecision = false;
     const unavailable = new Set();
     while (results.length < limit || newDecision) {
@@ -273,7 +275,18 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       const previous = state.list();
       const hold = dispatchHold(previous, state.get('control'));
       if (hold) return { reason: hold, results };
-      const issues = await load(signal);
+      let issues;
+      try {
+        issues = await load(signal);
+        pollFailures = 0;
+      } catch (error) {
+        if (!sourceRepo || error.transient !== true || pollFailures >= issueRetryDelays.length) throw error;
+        if (signal?.aborted) return { reason: 'stopped', results };
+        const retryHold = dispatchHold(previous, state.get('control'));
+        if (retryHold) return { reason: retryHold, results };
+        await waitForIssueRetry(issueRetryDelays[pollFailures++], undefined, { signal });
+        continue;
+      }
       if (signal?.aborted) return { reason: 'stopped', results };
       const afterPoll = dispatchHold(previous, state.get('control'));
       if (afterPoll) return { reason: afterPoll, results };

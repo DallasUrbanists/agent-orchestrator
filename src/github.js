@@ -89,6 +89,9 @@ async function githubRequest(method, args, failure, { signal } = {}, run = reque
     if (error.code === 'ENOENT') throw new Error('GitHub CLI (gh) is required for GitHub issue polling');
     const sanitized = new Error(failure + '. Check gh authentication, access, and rate limits');
     sanitized.status = Number(/^gh: [^\r\n]*\(HTTP (\d{3})\)\s*$/m.exec(error.stderr ?? '')?.[1]) || undefined;
+    sanitized.transient = [408, 500, 502, 503, 504].includes(sanitized.status) ||
+      (!sanitized.status && (error.killed === true ||
+        /(?:connection reset by peer|connection refused|i\/o timeout|temporary failure in name resolution|TLS handshake timeout|unexpected EOF)/i.test(error.stderr ?? '')));
     throw sanitized;
   }
   if (method === 'DELETE' && !stdout.trim()) return null;

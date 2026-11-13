@@ -112,7 +112,7 @@ npm run start -- --queue queue.local.json --state .\state\github-demo --execute 
 npm run status -- --state .\state\github-demo
 ```
 
-The GitHub-backed controller refreshes issue metadata before each dispatch. It uses the local prompt verbatim as task content and uses GitHub metadata for readiness, model, priority, and dependencies. For a run, `--polls` limits consecutive polls with no eligible work and defaults to one. `--interval-seconds` is the delay between those idle polls. A failed GitHub read stops the run and preserves existing claims.
+The GitHub-backed controller refreshes issue metadata before each dispatch. It uses the local prompt verbatim as task content and uses GitHub metadata for readiness, model, priority, and dependencies. For a run, `--polls` limits consecutive polls with no eligible work and defaults to one. `--interval-seconds` is the delay between those idle polls. For transient GitHub issue-read failures, the controller retries after 5, 15, and 60 seconds. It waits for a fresh issue snapshot before dispatch. Authentication, rate-limit and malformed-response failures stop the run and preserve existing claims.
 
 The controller binds the state directory to the checkout and `sourceRepo`. It records each issue claim in SQLite before creating the worktree or launching Codex. Keep using the same state directory on this machine. A task stays claimed across polls and restarts even if GitHub still shows it as ready. Local claims coordinate controllers that share this state directory. With the default options, GitHub operations are issue-list GET requests.
 
