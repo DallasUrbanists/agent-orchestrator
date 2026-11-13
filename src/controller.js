@@ -1,5 +1,5 @@
 import { acceptedMerge } from './merged-acceptance.js';
-import { repairPull } from './merge-conflict.js';
+import { repairPull, reconcileRepairedThreads } from './merge-conflict.js';
 import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, mkdirSync, openSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
@@ -461,6 +461,10 @@ export async function execute(queue, statePath, options, worker = runCodex) {
             try {
               await requestCodexReview(state, handoff.repo, receipt.pull, task.branch, head,
                 { signal }, publishOptions?.api);
+              if (queue.pullRepair && repair?.startsWith('published:')) {
+                await reconcileRepairedThreads({ state, repo: handoff.repo, number: receipt.pull, branch: task.branch,
+                  head, reviewers: queue.pullRepair.reviewers ?? [], signal, target: repo, api: publishOptions?.api });
+              }
             } catch {
               // The durable comment intent is reconciled on the next poll.
             }

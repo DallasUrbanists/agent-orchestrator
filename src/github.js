@@ -178,6 +178,12 @@ export const githubStatus = {
 };
 
 export const githubHandoff = {
+  async resolveThread(id, options, run) {
+    const data = await githubRequest('POST', ['graphql', '--raw-field',
+      'query=mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}',
+      '--raw-field', 'id=' + id], 'GitHub review thread resolution failed', options, run);
+    return data?.data?.resolveReviewThread?.thread;
+  },
   issue: githubStatus.issue,
   viewer: githubStatus.viewer,
   comments: githubStatus.comments,

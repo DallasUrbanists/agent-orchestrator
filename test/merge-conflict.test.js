@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { hasMergeConflict, repairPull } from '../src/merge-conflict.js';
+import { hasMergeConflict, repairPull, reconcileRepairedThreads } from '../src/merge-conflict.js';
 import { git } from '../src/worktrees.js';
 
 test('detects conflicts between exact commits without changing the checkout', t => {
@@ -103,4 +103,44 @@ test('repairs and verifies a conflict before pushing the same task branch', asyn
   assert.equal(state.get('pullRepair:1:published-thread:' + review.id), reviewed);
   await repairPull(retry);
   assert.equal(followups, 1);
+});
+
+test('resolves only threads recorded for the current verified repair and reconciles lost responses', async () => {
+  const head = 'a'.repeat(40);
+  const state = new Map([['pullRepair:1', 'published:' + head],
+    ['pullRepair:1:published-thread:fixed', head]]);
+  const thread = id => ({ id, isResolved: false, isOutdated: false,
+    comments: { nodes: [{ author: { login: 'reviewer' } }] } });
+  const fixed = thread('fixed');
+  const pull = { state: 'OPEN', headRefName: 'task', headRefOid: 'b'.repeat(40), baseRefName: 'main',
+    reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [fixed, thread('unrelated')] } };
+  const calls = [];
+  const options = { state, repo: 'example/fixture', number: 1, branch: 'task', head,
+    reviewers: ['reviewer'], lookup: () => pull, api: { async resolveThread(id) {
+      calls.push(id);
+      fixed.isResolved = true;
+      throw new Error('response lost');
+    } } };
+  await reconcileRepairedThreads(options);
+  assert.deepEqual(calls, []);
+  pull.headRefOid = head;
+  await assert.rejects(reconcileRepairedThreads(options), /response lost/);
+  await reconcileRepairedThreads(options);
+  fixed.isResolved = false;
+  await reconcileRepairedThreads(options);
+  assert.deepEqual(calls, ['fixed']);
+
+  const descendant = 'c'.repeat(40);
+  state.set('pullRepair:1', 'published:' + descendant);
+  state.set('pullRepair:1:published-thread:unrelated', head);
+  pull.headRefOid = descendant;
+  const resolveThread = async id => {
+    calls.push(id);
+    return { id, isResolved: true };
+  };
+  await reconcileRepairedThreads({ ...options, head: descendant, api: { resolveThread },
+    isAncestor: (commit, current) => commit === head && current === descendant });
+  assert.deepEqual(calls, ['fixed', 'unrelated']);
+  assert.equal(state.get('pullRepair:1:confirmed-thread:unrelated'), descendant);
+
 });
