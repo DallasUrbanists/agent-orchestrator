@@ -224,6 +224,25 @@ node src/cli.js sync-status 12 --state .\state\intake-demo
 
 Reconciliation retries label and comment edits and looks for an existing comment by its attempt marker and publisher account. If GitHub rejects a create request, the controller can retry. If the response is lost and GitHub has yet to show the comment, the controller reports unconfirmed delivery and keeps looking on later polls. It does not blindly post a second comment. A missing local claim leaves the issue alone. To reconcile one issue from an older local queue, run `sync-status N --repo OWNER/REPO`. The controller verifies the saved checkout's GitHub origin and leaves the queue binding in place. Review a running claim through the original journal before using this mode. Keep GitHub credentials in the controller's `gh` context.
 
+### Check a supervised merge
+
+A coordinator can check a reviewed PR with `check-merge`. Save a trusted
+`merge-evidence.json` containing the GitHub repository, the exact reviewed
+`head` commit, current `base` commit, numeric `reviewerId`, and a
+`requiredChecks` array. Each check entry has its exact `name` and GitHub
+`appId`. Pass the PR number separately.
+
+```powershell
+node src/cli.js check-merge 34 --merge-evidence merge-evidence.json
+```
+
+The command reads GitHub and reports the observed result. It requires an open
+non-draft PR into `main`, exact-head approval by the specified reviewer,
+successful checks from the configured apps, and a head that contains the
+current base. It reads the PR and base again before reporting. GitHub can
+change after the final read. The coordinator still owns the merge, and
+unattended merges require server-side branch protections.
+
 ### Recover from technical blockers
 
 Add `"technicalRecovery": { "limit": 2 }` to the reviewed queue to let the
