@@ -3,6 +3,7 @@ import { join, relative } from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
 import { MODELS, runCodex } from './codex.js';
 import { githubDecisions, githubOrigin, githubRepo, readGithubIssues, validatePolling } from './github.js';
+import { HEARTBEAT_MS, observeProgress, statusPublisher } from './issue-status.js';
 import { readIssueIntake } from './intake.js';
 import { approvedInstruction, decisionRequest, responderIds, reviewedDecisions, syncDecisions } from './decisions.js';
 import { eligibleIssues, validateIssues } from './scheduler.js';
@@ -200,7 +201,7 @@ export async function preview(queue, statePath, { readIssues = readGithubIssues,
 export async function execute(queue, statePath, options, worker = runCodex) {
   const { executable, limit = 1, timeoutMs = 15 * 60 * 1000, signal,
     polls = 1, intervalMs = 15000, readIssues = readGithubIssues, decisionsEnabled = false,
-    decisionApi = githubDecisions, readAcceptance, acceptancePath, intakeApi } = options;
+    decisionApi = githubDecisions, readAcceptance, acceptancePath, intakeApi, publishStatus = false, statusApi } = options;
   if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) {
     throw new Error('Specify a positive execution limit and a worker timeout up to one hour');
@@ -209,6 +210,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const stateDir = resolveStatePath(statePath);
   const repo = verifyTarget(queue?.target, queue?.allowedRepos, stateDir);
   const { sourceRepo, coordinatorId, load } = prepareQueue(queue, repo, readIssues, decisionsEnabled, intakeApi);
+  if (publishStatus && !sourceRepo) throw new Error('GitHub status publishing requires a GitHub-backed queue');
   if (coordinatorId && !readAcceptance) throw new Error('GitHub intake requires --watch-acceptance');
   const responders = decisionsEnabled ? responderIds(queue) : null;
   if (acceptancePath && (inside(repo, acceptancePath) || inside(stateDir, acceptancePath))) {
@@ -224,6 +226,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     state.bind(repo, sourceRepo, Object.hasOwn(queue, 'acceptedPrerequisites'), coordinatorId);
     if (state.get('restoreHold') === 'true') return { reason: 'restored-state-needs-reconciliation', results };
     state.recover();
+    const publisher = publishStatus ? statusPublisher(state, sourceRepo, { api: statusApi, signal }) : null;
     const refreshMain = coordinatorId ? () => {
       const origin = git(repo, ['config', '--local', '--get-all', 'remote.origin.url']);
       if (githubOrigin(origin) !== sourceRepo) throw new Error('The checkout origin changed during intake');
@@ -241,10 +244,13 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     const logDir = join(stateDir, 'logs');
     mkdirSync(logDir, { recursive: true });
     if (relative(realpathSync(logDir), logDir) !== '') throw new Error('Log directory redirects elsewhere');
+    await publisher?.all();
     let idlePolls = 0;
     let newDecision = false;
     const unavailable = new Set();
     while (results.length < limit || newDecision) {
+      if (signal?.aborted) return { reason: 'stopped', results };
+      if (idlePolls) await publisher?.all();
       if (signal?.aborted) return { reason: 'stopped', results };
       const previous = state.list();
       const hold = dispatchHold(previous, state.get('control'));
@@ -324,12 +330,25 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       } catch {
         const result = { state: 'failed', detail: 'recording-failed' };
         state.finish(issue.number, attempt, result);
+        await publisher?.sync(issue.number);
         results.push({ number: issue.number, ...result });
         return { reason: result.detail, results };
       }
+      let publication, heartbeat;
+      function publish() {
+        if (!publisher || publication) return;
+        publication = publisher.sync(issue.number).finally(() => { publication = undefined; });
+        // The foreground awaits publication before disposing the journal.
+        publication.catch(() => {});
+      }
       function record(event) {
+        const at = new Date().toISOString();
         if (event.pid || event.threadId) state.process(issue.number, attempt, event);
-        appendFileSync(logFile, JSON.stringify({ ...event, at: new Date().toISOString(), attempt }) + '\n');
+        appendFileSync(logFile, JSON.stringify({ ...event, at, attempt }) + '\n');
+        if (observeProgress(state, attempt, event, at) && publisher && !heartbeat) {
+          publish();
+          heartbeat = setInterval(publish, HEARTBEAT_MS);
+        }
       }
 
       const cancel = new AbortController();
@@ -361,6 +380,7 @@ export async function execute(queue, statePath, options, worker = runCodex) {
         }
       } finally {
         clearInterval(controlTimer);
+        clearInterval(heartbeat);
         signal?.removeEventListener('abort', abort);
         closeSync(logFile);
       }
@@ -369,6 +389,8 @@ export async function execute(queue, statePath, options, worker = runCodex) {
       }
       const request = result.state === 'blocked' ? decisionRequest(templates, result.result?.decisionKey) : null;
       state.finish(issue.number, attempt, result, request);
+      await publication;
+      await publisher?.sync(issue.number);
       newDecision = Boolean(request);
       results.push({ number: issue.number, state: result.state, detail: result.detail,
         ...(request && { decision: request.id }), ...(answer && { resumedFrom: answer.id }) });

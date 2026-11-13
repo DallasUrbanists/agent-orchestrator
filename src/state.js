@@ -56,6 +56,11 @@ export class State {
       "  pid INTEGER, session TEXT, started TEXT NOT NULL, completed TEXT, detail TEXT, exit_code INTEGER," +
       "  retries INTEGER NOT NULL DEFAULT 0, acknowledged INTEGER NOT NULL DEFAULT 0," +
       "  cleaned INTEGER NOT NULL DEFAULT 0);" +
+      "CREATE TABLE IF NOT EXISTS issue_status (" +
+      "  number INTEGER PRIMARY KEY REFERENCES tasks(number), pull INTEGER, error TEXT);" +
+      "CREATE TABLE IF NOT EXISTS attempt_progress (" +
+      "  attempt INTEGER PRIMARY KEY REFERENCES attempts(id), launched TEXT, activity TEXT, summary TEXT," +
+      "  marker TEXT UNIQUE, actor INTEGER, comment INTEGER, posting INTEGER NOT NULL DEFAULT 0, error TEXT);" +
       "CREATE TABLE IF NOT EXISTS issue_intake_claims (" +
       "  number INTEGER PRIMARY KEY REFERENCES tasks(number), issue_id TEXT NOT NULL UNIQUE," +
       "  revision TEXT NOT NULL, coordinator_id INTEGER NOT NULL, comment_id TEXT, base TEXT NOT NULL);" +
@@ -118,6 +123,39 @@ export class State {
   }
   list() { return this.db.prepare('SELECT * FROM tasks ORDER BY number').all(); }
   task(number) { return this.db.prepare('SELECT * FROM tasks WHERE number = ?').get(number); }
+
+  githubStatusRows() {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'issue_status'").get()) return [];
+    return this.db.prepare('SELECT * FROM issue_status ORDER BY number').all();
+  }
+
+  updateGithubStatus(number, { error, pull } = {}) {
+    this.db.prepare('INSERT INTO issue_status (number, error, pull) VALUES (?, ?, ?)' +
+      ' ON CONFLICT(number) DO UPDATE SET error = excluded.error, pull = coalesce(excluded.pull, issue_status.pull)'
+    ).run(number, error ?? null, pull ?? null);
+  }
+
+  observeAttempt(attempt, { launched = null, activity = null, summary = null }) {
+    this.db.prepare('INSERT INTO attempt_progress (attempt, launched, activity, summary) VALUES (?, ?, ?, ?)' +
+      ' ON CONFLICT(attempt) DO UPDATE SET launched = coalesce(attempt_progress.launched, excluded.launched),' +
+      ' activity = coalesce(excluded.activity, attempt_progress.activity), summary = coalesce(excluded.summary, attempt_progress.summary)'
+    ).run(attempt, launched, activity, summary);
+  }
+
+  githubProgress(number) {
+    return this.db.prepare('SELECT attempts.*, p.launched, p.activity, p.summary, p.marker, p.actor,' +
+      ' p.comment, p.posting, p.error AS publication_error FROM attempts LEFT JOIN attempt_progress p ON p.attempt = attempts.id' +
+      ' WHERE number = ? ORDER BY id').all(number);
+  }
+
+  updateProgress(attempt, { marker, actor, comment, posting, error } = {}) {
+    this.db.prepare(
+      'INSERT INTO attempt_progress (attempt, marker, actor, comment, posting, error) VALUES (?, ?, ?, ?, ?, ?)' +
+      ' ON CONFLICT(attempt) DO UPDATE SET marker = coalesce(attempt_progress.marker, excluded.marker),' +
+      ' actor = coalesce(attempt_progress.actor, excluded.actor), comment = coalesce(excluded.comment, attempt_progress.comment),' +
+      ' posting = coalesce(?, attempt_progress.posting), error = excluded.error'
+    ).run(attempt, marker ?? null, actor ?? null, comment ?? null, posting ?? 0, error ?? null, posting ?? null);
+  }
 
   intakeClaims() {
     if (this.get('intakeCoordinatorId') === undefined) return [];

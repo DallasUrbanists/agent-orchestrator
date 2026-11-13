@@ -77,7 +77,7 @@ The allowlist matches the canonical checkout path. The controller keeps one stat
 
 Every worker attempt receives a fresh scratch directory at the root of its worktree. The runner sets `TEMP`, `TMP`, and `TMPDIR` for sandboxed commands so tools such as Chromium can create profiles there. Harnesses can use `ORCHESTRATOR_WORKER_TEMP` to restore those variables inside the test process if the sandbox supplies its own Temp values. The runner removes scratch after confirmed exit and retains it for inspection when termination is uncertain. The system Temp exclusion stays enabled. Terra runs at medium reasoning and Sol runs at high reasoning.
 
-On the pilot host, legacy unelevated workers could write to scratch. Node child processes with piped output returned `spawn EPERM`, while file-backed output worked. Chromium started with file-backed output and created a profile, then exited with access-denied errors from Crashpad and Mojo IPC before navigation. In a disposable MXC comparison, Node started and profile creation passed, but Chromium still exited before navigation. Browser verification remains a coordinator step on that host.
+On the pilot host, legacy unelevated workers could write to scratch. Node child processes with piped output returned `spawn EPERM`, while file-backed output worked. Chromium started with file-backed output and created a profile, then exited with access-denied errors from Crashpad and Mojo IPC before navigation. In a disposable MXC comparison, Node started and profile creation passed, but Chromium still exited before navigation. The same Chromium build loaded the disposable loopback page outside Codex with Chromium's own sandbox enabled. With the browser binaries copied into a disposable MXC workspace, Chromium created a profile but its Crashpad registration pipe closed before navigation. Chromium Headless Shell also exited before navigation. The installed desktop CLI's elevated probe failed at startup with `registered Core launch requires an installed app`. Browser verification remains a coordinator step on that host.
 
 ## Poll GitHub issues and claim reviewed work
 
@@ -187,6 +187,27 @@ $env:ORCHESTRATOR_LIVE_INTAKE = '1'
 node --test test/intake.test.js
 Remove-Item Env:ORCHESTRATOR_LIVE_INTAKE
 ```
+
+### Publish issue status and worker progress
+
+Use `--github-status` on a real run with a GitHub-backed queue to enable status updates. Sign in to `gh` as the publisher with issue write access and pull request read access. Create the `in-progress`, `in-review`, and `blocked` labels before enabling this option. The controller manages those three labels and preserves all others.
+
+A confirmed worker launch sets `in-progress` and creates one comment for that attempt. The controller edits it every five minutes during the attempt and on exit. It includes elapsed time, the last event observed, and a short description of that event when available. Raw worker text, command output, and credentials stay out of the comment. A quiet update reports the lack of observed activity. If a decision resumes a task, the new worker attempt gets its own comment.
+
+A task that needs intervention gets `blocked`. Local completion clears `in-progress` and records that a PR handoff is pending. The controller discovers a matching open PR from the recorded worktree branch into the same repository's `main` on the next reconciliation. It sets `in-review` and edits the last attempt comment to link the PR. To record the handoff immediately with the controller stopped, run:
+
+```powershell
+node src/cli.js handoff 12 --pr 34 --state .\state\intake-demo
+```
+
+The same state directory preserves progress comment IDs across restarts. Start with `--github-status` again or reconcile existing claims without dispatch:
+
+```powershell
+node src/cli.js sync-status --state .\state\intake-demo
+node src/cli.js sync-status 12 --state .\state\intake-demo
+```
+
+Reconciliation retries label and comment edits and looks for an existing comment by its attempt marker and publisher account. If GitHub rejects a create request, the controller can retry. If the response is lost and GitHub has yet to show the comment, the controller reports unconfirmed delivery and keeps looking on later polls. It does not blindly post a second comment. A missing local claim leaves the issue alone. Keep GitHub credentials in the controller's `gh` context.
 
 ## Ask for a decision on GitHub
 

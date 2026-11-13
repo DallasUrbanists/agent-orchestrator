@@ -87,8 +87,11 @@ async function githubRequest(method, args, failure, { signal } = {}, run = reque
   } catch (error) {
     if (signal?.aborted) throw error;
     if (error.code === 'ENOENT') throw new Error('GitHub CLI (gh) is required for GitHub issue polling');
-    throw new Error(failure + '. Check gh authentication, access, and rate limits');
+    const sanitized = new Error(failure + '. Check gh authentication, access, and rate limits');
+    sanitized.status = Number(/^gh: [^\r\n]*\(HTTP (\d{3})\)\s*$/m.exec(error.stderr ?? '')?.[1]) || undefined;
+    throw sanitized;
   }
+  if (method === 'DELETE' && !stdout.trim()) return null;
   try { return JSON.parse(stdout); }
   catch { throw new Error('GitHub returned unreadable ' + (failure.startsWith('GitHub issue poll') ? 'issue pages' : 'GitHub data')); }
 }
@@ -101,10 +104,12 @@ export async function readGithubIssues(sourceRepo, options, run) {
   return normalizeIssues(pages);
 }
 
-function commentsEndpoint(sourceRepo, number) {
+function issueEndpoint(sourceRepo, number) {
   if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid GitHub issue number');
-  return 'repos/' + githubRepo(sourceRepo) + '/issues/' + number + '/comments';
+  return 'repos/' + githubRepo(sourceRepo) + '/issues/' + number;
 }
+
+const commentsEndpoint = (sourceRepo, number) => issueEndpoint(sourceRepo, number) + '/comments';
 
 export const githubDecisions = {
   async viewer(options, run) {
@@ -123,6 +128,49 @@ export const githubDecisions = {
   post(repo, number, body, options, run) {
     return githubRequest('POST', [commentsEndpoint(repo, number), '--raw-field', 'body=' + body],
       'GitHub decision comment delivery could not be confirmed', options, run);
+  }
+};
+
+export const githubStatus = {
+  viewer: githubDecisions.viewer,
+  comments: githubDecisions.comments,
+  post(repo, number, body, options, run) {
+    return githubRequest('POST', [commentsEndpoint(repo, number), '--raw-field', 'body=' + body],
+      'GitHub progress comment delivery failed', options, run);
+  },
+  edit(repo, id, body, options, run) {
+    if (!Number.isSafeInteger(id) || id < 1) throw new Error('Invalid GitHub comment ID');
+    return githubRequest('PATCH', ['repos/' + githubRepo(repo) + '/issues/comments/' + id,
+      '--raw-field', 'body=' + body], 'GitHub progress comment update failed', options, run);
+  },
+  issue(repo, number, options, run) {
+    return githubRequest('GET', [issueEndpoint(repo, number)], 'GitHub status issue lookup failed', options, run);
+  },
+  async openPulls(repo, branch, options, run) {
+    repo = githubRepo(repo);
+    const owner = repo.split('/')[0];
+    const pages = await githubRequest('GET', ['--paginate', '--slurp',
+      'repos/' + repo + '/pulls?state=open&base=main&per_page=100&head=' + encodeURIComponent(owner + ':' + branch)],
+    'GitHub status pull request discovery failed', options, run);
+    if (!Array.isArray(pages) || !pages.length || !pages.every(Array.isArray)) throw new Error('Invalid pull request pages');
+    return pages.flat();
+  },
+  pull(repo, number, options, run) {
+    if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid GitHub pull request number');
+    return githubRequest('GET', ['repos/' + githubRepo(repo) + '/pulls/' + number],
+      'GitHub status pull request lookup failed', options, run);
+  },
+  add(repo, number, label, options, run) {
+    return githubRequest('POST', [issueEndpoint(repo, number) + '/labels', '--raw-field', 'labels[]=' + label],
+      'GitHub status label add failed', options, run);
+  },
+  async remove(repo, number, label, options, run) {
+    try {
+      await githubRequest('DELETE', [issueEndpoint(repo, number) + '/labels/' + encodeURIComponent(label)],
+        'GitHub status label removal failed', options, run);
+    } catch (error) {
+      if (error.status !== 404) throw error;
+    }
   }
 };
 
