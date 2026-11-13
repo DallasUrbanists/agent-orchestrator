@@ -515,3 +515,10 @@ flowchart LR
 | Lease | The SQLite lock that lets only one controller dispatch from a state directory at a time. |
 | Blocker | A decision or condition that prevents the worker from finishing the task. |
 | Integration gate | The disposable test that checks whether this host can run both models and enforce the tested restrictions. |
+
+For an issue that stopped before implementing its changes, the coordinator can
+set `"resumeImplementation": true` on that issue's host verification binding.
+Its first environment recovery attempt resumes the worker in the saved
+worktree. The same attempt sends the result through the pinned verifier before
+recording success. The setting is scoped to the issue and uses the existing
+recovery budget.
