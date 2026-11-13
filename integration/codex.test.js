@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { findCodex, MODELS, runCodex } from '../src/codex.js';
@@ -12,6 +12,7 @@ import { stateDirectory, State } from '../src/state.js';
 import { git } from '../src/worktrees.js';
 
 const live = process.env.ORCHESTRATOR_LIVE_TEST === '1';
+const chrome = process.env.ORCHESTRATOR_TEST_CHROME;
 
 function disposable(t) {
   const scratch = mkdtempSync(join(tmpdir(), 'orchestrator-live-'));
@@ -34,7 +35,13 @@ test('blocks, runs independent work, and resumes after an authorized fixture rep
   const outside = join(scratch, 'outside.txt');
   writeFileSync(outside, 'outside-sentinel');
   writeFileSync(join(repo, 'probe.cjs'), [
-    "const { writeFileSync } = require('node:fs');",
+    "const { realpathSync, writeFileSync } = require('node:fs');",
+    "const { tmpdir } = require('node:os');",
+    "const { dirname, relative } = require('node:path');",
+    "const scratch = realpathSync(process.env.ORCHESTRATOR_WORKER_TEMP);",
+    "if (relative(realpathSync(process.cwd()), dirname(scratch)) || relative(realpathSync(tmpdir()), scratch)) throw Error('Unexpected scratch');",
+    "writeFileSync(scratch + '/scratch-probe.txt', 'ok');",
+    "writeFileSync('scratch-path.txt', scratch);",
     "try { writeFileSync(" + JSON.stringify(outside) + ", 'SANDBOX-PROBE'); process.exitCode = 90; }",
     "catch (error) {",
     "  if (!['EPERM', 'EACCES'].includes(error.code)) throw error;",
@@ -132,10 +139,39 @@ test('blocks, runs independent work, and resumes after an authorized fixture rep
     assert.ok(existsSync(row.log));
   }
   assert.equal(readFileSync(outside, 'utf8'), 'outside-sentinel', 'sandbox allowed a sibling Temp write');
+  const initialScratch = readFileSync(join(rows[0].worktree, 'scratch-path.txt'), 'utf8');
+  assert.equal(existsSync(initialScratch), false, 'worker scratch was not cleaned up');
   assert.match(readFileSync(join(rows[0].worktree, 'probe-result.txt'), 'utf8'), /^(EPERM|EACCES)$/);
   const restart = await execute(queue, stateDir, options,
     () => assert.fail('restart dispatched a claimed or unapproved task'));
   assert.deepEqual(restart, { reason: 'no-eligible-work', results: [] });
+});
+
+test('Chromium uses worktree-local scratch and loads a loopback page inside a Windows worker', {
+  skip: !live || process.platform !== 'win32' || !chrome, timeout: 150000
+}, async t => {
+  const { repo, stateDir } = disposable(t);
+  const probe = new URL('./chromium-probe.cjs', import.meta.url);
+  writeFileSync(join(repo, 'chromium-probe.cjs'), readFileSync(probe));
+  git(repo, ['add', 'chromium-probe.cjs']);
+  git(repo, ['-c', 'user.name=Orchestrator Test', '-c', 'user.email=test@example.invalid',
+    '-c', 'commit.gpgsign=false', 'commit', '-m', 'Add Chromium fixture']);
+  const issues = [{
+    number: 1, model: 'terra', state: 'ready', dependencies: [],
+    prompt: 'Run this committed synthetic browser probe exactly once using Node: node chromium-probe.cjs ' +
+      JSON.stringify(resolve(chrome)) + '. Do not edit the script or create its result file yourself. ' +
+      'Report done only if the probe exits successfully. Otherwise report blocked with a brief error.'
+  }];
+  const result = await execute({ target: repo, allowedRepos: [repo], issues }, stateDir,
+    { executable: findCodex(), limit: 1, timeoutMs: 120000 });
+  const worktree = join(stateDir, 'worktrees', 'task-1');
+  const report = JSON.parse(readFileSync(join(worktree, 'chromium-result.json'), 'utf8'));
+  t.diagnostic(JSON.stringify(report));
+  assert.deepEqual(result.results.map(item => item.state), ['done']);
+  assert.equal(report.profileCreated, true);
+  assert.equal(report.browser, 'passed');
+  assert.equal(report.nodeSubprocess, 'passed');
+  assert.equal(existsSync(report.scratch), false);
 });
 
 for (const reason of ['cancelled', 'timeout']) {
