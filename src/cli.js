@@ -6,7 +6,7 @@ import { parseArgs } from 'node:util';
 import { checkSupervisedMerge } from './merge-preflight.js';
 import { findCodex, MODELS } from './codex.js';
 import { execute, preview } from './controller.js';
-import { recordHandoff, statusPublisher, statusRepository } from './issue-status.js';
+import { recordHandoff, statusIssueNumbers, statusPublisher, statusRepository } from './issue-status.js';
 import { pollGithubIssues } from './github.js';
 import { plan } from './scheduler.js';
 import { hasJournal, lease, State, stateDirectory } from './state.js';
@@ -170,22 +170,29 @@ async function main() {
     if (publish) {
       if (state.get('restoreHold') === 'true') throw new Error('Status publishing requires reconciled state');
       const sourceRepo = statusRepository(state, stateDir, values.repo);
-      if (!sourceRepo) throw new Error('Status publishing requires GitHub-backed state or single-issue sync-status with --repo');
+      if (!sourceRepo) throw new Error('Status publishing requires a saved GitHub repository or single-issue sync-status with --repo');
       const number = Number(argument);
+      const numbers = statusIssueNumbers(state);
+      if (numbers && argument !== undefined && !numbers.has(number)) {
+        throw new Error('Issue is outside the saved reporting queue');
+      }
       if (argument !== undefined && !state.task(number)) {
         if (command === 'handoff') throw new Error('Handoff requires an existing task');
         return print({ number, status: 'unclaimed' });
       }
-      if (values.repo !== undefined && !state.get('sourceRepo') && state.task(number).state === 'running') {
+      if (!state.get('sourceRepo') && (argument === undefined ? state.list() : [state.task(number)])
+        .some(task => task.state === 'running')) {
         throw new Error('Review the running claim in the original journal before publishing');
       }
       if (state.get('sourceRepo')) state.recover();
-      const publisher = statusPublisher(state, sourceRepo);
+      const publisher = statusPublisher(state, sourceRepo, { numbers });
       if (command === 'handoff') await recordHandoff(state, sourceRepo, number, Number(values.pr));
       if (argument === undefined) await publisher.all();
       else await publisher.sync(number);
-      const updates = state.githubStatusRows().filter(row => argument === undefined || row.number === number);
-      const progress = state.list().filter(row => argument === undefined || row.number === number)
+      const updates = state.githubStatusRows().filter(row => (!numbers || numbers.has(row.number)) &&
+        (argument === undefined || row.number === number));
+      const progress = state.list().filter(row => (!numbers || numbers.has(row.number)) &&
+        (argument === undefined || row.number === number))
         .flatMap(row => state.githubProgress(row.number).map(({ id, comment, publication_error }) =>
           ({ attempt: id, comment, error: publication_error })));
       if (updates.some(row => row.error) || progress.some(row => row.error)) process.exitCode = 1;

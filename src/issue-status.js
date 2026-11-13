@@ -102,12 +102,12 @@ async function publishComment(state, api, repo, attempt, pull, options, now, rec
   state.updateProgress(attempt.id, { comment: posted.id, posting: 0 });
 }
 
-export function statusPublisher(state, sourceRepo, { api = githubStatus, signal, clock = () => new Date().toISOString() } = {}) {
+export function statusPublisher(state, sourceRepo, { api = githubStatus, signal, clock = () => new Date().toISOString(), numbers } = {}) {
   const repo = githubRepo(sourceRepo);
   const options = { signal };
   async function sync(number) {
     const task = state.task(number);
-    if (!task || signal?.aborted) return;
+    if (!task || signal?.aborted || (numbers && !numbers.has(number))) return;
     const attempts = state.githubProgress(number);
     const latest = attempts.at(-1);
     const status = state.githubStatusRows().find(row => row.number === number);
@@ -163,17 +163,30 @@ export function statusPublisher(state, sourceRepo, { api = githubStatus, signal,
 
 export function statusRepository(state, stateDir, requestedRepo) {
   const bound = state.get('sourceRepo');
-  if (requestedRepo === undefined) return bound;
-  const repo = githubRepo(requestedRepo);
   if (bound) {
-    if (repo !== bound) throw new Error('Status repository does not match the journal');
+    if (requestedRepo !== undefined && githubRepo(requestedRepo) !== bound) {
+      throw new Error('Status repository does not match the journal');
+    }
     return bound;
   }
+  const saved = state.get('statusRepo');
+  if (requestedRepo === undefined && !saved) return undefined;
+  const repo = githubRepo(requestedRepo ?? saved);
+  if (saved && repo !== saved) throw new Error('Status repository does not match the journal');
   const target = state.get('repo');
   const checkout = verifyTarget(target, [target], stateDir);
   const origin = git(checkout, ['config', '--local', '--get-all', 'remote.origin.url']);
   if (githubOrigin(origin) !== repo) throw new Error('Status repository does not match the saved checkout origin');
   return repo;
+}
+
+export function statusIssueNumbers(state) {
+  if (state.get('sourceRepo') || !state.get('statusRepo')) return undefined;
+  const numbers = JSON.parse(state.get('statusNumbers') ?? 'null');
+  if (!Array.isArray(numbers) || !numbers.every(validId)) {
+    throw new Error('Saved status scope is missing or invalid. Run with the reviewed reporting queue first');
+  }
+  return new Set(numbers);
 }
 
 export async function recordHandoff(state, sourceRepo, number, pull, api = githubStatus) {

@@ -258,7 +258,11 @@ export async function execute(queue, statePath, options, worker = runCodex) {
   const stateDir = resolveStatePath(statePath);
   const repo = verifyTarget(queue?.target, queue?.allowedRepos, stateDir);
   const { sourceRepo, coordinatorId, load } = prepareQueue(queue, repo, readIssues, decisionsEnabled, intakeApi);
-  if (publishStatus && !sourceRepo) throw new Error('GitHub status publishing requires a GitHub-backed queue');
+  const statusRepo = publishStatus && queue.statusRepo !== undefined ? githubRepo(queue.statusRepo) : sourceRepo;
+  if (publishStatus && (!statusRepo || (sourceRepo && statusRepo !== sourceRepo))) {
+    throw new Error('GitHub status publishing requires the queue repository or a matching statusRepo');
+  }
+  if (publishStatus && !sourceRepo) publicationOrigin(repo, statusRepo);
   if (coordinatorId && !readAcceptance) throw new Error('GitHub intake requires --watch-acceptance');
   if (adoptLocalIntake && !coordinatorId) throw new Error('Journal adoption requires GitHub intake');
   if (continuous && ((!sourceRepo && !readAcceptance) || finalHostVerification)) {
@@ -309,7 +313,18 @@ export async function execute(queue, statePath, options, worker = runCodex) {
     }
     state.bind(repo, sourceRepo, Object.hasOwn(queue, 'acceptedPrerequisites'), coordinatorId);
     state.recover();
-    const publisher = publishStatus ? statusPublisher(state, sourceRepo, { api: statusApi, signal }) : null;
+    const statusNumbers = publishStatus && !sourceRepo ? new Set(queue.issues.map(issue => issue.number)) : undefined;
+    if (statusNumbers) {
+      const savedStatusRepo = state.get('statusRepo');
+      if (savedStatusRepo && savedStatusRepo !== statusRepo) throw new Error('This journal has a different statusRepo');
+      state.transaction(() => {
+        state.set('statusRepo', statusRepo);
+        state.set('statusNumbers', JSON.stringify([...statusNumbers]));
+      });
+    }
+    const publisher = publishStatus ? statusPublisher(state, statusRepo, {
+      api: statusApi, signal, numbers: statusNumbers
+    }) : null;
     const startupBase = loadAcceptance ? null : git(repo, ['rev-parse', '--verify', 'HEAD^{commit}']);
     const initial = loadAcceptance ? null : {
       base: startupBase, accepted: verifyAcceptedPrerequisites(queue, repo, startupBase)
